@@ -87,22 +87,24 @@ async fn main() {
 
             // Spawn Polymarket market scanner only if strategy needs it
             if needs_polymarket {
-                let scanner =
-                    pmbot_rust::polymarket::market_scanner::MarketScanner::new(symbols.clone());
+                // Channel for scanner → orderbook stream token ID discovery
+                let (token_tx, token_rx) = mpsc::channel::<Vec<String>>(16);
+
+                let scanner = pmbot_rust::polymarket::market_scanner::MarketScanner::new(
+                    symbols.clone(),
+                    token_tx,
+                );
                 let poly_sd = shutdown.clone();
                 tokio::spawn(async move {
                     scanner.run(polymarket_tx, poly_sd).await;
                 });
 
                 // Spawn Polymarket WebSocket orderbook stream
-                // Token IDs are discovered at runtime by the market scanner,
-                // so we start with an empty list. The stream will be populated
-                // as markets are discovered. For now, start with empty to
-                // establish the connection pattern.
+                // Waits for token IDs from the scanner before connecting
                 let ws_book_cache = book_cache.clone();
                 let ws_sd = shutdown.clone();
                 tokio::spawn(async move {
-                    let stream = ws_orderbook::OrderbookStream::new(Vec::new(), ws_book_cache);
+                    let stream = ws_orderbook::OrderbookStream::new(token_rx, ws_book_cache);
                     stream.run(ws_sd).await;
                 });
             }

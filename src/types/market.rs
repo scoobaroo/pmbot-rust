@@ -60,6 +60,13 @@ pub struct AggregatedPrice {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Whether a market is bullish ("reach $X") or bearish ("dip to $X").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketDirection {
+    Bullish, // "Will X reach $Y" — P(S > K)
+    Bearish, // "Will X dip to $Y" — P(S < K)
+}
+
 /// Polymarket market representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketMarket {
@@ -72,6 +79,7 @@ pub struct PolymarketMarket {
     pub expiry: DateTime<Utc>,
     pub implied_prob_yes: Decimal,
     pub implied_prob_no: Decimal,
+    pub direction: MarketDirection,
 }
 
 /// A price level in an order book.

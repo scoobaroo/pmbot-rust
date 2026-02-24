@@ -2,10 +2,10 @@ use crate::exchanges::backoff_delay;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -46,22 +46,37 @@ impl BookSnapshot {
 
 /// Streams real-time L2 orderbook updates from Polymarket CLOB WebSocket.
 pub struct OrderbookStream {
-    token_ids: Vec<String>,
+    token_ids: HashSet<String>,
+    token_rx: mpsc::Receiver<Vec<String>>,
     book_cache: BookCache,
 }
 
 impl OrderbookStream {
-    pub fn new(token_ids: Vec<String>, book_cache: BookCache) -> Self {
+    pub fn new(token_rx: mpsc::Receiver<Vec<String>>, book_cache: BookCache) -> Self {
         Self {
-            token_ids,
+            token_ids: HashSet::new(),
+            token_rx,
             book_cache,
         }
     }
 
-    pub async fn run(&self, shutdown: CancellationToken) {
-        if self.token_ids.is_empty() {
-            info!("OrderbookStream: no token IDs to subscribe, exiting");
-            return;
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        // Wait for initial token IDs before connecting
+        info!("OrderbookStream: waiting for token IDs from market scanner");
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("OrderbookStream: shutting down before receiving tokens");
+                    return;
+                }
+                Some(new_ids) = self.token_rx.recv() => {
+                    self.token_ids.extend(new_ids);
+                    if !self.token_ids.is_empty() {
+                        info!(count = self.token_ids.len(), "OrderbookStream: received initial token IDs");
+                        break;
+                    }
+                }
+            }
         }
 
         let mut attempt = 0u32;
@@ -78,19 +93,9 @@ impl OrderbookStream {
 
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Subscribe to L2 updates for each token
+                    // Subscribe to L2 updates for all known tokens
                     for token_id in &self.token_ids {
-                        let sub = serde_json::json!({
-                            "type": "subscribe",
-                            "channel": "book",
-                            "market": token_id,
-                        });
-                        if let Err(e) = write
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                sub.to_string(),
-                            ))
-                            .await
-                        {
+                        if let Err(e) = send_subscribe(&mut write, token_id).await {
                             error!(error = %e, "OrderbookStream: failed to subscribe");
                             break;
                         }
@@ -101,6 +106,17 @@ impl OrderbookStream {
                             _ = shutdown.cancelled() => {
                                 info!("OrderbookStream: shutting down");
                                 return;
+                            }
+                            Some(new_ids) = self.token_rx.recv() => {
+                                // Subscribe to newly discovered tokens without reconnecting
+                                for id in new_ids {
+                                    if self.token_ids.insert(id.clone()) {
+                                        debug!(token_id = %id, "OrderbookStream: subscribing to new token");
+                                        if let Err(e) = send_subscribe(&mut write, &id).await {
+                                            warn!(error = %e, "OrderbookStream: failed to subscribe new token");
+                                        }
+                                    }
+                                }
                             }
                             msg = read.next() => {
                                 match msg {
@@ -202,6 +218,28 @@ impl OrderbookStream {
             "book update"
         );
     }
+}
+
+async fn send_subscribe<S>(
+    write: &mut S,
+    token_id: &str,
+) -> Result<(), tokio_tungstenite::tungstenite::Error>
+where
+    S: SinkExt<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin,
+{
+    let sub = serde_json::json!({
+        "type": "subscribe",
+        "channel": "book",
+        "market": token_id,
+    });
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            sub.to_string(),
+        ))
+        .await
 }
 
 /// Parse price levels array. Returns (best_price, total_depth).

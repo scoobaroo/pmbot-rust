@@ -1,12 +1,13 @@
 use crate::types::events::PolymarketUpdate;
-use crate::types::market::PolymarketMarket;
+use crate::types::market::{MarketDirection, PolymarketMarket};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const GAMMA_API_URL: &str = "https://gamma-api.polymarket.com";
 
@@ -14,14 +15,16 @@ pub struct MarketScanner {
     http: Client,
     symbols: Vec<String>,
     poll_interval_secs: u64,
+    token_tx: mpsc::Sender<Vec<String>>,
 }
 
 impl MarketScanner {
-    pub fn new(symbols: Vec<String>) -> Self {
+    pub fn new(symbols: Vec<String>, token_tx: mpsc::Sender<Vec<String>>) -> Self {
         Self {
             http: Client::new(),
             symbols,
             poll_interval_secs: 60,
+            token_tx,
         }
     }
 
@@ -41,6 +44,17 @@ impl MarketScanner {
                     match self.scan_markets().await {
                         Ok(markets) if !markets.is_empty() => {
                             info!(count = markets.len(), "found crypto price markets");
+
+                            // Collect all token IDs and send to orderbook stream
+                            let token_ids: Vec<String> = markets
+                                .iter()
+                                .flat_map(|m| vec![m.token_id_yes.clone(), m.token_id_no.clone()])
+                                .collect();
+
+                            if let Err(e) = self.token_tx.send(token_ids).await {
+                                warn!(error = %e, "failed to send token IDs to orderbook stream");
+                            }
+
                             let _ = tx.send(PolymarketUpdate::MarketsDiscovered(markets)).await;
                         }
                         Ok(_) => {
@@ -56,20 +70,33 @@ impl MarketScanner {
     }
 
     async fn scan_markets(&self) -> Result<Vec<PolymarketMarket>, reqwest::Error> {
+        let resp = self
+            .http
+            .get(format!("{}/events", GAMMA_API_URL))
+            .query(&[("closed", "false"), ("tag", "crypto"), ("limit", "50")])
+            .send()
+            .await?;
+
+        let events: Vec<serde_json::Value> = resp.json().await?;
         let mut all_markets = Vec::new();
 
-        for symbol in &self.symbols {
-            let resp = self
-                .http
-                .get(format!("{}/markets", GAMMA_API_URL))
-                .query(&[("closed", "false"), ("limit", "50"), ("tag", "crypto")])
-                .send()
-                .await?;
+        for event in &events {
+            let nested = match event.get("markets").and_then(|m| m.as_array()) {
+                Some(m) => m,
+                None => continue,
+            };
 
-            let markets: Vec<serde_json::Value> = resp.json().await?;
-
-            for m in markets {
-                if let Some(market) = parse_crypto_market(&m, symbol) {
+            for m in nested {
+                if let Some(market) = parse_crypto_market(m, &self.symbols) {
+                    info!(
+                        question = %market.question,
+                        symbol = %market.underlying_symbol,
+                        strike = %market.strike,
+                        direction = ?market.direction,
+                        implied_prob = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
+                        token_yes = %market.token_id_yes,
+                        "discovered market"
+                    );
                     all_markets.push(market);
                 }
             }
@@ -79,32 +106,61 @@ impl MarketScanner {
     }
 }
 
-fn parse_crypto_market(v: &serde_json::Value, target_symbol: &str) -> Option<PolymarketMarket> {
+/// Map full crypto names in questions to ticker symbols.
+fn name_to_ticker(text: &str) -> Option<&'static str> {
+    let upper = text.to_uppercase();
+    if upper.contains("BITCOIN") || upper.contains("BTC") {
+        Some("BTC")
+    } else if upper.contains("ETHEREUM") || upper.contains("ETHER") || upper.contains("ETH") {
+        Some("ETH")
+    } else if upper.contains("SOLANA") || upper.contains("SOL") {
+        Some("SOL")
+    } else if upper.contains("DOGECOIN") || upper.contains("DOGE") {
+        Some("DOGE")
+    } else if upper.contains("RIPPLE") || upper.contains("XRP") {
+        Some("XRP")
+    } else {
+        None
+    }
+}
+
+/// Detect market direction from the question text.
+fn detect_direction(question: &str) -> MarketDirection {
+    let q = question.to_lowercase();
+    if q.contains("dip") || q.contains("below") || q.contains("fall") || q.contains("drop") {
+        MarketDirection::Bearish
+    } else {
+        // Default to bullish: "reach", "hit", "above", etc.
+        MarketDirection::Bullish
+    }
+}
+
+fn parse_crypto_market(
+    v: &serde_json::Value,
+    configured_symbols: &[String],
+) -> Option<PolymarketMarket> {
     let question = v.get("question")?.as_str()?;
 
-    // Match questions like "Will BTC be above $100,000 on March 31?"
-    let q_upper = question.to_uppercase();
-    let base = target_symbol.split('-').next().unwrap_or(target_symbol);
+    // Map question text to a ticker
+    let ticker = name_to_ticker(question)?;
 
-    if !q_upper.contains(base) {
-        return None;
-    }
+    // Check if any configured symbol starts with this ticker (e.g. "BTC-USD" starts with "BTC")
+    let matching_symbol = configured_symbols
+        .iter()
+        .find(|s| s.split('-').next().unwrap_or(s) == ticker)?;
 
-    // Try to extract strike price from question
+    // Extract strike price from question
     let strike = extract_strike_from_question(question)?;
 
     let condition_id = v.get("conditionId")?.as_str()?.to_string();
 
-    // Get token IDs from outcomes
-    let tokens = v.get("tokens")?.as_array()?;
-    let (token_yes, token_no) = if tokens.len() >= 2 {
-        (
-            tokens[0].get("token_id")?.as_str()?.to_string(),
-            tokens[1].get("token_id")?.as_str()?.to_string(),
-        )
-    } else {
+    // Get token IDs from clobTokenIds array (not tokens[].token_id)
+    let clob_tokens = v.get("clobTokenIds")?.as_array()?;
+    if clob_tokens.len() < 2 {
         return None;
-    };
+    }
+    let token_yes = clob_tokens[0].as_str()?.to_string();
+    let token_no = clob_tokens[1].as_str()?.to_string();
 
     // Parse expiry
     let end_date = v
@@ -115,27 +171,41 @@ fn parse_crypto_market(v: &serde_json::Value, target_symbol: &str) -> Option<Pol
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
 
-    // Parse current prices
-    let yes_price = v
-        .get("outcomePrices")
-        .and_then(|p| p.as_str())
-        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-        .and_then(|prices| prices.first().and_then(|p| Decimal::from_str(p).ok()))
-        .unwrap_or(Decimal::new(50, 2));
+    // Parse outcome prices — may be a JSON string or a direct array
+    let yes_price = parse_outcome_price(v, 0).unwrap_or(Decimal::new(50, 2));
+    let no_price = parse_outcome_price(v, 1).unwrap_or(Decimal::ONE - yes_price);
 
-    let no_price = Decimal::ONE - yes_price;
+    let direction = detect_direction(question);
 
     Some(PolymarketMarket {
         condition_id,
         token_id_yes: token_yes,
         token_id_no: token_no,
         question: question.to_string(),
-        underlying_symbol: target_symbol.to_string(),
+        underlying_symbol: matching_symbol.clone(),
         strike,
         expiry: end_date,
         implied_prob_yes: yes_price,
         implied_prob_no: no_price,
+        direction,
     })
+}
+
+/// Parse outcomePrices which may be a JSON string like "[\"0.35\",\"0.65\"]" or an array.
+fn parse_outcome_price(v: &serde_json::Value, index: usize) -> Option<Decimal> {
+    let prices = v.get("outcomePrices")?;
+
+    if let Some(s) = prices.as_str() {
+        // It's a JSON-encoded string
+        let parsed: Vec<String> = serde_json::from_str(s).ok()?;
+        parsed.get(index).and_then(|p| Decimal::from_str(p).ok())
+    } else if let Some(arr) = prices.as_array() {
+        arr.get(index)
+            .and_then(|p| p.as_str())
+            .and_then(|s| Decimal::from_str(s).ok())
+    } else {
+        None
+    }
 }
 
 fn extract_strike_from_question(question: &str) -> Option<Decimal> {
@@ -180,5 +250,86 @@ mod tests {
             Some(Decimal::from(5000))
         );
         assert_eq!(extract_strike_from_question("No price here"), None);
+    }
+
+    #[test]
+    fn test_name_to_ticker() {
+        assert_eq!(name_to_ticker("Will Bitcoin reach $100k?"), Some("BTC"));
+        assert_eq!(name_to_ticker("Will Ethereum hit $5000?"), Some("ETH"));
+        assert_eq!(name_to_ticker("Will Solana reach $200?"), Some("SOL"));
+        assert_eq!(name_to_ticker("Will Trump win?"), None);
+    }
+
+    #[test]
+    fn test_detect_direction() {
+        assert_eq!(
+            detect_direction("Will Bitcoin reach $100,000?"),
+            MarketDirection::Bullish
+        );
+        assert_eq!(
+            detect_direction("Will Bitcoin dip to $50,000?"),
+            MarketDirection::Bearish
+        );
+        assert_eq!(
+            detect_direction("Will ETH fall below $2000?"),
+            MarketDirection::Bearish
+        );
+        assert_eq!(
+            detect_direction("Will BTC hit $200,000?"),
+            MarketDirection::Bullish
+        );
+    }
+
+    #[test]
+    fn test_parse_crypto_market() {
+        let market_json = serde_json::json!({
+            "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
+            "conditionId": "0xdaa4",
+            "clobTokenIds": ["56078", "11291"],
+            "outcomePrices": "[\"0.35\",\"0.65\"]",
+            "outcomes": ["Yes", "No"],
+            "endDate": "2027-01-01T05:00:00Z"
+        });
+
+        let symbols = vec!["BTC-USD".to_string(), "ETH-USD".to_string()];
+        let market = parse_crypto_market(&market_json, &symbols).unwrap();
+
+        assert_eq!(market.underlying_symbol, "BTC-USD");
+        assert_eq!(market.strike, Decimal::from(100000));
+        assert_eq!(market.token_id_yes, "56078");
+        assert_eq!(market.token_id_no, "11291");
+        assert_eq!(market.direction, MarketDirection::Bullish);
+        assert_eq!(market.implied_prob_yes, Decimal::new(35, 2));
+    }
+
+    #[test]
+    fn test_parse_crypto_market_bearish() {
+        let market_json = serde_json::json!({
+            "question": "Will Ethereum dip to $1,500 by March 2026?",
+            "conditionId": "0xbeef",
+            "clobTokenIds": ["token_a", "token_b"],
+            "outcomePrices": "[\"0.20\",\"0.80\"]",
+            "endDate": "2026-04-01T00:00:00Z"
+        });
+
+        let symbols = vec!["BTC-USD".to_string(), "ETH-USD".to_string()];
+        let market = parse_crypto_market(&market_json, &symbols).unwrap();
+
+        assert_eq!(market.underlying_symbol, "ETH-USD");
+        assert_eq!(market.direction, MarketDirection::Bearish);
+    }
+
+    #[test]
+    fn test_parse_rejects_non_crypto() {
+        let market_json = serde_json::json!({
+            "question": "Will Trump win the election?",
+            "conditionId": "0x1234",
+            "clobTokenIds": ["aaa", "bbb"],
+            "outcomePrices": "[\"0.50\",\"0.50\"]",
+            "endDate": "2026-11-01T00:00:00Z"
+        });
+
+        let symbols = vec!["BTC-USD".to_string()];
+        assert!(parse_crypto_market(&market_json, &symbols).is_none());
     }
 }

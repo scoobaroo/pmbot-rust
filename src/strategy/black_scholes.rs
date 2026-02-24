@@ -5,7 +5,7 @@ use crate::strategy::kelly;
 use crate::strategy::probability;
 use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
 use crate::types::events::{PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
-use crate::types::market::{AggregatedPrice, PolymarketMarket};
+use crate::types::market::{AggregatedPrice, MarketDirection, PolymarketMarket};
 use crate::types::order::Side;
 use chrono::Utc;
 use rust_decimal::prelude::*;
@@ -99,8 +99,13 @@ impl BlackScholesStrategy {
             return None;
         }
 
-        let estimated_prob =
+        // Direction-aware probability estimation
+        let prob_above =
             probability::prob_above_strike(spot, strike, time_to_expiry, volatility, 0.0);
+        let estimated_prob = match market.direction {
+            MarketDirection::Bullish => prob_above,
+            MarketDirection::Bearish => 1.0 - prob_above,
+        };
 
         let implied_prob = market
             .implied_prob_yes
@@ -128,15 +133,18 @@ impl BlackScholesStrategy {
         let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
         let net_edge = raw_edge.abs() - total_cost_f64;
 
-        debug!(
-            condition_id = %market.condition_id,
-            raw_edge = raw_edge,
-            total_cost = %total_cost,
-            net_edge = net_edge,
-            "fee-aware edge evaluation"
-        );
-
         if net_edge < self.min_edge_threshold {
+            info!(
+                question = %market.question,
+                spot = spot,
+                strike = strike,
+                direction = ?market.direction,
+                estimated_prob = format!("{:.1}%", estimated_prob * 100.0),
+                implied_prob = format!("{:.1}%", implied_prob * 100.0),
+                net_edge = format!("{:.1}%", net_edge * 100.0),
+                threshold = format!("{:.1}%", self.min_edge_threshold * 100.0),
+                "below edge threshold"
+            );
             return None;
         }
 
@@ -168,6 +176,20 @@ impl BlackScholesStrategy {
         if size_usd <= Decimal::ZERO {
             return None;
         }
+
+        info!(
+            question = %market.question,
+            spot = spot,
+            strike = strike,
+            direction = ?market.direction,
+            estimated_prob = format!("{:.1}%", estimated_prob * 100.0),
+            implied_prob = format!("{:.1}%", implied_prob * 100.0),
+            edge = format!("{:.1}%", net_edge * 100.0),
+            kelly = format!("{:.1}%", kelly_frac * 100.0),
+            size_usd = %size_usd,
+            side = %side,
+            "opportunity detected"
+        );
 
         let signal_price = match side {
             Side::Buy => market.implied_prob_yes,
