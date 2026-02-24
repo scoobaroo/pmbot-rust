@@ -11,8 +11,45 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const KRAKEN_WS_URL: &str = "wss://ws.kraken.com/v2";
+const KRAKEN_REST_URL: &str = "https://api.kraken.com/0/public";
 
-pub struct KrakenFeed;
+pub struct KrakenFeed {
+    http: reqwest::Client,
+}
+
+impl Default for KrakenFeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KrakenFeed {
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Fetch current ticker via REST API for initial price bootstrap.
+    async fn fetch_ticker(&self, pair: &str) -> Option<MarketTick> {
+        let url = format!("{}/Ticker?pair={}", KRAKEN_REST_URL, pair);
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(exchange = "Kraken", pair, error = %e, "REST ticker fetch failed");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            warn!(exchange = "Kraken", pair, status = %resp.status(), "REST ticker non-200");
+            return None;
+        }
+
+        let text = resp.text().await.ok()?;
+        parse_rest_ticker(&text)
+    }
+}
 
 impl ExchangeFeed for KrakenFeed {
     fn exchange(&self) -> Exchange {
@@ -25,6 +62,18 @@ impl ExchangeFeed for KrakenFeed {
         tx: mpsc::Sender<ExchangeEvent>,
         shutdown: CancellationToken,
     ) {
+        // Bootstrap: fetch initial prices via REST
+        for symbol in &symbols {
+            // Kraken REST uses pairs like "XBTUSD" (no slash)
+            let kraken_pair =
+                crate::exchanges::common::to_exchange_symbol(Exchange::Kraken, symbol)
+                    .replace('/', "");
+            if let Some(tick) = self.fetch_ticker(&kraken_pair).await {
+                info!(exchange = "Kraken", symbol = %tick.symbol, "REST bootstrap tick");
+                let _ = tx.send(ExchangeEvent::Tick(tick)).await;
+            }
+        }
+
         let mut attempt = 0u32;
 
         loop {
@@ -74,7 +123,7 @@ impl ExchangeFeed for KrakenFeed {
                             msg = read.next() => {
                                 match msg {
                                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                                        if let Some(tick) = parse_kraken_ticker(&text) {
+                                        if let Some(tick) = parse_ws_ticker(&text) {
                                             debug!(exchange = "Kraken", symbol = %tick.symbol, bid = %tick.bid, ask = %tick.ask, "tick");
                                             let _ = tx.send(ExchangeEvent::Tick(tick)).await;
                                         }
@@ -118,7 +167,8 @@ impl ExchangeFeed for KrakenFeed {
     }
 }
 
-fn parse_kraken_ticker(text: &str) -> Option<MarketTick> {
+/// Parse a WebSocket ticker message from Kraken v2 feed.
+fn parse_ws_ticker(text: &str) -> Option<MarketTick> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
     // Kraken v2 ticker: {"channel":"ticker","type":"update","data":[{...}]}
@@ -148,4 +198,116 @@ fn parse_kraken_ticker(text: &str) -> Option<MarketTick> {
         volume_24h: volume,
         timestamp: Utc::now(),
     })
+}
+
+/// Parse a REST ticker response from /0/public/Ticker.
+/// Response: {"error":[],"result":{"XXBTZUSD":{"a":["price","wlv","lv"],"b":["price","wlv","lv"],"c":["price","vol"],"v":["today","24h"],...}}}
+fn parse_rest_ticker(text: &str) -> Option<MarketTick> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+
+    let result = v.get("result")?.as_object()?;
+    // Take the first (and usually only) pair from the result
+    let (pair_key, pair_data) = result.iter().next()?;
+
+    let symbol = crate::exchanges::common::normalize_symbol(
+        Exchange::Kraken,
+        &pair_key.replace("XXBT", "XBT/").replace("ZUSD", "USD"),
+    );
+
+    // "b": ["price", "whole_lot_volume", "lot_volume"]
+    let bid = Decimal::from_str(pair_data.get("b")?.as_array()?.first()?.as_str()?).ok()?;
+    // "a": ["price", "whole_lot_volume", "lot_volume"]
+    let ask = Decimal::from_str(pair_data.get("a")?.as_array()?.first()?.as_str()?).ok()?;
+    // "c": ["price", "lot_volume"]
+    let last = Decimal::from_str(pair_data.get("c")?.as_array()?.first()?.as_str()?).ok()?;
+    // "v": ["today", "last_24h"]
+    let volume = pair_data
+        .get("v")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_str())
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+
+    Some(MarketTick {
+        exchange: Exchange::Kraken,
+        symbol,
+        bid,
+        ask,
+        last,
+        volume_24h: volume,
+        timestamp: Utc::now(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ws_ticker() {
+        let json = r#"{
+            "channel": "ticker",
+            "type": "update",
+            "data": [{
+                "symbol": "XBT/USD",
+                "bid": 42500.50,
+                "ask": 42501.00,
+                "last": 42500.75,
+                "volume": 1234.56,
+                "vwap": 42450.00,
+                "low": 42100.00,
+                "high": 42800.00,
+                "change": 100.00,
+                "change_pct": 0.24
+            }]
+        }"#;
+
+        let tick = parse_ws_ticker(json).unwrap();
+        assert_eq!(tick.exchange, Exchange::Kraken);
+        assert_eq!(tick.symbol, "BTC-USD");
+        assert_eq!(tick.bid, Decimal::from_str("42500.5").unwrap());
+        assert_eq!(tick.ask, Decimal::from_str("42501").unwrap());
+        assert_eq!(tick.last, Decimal::from_str("42500.75").unwrap());
+    }
+
+    #[test]
+    fn test_parse_ws_subscription_ack() {
+        let json = r#"{"channel":"status","type":"update","data":[{"system":"online","version":"2.0.0"}]}"#;
+        assert!(parse_ws_ticker(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_ws_non_ticker() {
+        let json = r#"{"channel":"heartbeat"}"#;
+        assert!(parse_ws_ticker(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_rest_ticker() {
+        let json = r#"{
+            "error": [],
+            "result": {
+                "XXBTZUSD": {
+                    "a": ["42501.00000", "1", "1.000"],
+                    "b": ["42500.50000", "1", "1.000"],
+                    "c": ["42500.75000", "0.001"],
+                    "v": ["1000.00", "1234.56"],
+                    "p": ["42450.00", "42400.00"],
+                    "t": [1000, 2000],
+                    "l": ["42100.00", "42000.00"],
+                    "h": ["42800.00", "42900.00"],
+                    "o": "42400.00"
+                }
+            }
+        }"#;
+
+        let tick = parse_rest_ticker(json).unwrap();
+        assert_eq!(tick.exchange, Exchange::Kraken);
+        assert_eq!(tick.symbol, "BTC-USD");
+        assert_eq!(tick.bid, Decimal::from_str("42500.50000").unwrap());
+        assert_eq!(tick.ask, Decimal::from_str("42501.00000").unwrap());
+        assert_eq!(tick.last, Decimal::from_str("42500.75000").unwrap());
+        assert_eq!(tick.volume_24h, Decimal::from_str("1234.56").unwrap());
+    }
 }

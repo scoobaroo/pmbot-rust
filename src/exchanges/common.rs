@@ -6,7 +6,6 @@ pub fn normalize_symbol(exchange: Exchange, raw: &str) -> String {
         Exchange::Kraken => normalize_kraken(raw),
         Exchange::Coinbase => normalize_coinbase(raw),
         Exchange::Bitfinex => normalize_bitfinex(raw),
-        Exchange::Ndax => normalize_ndax(raw),
         Exchange::Binance => normalize_binance(raw),
         Exchange::Okx => normalize_okx(raw),
     }
@@ -35,10 +34,6 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
                 other => other,
             };
             format!("t{}{}", base, quote)
-        }
-        Exchange::Ndax => {
-            // NDAX uses InstrumentId, but for subscription we use the symbol
-            format!("{}{}", base, quote)
         }
         Exchange::Binance => {
             // Binance WS subscriptions require lowercase: "btcusdt"
@@ -84,16 +79,6 @@ fn normalize_bitfinex(raw: &str) -> String {
         format!("{}-{}", parts[0], parts.get(1).unwrap_or(&"USD"))
     } else {
         s.to_string()
-    }
-}
-
-fn normalize_ndax(raw: &str) -> String {
-    // "BTCUSD" → "BTC-USD"
-    if raw.len() == 6 {
-        let (base, quote) = raw.split_at(3);
-        format!("{}-{}", base, quote)
-    } else {
-        raw.to_string()
     }
 }
 
@@ -143,11 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ndax_normalization() {
-        assert_eq!(normalize_symbol(Exchange::Ndax, "BTCUSD"), "BTC-USD");
-    }
-
-    #[test]
     fn test_binance_normalization() {
         assert_eq!(normalize_symbol(Exchange::Binance, "BTCUSDT"), "BTC-USD");
         assert_eq!(normalize_symbol(Exchange::Binance, "ETHUSDT"), "ETH-USD");
@@ -180,7 +160,6 @@ mod tests {
         assert_eq!(to_exchange_symbol(Exchange::Kraken, "BTC-USD"), "XBT/USD");
         assert_eq!(to_exchange_symbol(Exchange::Coinbase, "BTC-USD"), "BTC-USD");
         assert_eq!(to_exchange_symbol(Exchange::Bitfinex, "BTC-USD"), "tBTCUSD");
-        assert_eq!(to_exchange_symbol(Exchange::Ndax, "BTC-USD"), "BTCUSD");
         assert_eq!(to_exchange_symbol(Exchange::Binance, "BTC-USD"), "btcusdt");
         assert_eq!(to_exchange_symbol(Exchange::Okx, "BTC-USD"), "BTC-USDT");
     }

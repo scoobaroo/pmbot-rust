@@ -4,7 +4,6 @@ use pmbot_rust::exchanges::binance::BinanceFeed;
 use pmbot_rust::exchanges::bitfinex::BitfinexFeed;
 use pmbot_rust::exchanges::coinbase::CoinbaseFeed;
 use pmbot_rust::exchanges::kraken::KrakenFeed;
-use pmbot_rust::exchanges::ndax::NdaxFeed;
 use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
 use pmbot_rust::polymarket::ws_orderbook;
@@ -80,10 +79,9 @@ async fn main() {
                     });
                 }};
             }
-            spawn_feed!(KrakenFeed);
+            spawn_feed!(KrakenFeed::new());
             spawn_feed!(CoinbaseFeed::new());
             spawn_feed!(BitfinexFeed);
-            spawn_feed!(NdaxFeed);
             spawn_feed!(BinanceFeed);
             spawn_feed!(OkxFeed);
 

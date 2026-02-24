@@ -7,7 +7,6 @@ pub enum Exchange {
     Kraken,
     Coinbase,
     Bitfinex,
-    Ndax,
     Binance,
     Okx,
 }
@@ -18,7 +17,6 @@ impl std::fmt::Display for Exchange {
             Exchange::Kraken => write!(f, "Kraken"),
             Exchange::Coinbase => write!(f, "Coinbase"),
             Exchange::Bitfinex => write!(f, "Bitfinex"),
-            Exchange::Ndax => write!(f, "NDAX"),
             Exchange::Binance => write!(f, "Binance"),
             Exchange::Okx => write!(f, "OKX"),
         }
