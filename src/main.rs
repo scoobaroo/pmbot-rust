@@ -80,7 +80,7 @@ async fn main() {
                 }};
             }
             spawn_feed!(KrakenFeed);
-            spawn_feed!(CoinbaseFeed);
+            spawn_feed!(CoinbaseFeed::new());
             spawn_feed!(BitfinexFeed);
             spawn_feed!(NdaxFeed);
             spawn_feed!(BinanceFeed);
