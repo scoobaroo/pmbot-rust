@@ -209,10 +209,13 @@ fn parse_rest_ticker(text: &str) -> Option<MarketTick> {
     // Take the first (and usually only) pair from the result
     let (pair_key, pair_data) = result.iter().next()?;
 
-    let symbol = crate::exchanges::common::normalize_symbol(
-        Exchange::Kraken,
-        &pair_key.replace("XXBT", "XBT/").replace("ZUSD", "USD"),
-    );
+    // Kraken REST pair keys: "XXBTZUSD" → "XBT/USD", "XETHZUSD" → "ETH/USD"
+    // Strip leading X (crypto prefix), replace ZUSD → /USD
+    let normalized_key = pair_key
+        .strip_prefix('X')
+        .unwrap_or(pair_key)
+        .replacen("ZUSD", "/USD", 1);
+    let symbol = crate::exchanges::common::normalize_symbol(Exchange::Kraken, &normalized_key);
 
     // "b": ["price", "whole_lot_volume", "lot_volume"]
     let bid = Decimal::from_str(pair_data.get("b")?.as_array()?.first()?.as_str()?).ok()?;
@@ -309,5 +312,31 @@ mod tests {
         assert_eq!(tick.ask, Decimal::from_str("42501.00000").unwrap());
         assert_eq!(tick.last, Decimal::from_str("42500.75000").unwrap());
         assert_eq!(tick.volume_24h, Decimal::from_str("1234.56").unwrap());
+    }
+
+    #[test]
+    fn test_parse_rest_ticker_eth() {
+        let json = r#"{
+            "error": [],
+            "result": {
+                "XETHZUSD": {
+                    "a": ["1825.00000", "1", "1.000"],
+                    "b": ["1824.90000", "1", "1.000"],
+                    "c": ["1824.95000", "0.1"],
+                    "v": ["500.00", "2000.00"],
+                    "p": ["1820.00", "1818.00"],
+                    "t": [500, 1000],
+                    "l": ["1810.00", "1808.00"],
+                    "h": ["1830.00", "1832.00"],
+                    "o": "1815.00"
+                }
+            }
+        }"#;
+
+        let tick = parse_rest_ticker(json).unwrap();
+        assert_eq!(tick.exchange, Exchange::Kraken);
+        assert_eq!(tick.symbol, "ETH-USD");
+        assert_eq!(tick.bid, Decimal::from_str("1824.90000").unwrap());
+        assert_eq!(tick.ask, Decimal::from_str("1825.00000").unwrap());
     }
 }
