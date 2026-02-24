@@ -5,6 +5,7 @@ use pmbot_rust::exchanges::bitfinex::BitfinexFeed;
 use pmbot_rust::exchanges::coinbase::CoinbaseFeed;
 use pmbot_rust::exchanges::kraken::KrakenFeed;
 use pmbot_rust::exchanges::ndax::NdaxFeed;
+use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
 use pmbot_rust::polymarket::ws_orderbook;
 use pmbot_rust::types::candle::Timeframe;
@@ -84,6 +85,7 @@ async fn main() {
             spawn_feed!(BitfinexFeed);
             spawn_feed!(NdaxFeed);
             spawn_feed!(BinanceFeed);
+            spawn_feed!(OkxFeed);
 
             // Spawn Polymarket market scanner only if strategy needs it
             if needs_polymarket {

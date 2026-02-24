@@ -9,6 +9,7 @@ pub enum Exchange {
     Bitfinex,
     Ndax,
     Binance,
+    Okx,
 }
 
 impl std::fmt::Display for Exchange {
@@ -19,6 +20,7 @@ impl std::fmt::Display for Exchange {
             Exchange::Bitfinex => write!(f, "Bitfinex"),
             Exchange::Ndax => write!(f, "NDAX"),
             Exchange::Binance => write!(f, "Binance"),
+            Exchange::Okx => write!(f, "OKX"),
         }
     }
 }

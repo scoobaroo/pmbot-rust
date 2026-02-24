@@ -8,6 +8,7 @@ pub fn normalize_symbol(exchange: Exchange, raw: &str) -> String {
         Exchange::Bitfinex => normalize_bitfinex(raw),
         Exchange::Ndax => normalize_ndax(raw),
         Exchange::Binance => normalize_binance(raw),
+        Exchange::Okx => normalize_okx(raw),
     }
 }
 
@@ -46,6 +47,14 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
                 other => other,
             };
             format!("{}{}", base, quote).to_lowercase()
+        }
+        Exchange::Okx => {
+            // OKX uses "BTC-USDT" format
+            let quote = match quote {
+                "USD" => "USDT",
+                other => other,
+            };
+            format!("{}-{}", base, quote)
         }
     }
 }
@@ -99,6 +108,19 @@ fn normalize_binance(raw: &str) -> String {
     upper
 }
 
+fn normalize_okx(raw: &str) -> String {
+    // "BTC-USDT" → "BTC-USD", "ETH-USDT" → "ETH-USD"
+    if let Some((base, quote)) = raw.split_once('-') {
+        let quote = match quote {
+            "USDT" | "BUSD" => "USD",
+            other => other,
+        };
+        format!("{}-{}", base, quote)
+    } else {
+        raw.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,11 +163,25 @@ mod tests {
     }
 
     #[test]
+    fn test_okx_normalization() {
+        assert_eq!(normalize_symbol(Exchange::Okx, "BTC-USDT"), "BTC-USD");
+        assert_eq!(normalize_symbol(Exchange::Okx, "ETH-USDT"), "ETH-USD");
+        assert_eq!(normalize_symbol(Exchange::Okx, "BTC-USD"), "BTC-USD");
+    }
+
+    #[test]
+    fn test_okx_to_exchange_symbol() {
+        assert_eq!(to_exchange_symbol(Exchange::Okx, "BTC-USD"), "BTC-USDT");
+        assert_eq!(to_exchange_symbol(Exchange::Okx, "ETH-USD"), "ETH-USDT");
+    }
+
+    #[test]
     fn test_to_exchange_symbol() {
         assert_eq!(to_exchange_symbol(Exchange::Kraken, "BTC-USD"), "XBT/USD");
         assert_eq!(to_exchange_symbol(Exchange::Coinbase, "BTC-USD"), "BTC-USD");
         assert_eq!(to_exchange_symbol(Exchange::Bitfinex, "BTC-USD"), "tBTCUSD");
         assert_eq!(to_exchange_symbol(Exchange::Ndax, "BTC-USD"), "BTCUSD");
         assert_eq!(to_exchange_symbol(Exchange::Binance, "BTC-USD"), "btcusdt");
+        assert_eq!(to_exchange_symbol(Exchange::Okx, "BTC-USD"), "BTC-USDT");
     }
 }

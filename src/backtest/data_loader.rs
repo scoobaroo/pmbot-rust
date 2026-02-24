@@ -49,6 +49,7 @@ pub fn load_ticks(path: &Path) -> Result<Vec<MarketTick>, DataLoadError> {
             "Bitfinex" => Exchange::Bitfinex,
             "NDAX" => Exchange::Ndax,
             "Binance" => Exchange::Binance,
+            "OKX" => Exchange::Okx,
             other => {
                 return Err(DataLoadError::Parse {
                     row,
