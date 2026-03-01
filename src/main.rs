@@ -44,17 +44,31 @@ async fn main() {
             vec![tf]
         }
         StrategyName::BlackScholes => vec![], // no candles needed
+        StrategyName::Unified => {
+            let bb_tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
+            let ma_tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
+            if bb_tf == ma_tf {
+                vec![bb_tf]
+            } else {
+                vec![bb_tf, ma_tf]
+            }
+        }
     };
 
     // Create shared BookCache for Polymarket orderbook data
     let book_cache = ws_orderbook::new_book_cache();
 
-    // Create strategy via factory, injecting book cache for Black-Scholes
+    // Create strategy via factory, injecting book cache for Black-Scholes / Unified
     let strategy: Box<dyn pmbot_rust::strategy::traits::Strategy> = match config.strategy {
         StrategyName::BlackScholes => {
             let bs = pmbot_rust::strategy::black_scholes::BlackScholesStrategy::new(&config)
                 .with_book_cache(book_cache.clone());
             Box::new(bs)
+        }
+        StrategyName::Unified => {
+            let unified = pmbot_rust::strategy::unified::UnifiedStrategy::new(&config)
+                .with_book_cache(book_cache.clone());
+            Box::new(unified)
         }
         StrategyName::MaCrossover => {
             Box::new(pmbot_rust::strategy::ma_crossover::MACrossoverStrategy::new(&config))
@@ -75,6 +89,31 @@ async fn main() {
                 pmbot_rust::backtest::engine::run_backtest(&bt_config, bt_exchange_tx, bt_shutdown)
                     .await;
             });
+
+            // Inject synthetic Polymarket markets for strategies that need them
+            if needs_polymarket {
+                use pmbot_rust::backtest::synthetic_markets;
+                use rust_decimal::Decimal;
+
+                // Generate markets at standard offsets from assumed initial prices
+                let initial_prices: Vec<(String, Decimal)> = config
+                    .symbols
+                    .iter()
+                    .map(|s| {
+                        let price = match s.as_str() {
+                            "BTC-USD" => Decimal::from(100_000),
+                            "ETH-USD" => Decimal::from(3_500),
+                            _ => Decimal::from(1_000),
+                        };
+                        (s.clone(), price)
+                    })
+                    .collect();
+
+                let markets = synthetic_markets::generate_markets(&config.symbols, &initial_prices);
+                let event = synthetic_markets::as_discovery_event(markets);
+                info!(mode = "backtest", "injecting synthetic Polymarket markets");
+                let _ = polymarket_tx.send(event).await;
+            }
         }
         _ => {
             // Live/Paper: spawn all 4 exchange feeds
@@ -168,33 +207,8 @@ async fn main() {
         None
     };
 
-    // Create Kraken spot client for live spot execution
-    let spot_client = if config.mode == RunMode::Live
-        && !config.kraken_api_key.is_empty()
-        && !config.kraken_api_secret.is_empty()
-    {
-        match pmbot_rust::exchanges::kraken_trading::KrakenSpotClient::new(
-            config.kraken_api_key.clone(),
-            config.kraken_api_secret.clone(),
-        ) {
-            Ok(client) => {
-                info!("Kraken spot client initialized for live trading");
-                Some(client)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to initialize Kraken spot client");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let exec_engine = pmbot_rust::execution::engine::ExecutionEngine::new(
-        config.clone(),
-        poly_client,
-        spot_client,
-    );
+    let exec_engine =
+        pmbot_rust::execution::engine::ExecutionEngine::new(config.clone(), poly_client);
     let exec_sd = shutdown.clone();
     tokio::spawn(async move {
         exec_engine.run(signal_rx, execution_tx, exec_sd).await;
