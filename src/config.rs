@@ -14,6 +14,7 @@ pub enum StrategyName {
     BlackScholes,
     MaCrossover,
     BollingerBands,
+    Unified,
 }
 
 #[derive(Parser, Debug)]
@@ -22,7 +23,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "paper")]
     pub mode: RunMode,
 
-    #[arg(long, value_enum, default_value = "black-scholes")]
+    #[arg(long, value_enum, default_value = "unified")]
     pub strategy: StrategyName,
 
     #[arg(long, default_value = "data/backtest.csv")]
@@ -30,6 +31,11 @@ pub struct Cli {
 
     #[arg(long, default_value = "true")]
     pub maker_mode: bool,
+
+    /// Maximum position size in USD for live mode (safety cap).
+    /// Defaults to $50 to prevent large losses during initial live testing.
+    #[arg(long, default_value = "50")]
+    pub live_max_position_usd: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +81,10 @@ pub struct Config {
     pub heartbeat_interval_secs: u64,
     pub ws_book_max_stale_secs: u64,
 
+    // Unified strategy weights
+    pub unified_bb_weight: f64,
+    pub unified_ma_weight: f64,
+
     // System
     pub log_level: String,
     pub stale_feed_timeout_secs: u64,
@@ -83,6 +93,22 @@ pub struct Config {
 impl Config {
     pub fn load(cli: &Cli) -> Self {
         let _ = dotenvy::dotenv();
+
+        let mut max_position_usd = dec_or("MAX_POSITION_USD", "1000");
+        let mut max_total_exposure_usd = dec_or("MAX_TOTAL_EXPOSURE_USD", "5000");
+
+        // In live mode, enforce safety caps
+        if cli.mode == RunMode::Live {
+            let live_cap = Decimal::from(cli.live_max_position_usd);
+            if max_position_usd > live_cap {
+                max_position_usd = live_cap;
+            }
+            // Total exposure capped at 5× position cap
+            let exposure_cap = live_cap * Decimal::from(5);
+            if max_total_exposure_usd > exposure_cap {
+                max_total_exposure_usd = exposure_cap;
+            }
+        }
 
         Self {
             mode: cli.mode,
@@ -101,8 +127,8 @@ impl Config {
             min_edge_threshold: dec_or("MIN_EDGE_THRESHOLD", "0.03"),
             kelly_fraction_cap: dec_or("KELLY_FRACTION_CAP", "0.5"),
             volatility_window_hours: u64_or("VOLATILITY_WINDOW_HOURS", 24),
-            max_position_usd: dec_or("MAX_POSITION_USD", "1000"),
-            max_total_exposure_usd: dec_or("MAX_TOTAL_EXPOSURE_USD", "5000"),
+            max_position_usd,
+            max_total_exposure_usd,
             max_drawdown_pct: dec_or("MAX_DRAWDOWN_PCT", "0.10"),
             max_orders_per_minute: u32_or("MAX_ORDERS_PER_MINUTE", 10),
             ma_fast_period: usize_or("MA_FAST_PERIOD", 9),
@@ -118,6 +144,8 @@ impl Config {
             maker_mode: cli.maker_mode,
             heartbeat_interval_secs: u64_or("HEARTBEAT_INTERVAL_SECS", 10),
             ws_book_max_stale_secs: u64_or("WS_BOOK_MAX_STALE_SECS", 30),
+            unified_bb_weight: f64_or("UNIFIED_BB_WEIGHT", 0.4),
+            unified_ma_weight: f64_or("UNIFIED_MA_WEIGHT", 0.4),
             log_level: env_or("LOG_LEVEL", "info"),
             stale_feed_timeout_secs: u64_or("STALE_FEED_TIMEOUT_SECS", 30),
         }

@@ -24,6 +24,14 @@ async fn main() {
 
     info!(mode = ?config.mode, strategy = ?config.strategy, symbols = ?config.symbols, "pmbot starting");
 
+    if config.mode == RunMode::Live {
+        tracing::warn!(
+            max_position_usd = %config.max_position_usd,
+            max_total_exposure_usd = %config.max_total_exposure_usd,
+            "LIVE MODE — real money at risk. Position sizes capped by --live-max-position-usd"
+        );
+    }
+
     // Create channels
     let (exchange_tx, exchange_rx) = mpsc::channel::<ExchangeEvent>(1024);
     let (aggregator_tx, aggregator_rx) = mpsc::channel::<AggregatorEvent>(256);
