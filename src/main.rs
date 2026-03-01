@@ -56,8 +56,11 @@ async fn main() {
                 .with_book_cache(book_cache.clone());
             Box::new(bs)
         }
-        StrategyName::MaCrossover | StrategyName::BollingerBands => {
-            pmbot_rust::strategy::factory::create_strategy(&config)
+        StrategyName::MaCrossover => {
+            Box::new(pmbot_rust::strategy::ma_crossover::MACrossoverStrategy::new(&config))
+        }
+        StrategyName::BollingerBands => {
+            Box::new(pmbot_rust::strategy::bollinger::BollingerBandsStrategy::new(&config))
         }
     };
     let needs_polymarket = strategy.subscriptions().polymarket_updates;
@@ -165,8 +168,33 @@ async fn main() {
         None
     };
 
-    let exec_engine =
-        pmbot_rust::execution::engine::ExecutionEngine::new(config.clone(), poly_client);
+    // Create Kraken spot client for live spot execution
+    let spot_client = if config.mode == RunMode::Live
+        && !config.kraken_api_key.is_empty()
+        && !config.kraken_api_secret.is_empty()
+    {
+        match pmbot_rust::exchanges::kraken_trading::KrakenSpotClient::new(
+            config.kraken_api_key.clone(),
+            config.kraken_api_secret.clone(),
+        ) {
+            Ok(client) => {
+                info!("Kraken spot client initialized for live trading");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to initialize Kraken spot client");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let exec_engine = pmbot_rust::execution::engine::ExecutionEngine::new(
+        config.clone(),
+        poly_client,
+        spot_client,
+    );
     let exec_sd = shutdown.clone();
     tokio::spawn(async move {
         exec_engine.run(signal_rx, execution_tx, exec_sd).await;

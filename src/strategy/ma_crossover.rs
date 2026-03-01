@@ -189,6 +189,7 @@ mod tests {
             bb_num_std: 2.0,
             bb_timeframe: "5m".into(),
             bb_size_usd: Decimal::from(500),
+            bb_cooldown_candles: 3,
             fee_rate_bps: 156,
             maker_mode: true,
             heartbeat_interval_secs: 10,

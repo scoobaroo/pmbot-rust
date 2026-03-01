@@ -3,6 +3,7 @@ pub mod bitfinex;
 pub mod coinbase;
 pub mod common;
 pub mod kraken;
+pub mod kraken_trading;
 pub mod okx;
 
 use crate::types::events::ExchangeEvent;
