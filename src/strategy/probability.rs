@@ -42,6 +42,28 @@ pub fn prob_below_strike(
     1.0 - prob_above_strike(spot, strike, time_to_expiry, volatility, risk_free_rate)
 }
 
+/// Probability that price is at or above start_price after `time_remaining_secs`.
+///
+/// Used for 5-minute up/down markets where "Up" resolves if end >= start.
+/// Delegates to `prob_above_strike()` with `r = 0`.
+pub fn prob_price_up(
+    spot: f64,
+    start_price: f64,
+    time_remaining_secs: f64,
+    volatility: f64,
+) -> f64 {
+    if time_remaining_secs <= 0.0 {
+        // Expired — deterministic
+        return if spot >= start_price { 1.0 } else { 0.0 };
+    }
+    if volatility <= 0.0 {
+        // Zero vol — deterministic drift (r=0 so no drift)
+        return if spot >= start_price { 1.0 } else { 0.0 };
+    }
+    let time_years = time_remaining_secs / (365.25 * 24.0 * 3600.0);
+    prob_above_strike(spot, start_price, time_years, volatility, 0.0)
+}
+
 /// Time to expiry in years from now to target datetime.
 pub fn time_to_expiry_years(expiry: chrono::DateTime<chrono::Utc>) -> f64 {
     let now = chrono::Utc::now();
@@ -105,6 +127,56 @@ mod tests {
         assert!(
             (prob - 1.0).abs() < f64::EPSILON,
             "expired ITM should be 1.0"
+        );
+    }
+
+    // --- prob_price_up tests ---
+
+    #[test]
+    fn test_updown_at_start_price() {
+        // Spot == start_price with 150s remaining → ~50%
+        let prob = prob_price_up(100.0, 100.0, 150.0, 0.5);
+        assert!(
+            (prob - 0.5).abs() < 0.05,
+            "at start price should be ~50%, got {}",
+            prob
+        );
+    }
+
+    #[test]
+    fn test_updown_above_start() {
+        // Spot above start → >50%
+        let prob = prob_price_up(101.0, 100.0, 150.0, 0.5);
+        assert!(prob > 0.5, "above start should be >50%, got {}", prob);
+    }
+
+    #[test]
+    fn test_updown_below_start() {
+        // Spot below start → <50%
+        let prob = prob_price_up(99.0, 100.0, 150.0, 0.5);
+        assert!(prob < 0.5, "below start should be <50%, got {}", prob);
+    }
+
+    #[test]
+    fn test_updown_expired_above() {
+        let prob = prob_price_up(101.0, 100.0, 0.0, 0.5);
+        assert!((prob - 1.0).abs() < f64::EPSILON, "expired above → 1.0");
+    }
+
+    #[test]
+    fn test_updown_expired_below() {
+        let prob = prob_price_up(99.0, 100.0, 0.0, 0.5);
+        assert!(prob.abs() < f64::EPSILON, "expired below → 0.0");
+    }
+
+    #[test]
+    fn test_updown_low_vol_strongly_directional() {
+        // Very low vol, spot well above start → near 1.0
+        let prob = prob_price_up(105.0, 100.0, 150.0, 0.01);
+        assert!(
+            prob > 0.99,
+            "low vol, strongly above → near 1.0, got {}",
+            prob
         );
     }
 }

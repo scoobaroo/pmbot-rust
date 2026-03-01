@@ -20,7 +20,7 @@ pub enum DataLoadError {
 /// timestamp,exchange,symbol,bid,ask,last,volume_24h
 ///
 /// Example:
-/// 2024-01-15T10:30:00Z,Kraken,BTC-USD,42500.50,42501.00,42500.75,1234.56
+/// 2024-01-15T10:30:00Z,Coinbase,BTC-USD,42500.50,42501.00,42500.75,1234.56
 pub fn load_ticks(path: &Path) -> Result<Vec<MarketTick>, DataLoadError> {
     info!(path = %path.display(), "loading backtest data");
 
@@ -43,8 +43,7 @@ pub fn load_ticks(path: &Path) -> Result<Vec<MarketTick>, DataLoadError> {
                 msg: format!("bad timestamp: {}", e),
             })?;
 
-        let exchange = match record.get(1).unwrap_or("Kraken") {
-            "Kraken" => Exchange::Kraken,
+        let exchange = match record.get(1).unwrap_or("Coinbase") {
             "Coinbase" => Exchange::Coinbase,
             "Bitfinex" => Exchange::Bitfinex,
             "Binance" => Exchange::Binance,

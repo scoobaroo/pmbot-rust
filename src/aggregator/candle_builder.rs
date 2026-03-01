@@ -118,7 +118,7 @@ mod tests {
 
     fn make_tick(symbol: &str, bid: f64, ask: f64, ts_secs: i64) -> MarketTick {
         MarketTick {
-            exchange: Exchange::Kraken,
+            exchange: Exchange::Coinbase,
             symbol: symbol.to_string(),
             bid: Decimal::from_f64_retain(bid).unwrap(),
             ask: Decimal::from_f64_retain(ask).unwrap(),

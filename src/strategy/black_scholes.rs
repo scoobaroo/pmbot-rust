@@ -209,6 +209,7 @@ impl BlackScholesStrategy {
                 kelly_fraction: kelly_frac,
             },
             timestamp: Utc::now(),
+            is_exit: false,
         })
     }
 }

@@ -3,11 +3,11 @@ use crate::types::market::Exchange;
 /// Normalize exchange-specific symbols to canonical format (e.g., "BTC-USD").
 pub fn normalize_symbol(exchange: Exchange, raw: &str) -> String {
     match exchange {
-        Exchange::Kraken => normalize_kraken(raw),
         Exchange::Coinbase => normalize_coinbase(raw),
         Exchange::Bitfinex => normalize_bitfinex(raw),
         Exchange::Binance => normalize_binance(raw),
         Exchange::Okx => normalize_okx(raw),
+        Exchange::Chainlink => raw.to_string(), // already canonical BTC-USD
     }
 }
 
@@ -20,13 +20,6 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
     let (base, quote) = (parts[0], parts[1]);
 
     match exchange {
-        Exchange::Kraken => {
-            let base = match base {
-                "BTC" => "XBT",
-                other => other,
-            };
-            format!("{}/{}", base, quote)
-        }
         Exchange::Coinbase => format!("{}-{}", base, quote),
         Exchange::Bitfinex => {
             let base = match base {
@@ -51,12 +44,8 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
             };
             format!("{}-{}", base, quote)
         }
+        Exchange::Chainlink => canonical.to_string(), // identity
     }
-}
-
-fn normalize_kraken(raw: &str) -> String {
-    let raw = raw.replace('/', "-");
-    raw.replace("XBT", "BTC")
 }
 
 fn normalize_coinbase(raw: &str) -> String {
@@ -111,12 +100,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_kraken_normalization() {
-        assert_eq!(normalize_symbol(Exchange::Kraken, "XBT/USD"), "BTC-USD");
-        assert_eq!(normalize_symbol(Exchange::Kraken, "ETH/USD"), "ETH-USD");
-    }
-
-    #[test]
     fn test_coinbase_normalization() {
         assert_eq!(normalize_symbol(Exchange::Coinbase, "BTC-USD"), "BTC-USD");
     }
@@ -157,7 +140,6 @@ mod tests {
 
     #[test]
     fn test_to_exchange_symbol() {
-        assert_eq!(to_exchange_symbol(Exchange::Kraken, "BTC-USD"), "XBT/USD");
         assert_eq!(to_exchange_symbol(Exchange::Coinbase, "BTC-USD"), "BTC-USD");
         assert_eq!(to_exchange_symbol(Exchange::Bitfinex, "BTC-USD"), "tBTCUSD");
         assert_eq!(to_exchange_symbol(Exchange::Binance, "BTC-USD"), "btcusdt");

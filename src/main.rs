@@ -3,7 +3,6 @@ use pmbot_rust::config::{Cli, Config, RunMode, StrategyName};
 use pmbot_rust::exchanges::binance::BinanceFeed;
 use pmbot_rust::exchanges::bitfinex::BitfinexFeed;
 use pmbot_rust::exchanges::coinbase::CoinbaseFeed;
-use pmbot_rust::exchanges::kraken::KrakenFeed;
 use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
 use pmbot_rust::polymarket::ws_orderbook;
@@ -135,11 +134,26 @@ async fn main() {
                     });
                 }};
             }
-            spawn_feed!(KrakenFeed::new());
             spawn_feed!(CoinbaseFeed::new());
             spawn_feed!(BitfinexFeed);
             spawn_feed!(BinanceFeed);
             spawn_feed!(OkxFeed);
+
+            // Spawn Chainlink oracle feed (polling, not WebSocket)
+            {
+                let chainlink_feed = pmbot_rust::exchanges::chainlink::ChainlinkFeed::new(
+                    &config.polygon_rpc_url,
+                    &config.ethereum_rpc_url,
+                );
+                let chainlink_tx = exchange_tx.clone();
+                let chainlink_syms = symbols.clone();
+                let chainlink_sd = shutdown.clone();
+                tokio::spawn(async move {
+                    chainlink_feed
+                        .run(chainlink_syms, chainlink_tx, chainlink_sd)
+                        .await;
+                });
+            }
 
             // Spawn Polymarket market scanner only if strategy needs it
             if needs_polymarket {
@@ -149,6 +163,8 @@ async fn main() {
                 let scanner = pmbot_rust::polymarket::market_scanner::MarketScanner::new(
                     symbols.clone(),
                     token_tx,
+                    config.updown_enabled,
+                    config.updown_only,
                 );
                 let poly_sd = shutdown.clone();
                 tokio::spawn(async move {
@@ -205,7 +221,9 @@ async fn main() {
         match pmbot_rust::polymarket::auth::derive_api_credentials(&config.polymarket_private_key)
             .await
         {
-            Ok(creds) => Some(pmbot_rust::polymarket::client::PolymarketClient::new(creds)),
+            Ok((creds, signer)) => Some(pmbot_rust::polymarket::client::PolymarketClient::new(
+                creds, signer,
+            )),
             Err(e) => {
                 tracing::error!(error = %e, "failed to derive Polymarket credentials");
                 None

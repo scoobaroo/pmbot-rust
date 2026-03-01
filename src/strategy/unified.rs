@@ -6,7 +6,7 @@ use crate::strategy::probability;
 use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
 use crate::types::candle::{Candle, Timeframe};
 use crate::types::events::{PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
-use crate::types::market::{AggregatedPrice, MarketDirection, PolymarketMarket};
+use crate::types::market::{AggregatedPrice, MarketDirection, MarketType, PolymarketMarket};
 use crate::types::order::Side;
 use chrono::Utc;
 use rust_decimal::prelude::*;
@@ -103,6 +103,9 @@ pub struct UnifiedStrategy {
 
     // Open positions for exit logic (keyed by condition_id)
     open_positions: HashMap<String, OpenPosition>,
+
+    // Up/down: captured VWAP at window start, keyed by condition_id → (start_price, window_start_ts)
+    updown_start_prices: HashMap<String, (f64, i64)>,
 }
 
 impl UnifiedStrategy {
@@ -143,6 +146,7 @@ impl UnifiedStrategy {
             ma_weight: config.unified_ma_weight,
 
             open_positions: HashMap::new(),
+            updown_start_prices: HashMap::new(),
         }
     }
 
@@ -346,6 +350,10 @@ impl UnifiedStrategy {
                 Some(m) => m,
                 None => continue,
             };
+            // Up/down binary markets: hold until resolution, no early exit
+            if matches!(market.market_type, MarketType::UpDown { .. }) {
+                continue;
+            }
             if let Some(signal) = self.check_exit(market, pos) {
                 signals.push(signal);
             }
@@ -424,12 +432,8 @@ impl UnifiedStrategy {
     }
 
     fn make_exit_signal(&self, market: &PolymarketMarket, pos: &OpenPosition) -> TradeSignal {
-        // Exit = opposite side
-        let exit_side = match pos.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        };
-        let exit_price = match exit_side {
+        // Exit: keep same side (we're selling the same token we bought)
+        let exit_price = match pos.side {
             Side::Buy => market.implied_prob_yes,
             Side::Sell => market.implied_prob_no,
         };
@@ -438,7 +442,7 @@ impl UnifiedStrategy {
 
         TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
-            side: exit_side,
+            side: pos.side,
             size_usd,
             confidence: 0.0, // exit, not a new edge
             price: exit_price,
@@ -453,6 +457,7 @@ impl UnifiedStrategy {
                 kelly_fraction: 0.0,
             },
             timestamp: Utc::now(),
+            is_exit: true,
         }
     }
 
@@ -463,8 +468,12 @@ impl UnifiedStrategy {
     fn evaluate_all_markets(&self) -> Vec<TradeSignal> {
         let mut signals = Vec::new();
         for market in self.markets.values() {
-            if let Some(signal) = self.evaluate_market(market) {
-                signals.push(signal);
+            let signal = match market.market_type {
+                MarketType::StrikeAbove => self.evaluate_market(market),
+                MarketType::UpDown { .. } => self.evaluate_updown_market(market),
+            };
+            if let Some(s) = signal {
+                signals.push(s);
             }
         }
         signals
@@ -647,7 +656,206 @@ impl UnifiedStrategy {
                 kelly_fraction: kelly_scaled,
             },
             timestamp: Utc::now(),
+            is_exit: false,
         })
+    }
+
+    // -------------------------------------------------------------------
+    // Up/Down 5-minute market evaluation
+    // -------------------------------------------------------------------
+
+    fn evaluate_updown_market(&self, market: &PolymarketMarket) -> Option<TradeSignal> {
+        let (window_start_ts, window_secs) = match market.market_type {
+            MarketType::UpDown {
+                window_start_ts,
+                window_secs,
+            } => (window_start_ts, window_secs),
+            _ => return None,
+        };
+
+        // Already positioned in this window — hold until resolution
+        if self.open_positions.contains_key(&market.condition_id) {
+            return None;
+        }
+
+        let price = self.latest_prices.get(&market.underlying_symbol)?;
+        let spot = price.vwap.to_f64()?;
+        let volatility = price.volatility;
+
+        // Get captured start price
+        let (start_price, _) = self.updown_start_prices.get(&market.condition_id)?;
+        let start_price = *start_price;
+
+        // Time remaining
+        let now = Utc::now().timestamp();
+        let window_end = window_start_ts + window_secs as i64;
+        let time_remaining_secs = (window_end - now) as f64;
+
+        // Dead zones: skip first 30s and last 30s
+        let elapsed = now - window_start_ts;
+        if elapsed < 30 || time_remaining_secs < 30.0 {
+            return None;
+        }
+
+        if volatility <= 0.0 || time_remaining_secs <= 0.0 {
+            return None;
+        }
+
+        // P(up) = P(end >= start)
+        let prob_up =
+            probability::prob_price_up(spot, start_price, time_remaining_secs, volatility);
+        let implied_prob_up = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+
+        // Pick the side with positive edge
+        let edge_up = prob_up - implied_prob_up;
+        let _edge_down = -edge_up; // symmetric
+
+        let (side, estimated_prob, implied_prob, token_id) = if edge_up > 0.0 {
+            (Side::Buy, prob_up, implied_prob_up, &market.token_id_yes)
+        } else if edge_up < 0.0 {
+            (
+                Side::Sell, // Buy Down
+                1.0 - prob_up,
+                1.0 - implied_prob_up,
+                &market.token_id_no,
+            )
+        } else {
+            return None;
+        };
+
+        let raw_edge = (estimated_prob - implied_prob).abs();
+
+        // Spread + fee deduction
+        let half_spread = self.get_half_spread(token_id);
+        let implied_price = if side == Side::Buy {
+            market.implied_prob_yes
+        } else {
+            market.implied_prob_no
+        };
+        let total_cost = self.fee_calculator.total_cost(implied_price, half_spread);
+        let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
+        let net_edge = raw_edge - total_cost_f64;
+
+        // Confluence modifier
+        let bb = self.bb_score(&market.underlying_symbol);
+        let ma = self.ma_score(&market.underlying_symbol);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma).clamp(0.0, 2.0);
+        let adjusted_edge = net_edge * multiplier;
+
+        // Threshold gate
+        if adjusted_edge < self.min_edge_threshold {
+            debug!(
+                symbol = %market.underlying_symbol,
+                prob_up = format!("{:.1}%", prob_up * 100.0),
+                implied_up = format!("{:.1}%", implied_prob_up * 100.0),
+                adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
+                "up/down: below edge threshold"
+            );
+            return None;
+        }
+
+        // Kelly sizing with 0.5× scale for high-frequency
+        let kelly_frac = crate::strategy::kelly::kelly_fraction(
+            estimated_prob,
+            implied_prob,
+            self.kelly_fraction_cap,
+        );
+        if kelly_frac <= 0.0 {
+            return None;
+        }
+        let kelly_scaled = kelly_frac * multiplier.min(1.5) * 0.5;
+        let size_usd = crate::strategy::kelly::position_size_usd(
+            kelly_scaled,
+            self.max_total_exposure_usd,
+            self.max_position_usd,
+        );
+
+        if size_usd <= Decimal::ZERO {
+            return None;
+        }
+
+        // Min order gate: 5 units × implied_price
+        let min_order_usd = Decimal::from(5) * implied_price;
+        if size_usd < min_order_usd {
+            debug!(
+                symbol = %market.underlying_symbol,
+                size_usd = %size_usd,
+                min_order_usd = %min_order_usd,
+                "up/down: below min order size"
+            );
+            return None;
+        }
+
+        info!(
+            symbol = %market.underlying_symbol,
+            start_price,
+            spot,
+            prob_up = format!("{:.1}%", prob_up * 100.0),
+            implied_up = format!("{:.1}%", implied_prob_up * 100.0),
+            adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
+            kelly = format!("{:.1}%", kelly_scaled * 100.0),
+            size_usd = %size_usd,
+            side = %side,
+            time_remaining = format!("{:.0}s", time_remaining_secs),
+            "up/down signal"
+        );
+
+        Some(TradeSignal {
+            target: TradeTarget::Polymarket(market.clone()),
+            side,
+            size_usd,
+            confidence: adjusted_edge,
+            price: implied_price,
+            metadata: SignalMetadata::UpDown {
+                estimated_prob_up: prob_up,
+                implied_prob_up,
+                start_price,
+                spot,
+                time_remaining_secs,
+                raw_edge: net_edge,
+                adjusted_edge,
+                confluence_multiplier: multiplier,
+                bb_score: bb,
+                ma_score: ma,
+                kelly_fraction: kelly_scaled,
+            },
+            timestamp: Utc::now(),
+            is_exit: false,
+        })
+    }
+
+    /// Remove expired up/down markets and their start prices.
+    fn cleanup_expired_updown(&mut self) {
+        let now = Utc::now().timestamp();
+        let expired_ids: Vec<String> = self
+            .markets
+            .iter()
+            .filter_map(|(cid, m)| match m.market_type {
+                MarketType::UpDown {
+                    window_start_ts,
+                    window_secs,
+                } => {
+                    if now > window_start_ts + window_secs as i64 + 60 {
+                        Some(cid.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+
+        for cid in &expired_ids {
+            self.markets.remove(cid);
+            self.updown_start_prices.remove(cid);
+            self.open_positions.remove(cid);
+        }
+        if !expired_ids.is_empty() {
+            debug!(
+                count = expired_ids.len(),
+                "cleaned up expired up/down markets"
+            );
+        }
     }
 }
 
@@ -669,6 +877,9 @@ impl Strategy for UnifiedStrategy {
         match event {
             StrategyEvent::PriceUpdate(price) => {
                 self.latest_prices.insert(price.symbol.clone(), price);
+
+                // Cleanup expired up/down markets
+                self.cleanup_expired_updown();
 
                 // Check exits first
                 let mut signals = self.check_exits();
@@ -702,18 +913,23 @@ impl Strategy for UnifiedStrategy {
                 // Track new positions
                 for sig in &entry_signals {
                     if let TradeTarget::Polymarket(ref m) = sig.target {
-                        let ss = self
-                            .symbol_states
-                            .entry(m.underlying_symbol.clone())
-                            .or_insert(SymbolState {
-                                position: SymbolPosition::Flat,
-                                cooldown_remaining: 0,
-                            });
-                        ss.position = match sig.side {
-                            Side::Buy => SymbolPosition::Long,
-                            Side::Sell => SymbolPosition::Short,
-                        };
-                        ss.cooldown_remaining = self.cooldown_candles;
+                        // UpDown markets: hold until resolution, don't set symbol-level
+                        // position/cooldown since each window is independent
+                        let is_updown = matches!(m.market_type, MarketType::UpDown { .. });
+                        if !is_updown {
+                            let ss = self
+                                .symbol_states
+                                .entry(m.underlying_symbol.clone())
+                                .or_insert(SymbolState {
+                                    position: SymbolPosition::Flat,
+                                    cooldown_remaining: 0,
+                                });
+                            ss.position = match sig.side {
+                                Side::Buy => SymbolPosition::Long,
+                                Side::Sell => SymbolPosition::Short,
+                            };
+                            ss.cooldown_remaining = self.cooldown_candles;
+                        }
 
                         self.open_positions.insert(
                             m.condition_id.clone(),
@@ -741,6 +957,40 @@ impl Strategy for UnifiedStrategy {
                     PolymarketUpdate::MarketsDiscovered(new_markets) => {
                         info!(count = new_markets.len(), "unified: markets discovered");
                         for market in new_markets {
+                            // For UpDown markets, capture start price (prefer oracle, fallback VWAP)
+                            if let MarketType::UpDown {
+                                window_start_ts, ..
+                            } = market.market_type
+                            {
+                                if !self.updown_start_prices.contains_key(&market.condition_id) {
+                                    if let Some(price) =
+                                        self.latest_prices.get(&market.underlying_symbol)
+                                    {
+                                        // Prefer Chainlink oracle price (aligns with resolution source)
+                                        let start = price
+                                            .oracle_price
+                                            .and_then(|op| op.to_f64())
+                                            .unwrap_or_else(|| price.vwap.to_f64().unwrap_or(0.0));
+                                        if start > 0.0 {
+                                            let source = if price.oracle_price.is_some() {
+                                                "oracle"
+                                            } else {
+                                                "vwap"
+                                            };
+                                            self.updown_start_prices.insert(
+                                                market.condition_id.clone(),
+                                                (start, window_start_ts),
+                                            );
+                                            info!(
+                                                symbol = %market.underlying_symbol,
+                                                start_price = start,
+                                                source,
+                                                "captured up/down start price"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             self.markets.insert(market.condition_id.clone(), market);
                         }
                     }
@@ -788,12 +1038,11 @@ mod tests {
             mode: crate::config::RunMode::Paper,
             strategy: crate::config::StrategyName::Unified,
             backtest_file: String::new(),
-            kraken_api_key: String::new(),
-            kraken_api_secret: String::new(),
             coinbase_api_key: String::new(),
             coinbase_api_secret: String::new(),
             polymarket_private_key: String::new(),
             polygon_rpc_url: String::new(),
+            ethereum_rpc_url: String::new(),
             symbols: vec!["BTC-USD".into()],
             min_edge_threshold: Decimal::new(3, 2), // 0.03
             kelly_fraction_cap: Decimal::new(5, 1), // 0.5
@@ -819,6 +1068,8 @@ mod tests {
             stale_feed_timeout_secs: 30,
             unified_bb_weight: 0.4,
             unified_ma_weight: 0.4,
+            updown_enabled: true,
+            updown_only: false,
         }
     }
 
@@ -834,6 +1085,7 @@ mod tests {
             implied_prob_yes: dec!(0.40), // market says 40% yes
             implied_prob_no: dec!(0.60),
             direction,
+            market_type: MarketType::StrikeAbove,
         }
     }
 
@@ -844,12 +1096,13 @@ mod tests {
             vwap: Decimal::from_f64_retain(vwap).unwrap(),
             best_bid: Decimal::from_f64_retain(vwap - 1.0).unwrap(),
             best_ask: Decimal::from_f64_retain(vwap + 1.0).unwrap(),
-            best_bid_exchange: Exchange::Kraken,
+            best_bid_exchange: Exchange::Coinbase,
             best_ask_exchange: Exchange::Coinbase,
             spread: dec!(2.0),
             num_feeds: 3,
             timestamp: Utc::now(),
             volatility: 0.5, // 50% annualized vol
+            oracle_price: None,
         }
     }
 
@@ -1228,7 +1481,8 @@ mod tests {
         let signals = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_000.0)));
         let exits: Vec<_> = signals.iter().filter(|s| s.confidence == 0.0).collect();
         assert!(!exits.is_empty(), "should produce exit signal near expiry");
-        assert_eq!(exits[0].side, Side::Sell, "exit for Buy position = Sell");
+        assert_eq!(exits[0].side, Side::Buy, "exit keeps same side as position");
+        assert!(exits[0].is_exit, "exit signal should have is_exit=true");
     }
 
     // -----------------------------------------------------------------------
@@ -1275,7 +1529,8 @@ mod tests {
             !exits.is_empty(),
             "should exit when edge reverses against position"
         );
-        assert_eq!(exits[0].side, Side::Sell, "exit for Buy = Sell");
+        assert_eq!(exits[0].side, Side::Buy, "exit keeps same side as position");
+        assert!(exits[0].is_exit, "exit signal should have is_exit=true");
     }
 
     // -----------------------------------------------------------------------
@@ -1310,5 +1565,188 @@ mod tests {
         let signals = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_000.0)));
         let exits: Vec<_> = signals.iter().filter(|s| s.confidence == 0.0).collect();
         assert!(exits.is_empty(), "no exit when position is healthy");
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. Up/down signal when price above start
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_updown_signal_when_price_above_start() {
+        let mut config = make_config();
+        config.fee_rate_bps = 0; // zero fees for clean test
+        config.min_edge_threshold = Decimal::new(1, 2); // 0.01 low threshold
+        let mut strat = UnifiedStrategy::new(&config);
+
+        // Create an up/down market with window starting now - 60s (so we're past dead zone)
+        // Use 240s remaining to get a meaningful (non-degenerate) probability
+        let now = Utc::now();
+        let window_start_ts = now.timestamp() - 60;
+        let window_end = window_start_ts + 300;
+        let end_dt = chrono::DateTime::from_timestamp(window_end, 0).unwrap();
+
+        let market = PolymarketMarket {
+            condition_id: "updown-btc-1".into(),
+            token_id_yes: "up-token".into(),
+            token_id_no: "down-token".into(),
+            question: "Will BTC go up?".into(),
+            underlying_symbol: "BTC-USD".into(),
+            strike: Decimal::ZERO,
+            expiry: end_dt,
+            implied_prob_yes: dec!(0.50), // market says 50/50
+            implied_prob_no: dec!(0.50),
+            direction: MarketDirection::Bullish,
+            market_type: MarketType::UpDown {
+                window_start_ts,
+                window_secs: 300,
+            },
+        };
+
+        let cid = market.condition_id.clone();
+        inject_market(&mut strat, market);
+
+        // With vol=0.5 and ~240s remaining, sigma*sqrt(T) ≈ 0.00138
+        // A 0.01% move (100010 vs 100000) gives d2 ≈ 0.072 → P(up) ≈ 0.529 → edge ~0.029
+        let price = make_price("BTC-USD", 100_010.0);
+        strat
+            .updown_start_prices
+            .insert(cid, (100_000.0, window_start_ts));
+
+        // Inject price first so latest_prices is set
+        let signals = strat.on_event(StrategyEvent::PriceUpdate(price));
+
+        assert!(!signals.is_empty(), "should produce up/down signal");
+        assert_eq!(
+            signals[0].side,
+            Side::Buy,
+            "should Buy Up when prob_up > implied"
+        );
+
+        if let SignalMetadata::UpDown {
+            estimated_prob_up,
+            start_price,
+            spot,
+            ..
+        } = &signals[0].metadata
+        {
+            assert!(*estimated_prob_up > 0.5, "prob up should be >50%");
+            assert!((*start_price - 100_000.0).abs() < 1.0);
+            assert!((*spot - 100_010.0).abs() < 1.0);
+        } else {
+            panic!("expected UpDown metadata");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. Up/down short signal (Buy Down) when price below start
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_updown_short_signal_when_price_below_start() {
+        let mut config = make_config();
+        config.fee_rate_bps = 0;
+        config.min_edge_threshold = Decimal::new(1, 2); // 0.01
+        let mut strat = UnifiedStrategy::new(&config);
+
+        let now = Utc::now();
+        let window_start_ts = now.timestamp() - 60;
+        let window_end = window_start_ts + 300;
+        let end_dt = chrono::DateTime::from_timestamp(window_end, 0).unwrap();
+
+        let market = PolymarketMarket {
+            condition_id: "updown-btc-2".into(),
+            token_id_yes: "up-token".into(),
+            token_id_no: "down-token".into(),
+            question: "Will BTC go up?".into(),
+            underlying_symbol: "BTC-USD".into(),
+            strike: Decimal::ZERO,
+            expiry: end_dt,
+            implied_prob_yes: dec!(0.50),
+            implied_prob_no: dec!(0.50),
+            direction: MarketDirection::Bullish,
+            market_type: MarketType::UpDown {
+                window_start_ts,
+                window_secs: 300,
+            },
+        };
+
+        let cid = market.condition_id.clone();
+        inject_market(&mut strat, market);
+
+        // Start=100010, spot=100000 → price BELOW start → P(up) < 50% → Buy Down (Sell)
+        let price = make_price("BTC-USD", 100_000.0);
+        strat
+            .updown_start_prices
+            .insert(cid, (100_010.0, window_start_ts));
+
+        let signals = strat.on_event(StrategyEvent::PriceUpdate(price));
+
+        assert!(!signals.is_empty(), "should produce down signal");
+        assert_eq!(
+            signals[0].side,
+            Side::Sell,
+            "should Sell (Buy Down) when prob_up < implied"
+        );
+
+        if let SignalMetadata::UpDown {
+            estimated_prob_up, ..
+        } = &signals[0].metadata
+        {
+            assert!(
+                *estimated_prob_up < 0.5,
+                "prob up should be <50%, got {}",
+                estimated_prob_up
+            );
+        } else {
+            panic!("expected UpDown metadata");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. Up/down no duplicate signal once positioned
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_updown_no_duplicate_once_positioned() {
+        let mut config = make_config();
+        config.fee_rate_bps = 0;
+        config.min_edge_threshold = Decimal::new(1, 2);
+        let mut strat = UnifiedStrategy::new(&config);
+
+        let now = Utc::now();
+        let window_start_ts = now.timestamp() - 60;
+        let window_end = window_start_ts + 300;
+        let end_dt = chrono::DateTime::from_timestamp(window_end, 0).unwrap();
+
+        let market = PolymarketMarket {
+            condition_id: "updown-btc-3".into(),
+            token_id_yes: "up-token".into(),
+            token_id_no: "down-token".into(),
+            question: "Will BTC go up?".into(),
+            underlying_symbol: "BTC-USD".into(),
+            strike: Decimal::ZERO,
+            expiry: end_dt,
+            implied_prob_yes: dec!(0.50),
+            implied_prob_no: dec!(0.50),
+            direction: MarketDirection::Bullish,
+            market_type: MarketType::UpDown {
+                window_start_ts,
+                window_secs: 300,
+            },
+        };
+
+        let cid = market.condition_id.clone();
+        inject_market(&mut strat, market);
+        strat
+            .updown_start_prices
+            .insert(cid, (100_000.0, window_start_ts));
+
+        // First signal fires
+        let s1 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_010.0)));
+        assert!(!s1.is_empty(), "first signal should fire");
+
+        // Second tick — already positioned, should not fire again
+        let s2 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_010.0)));
+        assert!(
+            s2.is_empty(),
+            "should not fire duplicate signal while holding"
+        );
     }
 }

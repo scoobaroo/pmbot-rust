@@ -4,21 +4,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
-    Kraken,
     Coinbase,
     Bitfinex,
     Binance,
     Okx,
+    Chainlink,
 }
 
 impl std::fmt::Display for Exchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Exchange::Kraken => write!(f, "Kraken"),
             Exchange::Coinbase => write!(f, "Coinbase"),
             Exchange::Bitfinex => write!(f, "Bitfinex"),
             Exchange::Binance => write!(f, "Binance"),
             Exchange::Okx => write!(f, "OKX"),
+            Exchange::Chainlink => write!(f, "Chainlink"),
         }
     }
 }
@@ -58,6 +58,8 @@ pub struct AggregatedPrice {
     pub volatility: f64,
     pub num_feeds: usize,
     pub timestamp: DateTime<Utc>,
+    /// Chainlink oracle price, if available. Used for UpDown market resolution alignment.
+    pub oracle_price: Option<Decimal>,
 }
 
 /// Whether a market is bullish ("reach $X") or bearish ("dip to $X").
@@ -65,6 +67,18 @@ pub struct AggregatedPrice {
 pub enum MarketDirection {
     Bullish, // "Will X reach $Y" — P(S > K)
     Bearish, // "Will X dip to $Y" — P(S < K)
+}
+
+/// What kind of Polymarket crypto market this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketType {
+    /// Traditional strike-based: "Will BTC reach $100k?"
+    StrikeAbove,
+    /// Rolling 5-minute up/down: resolves Up if end_price >= start_price.
+    UpDown {
+        window_start_ts: i64,
+        window_secs: u64,
+    },
 }
 
 /// Polymarket market representation.
@@ -80,6 +94,7 @@ pub struct PolymarketMarket {
     pub implied_prob_yes: Decimal,
     pub implied_prob_no: Decimal,
     pub direction: MarketDirection,
+    pub market_type: MarketType,
 }
 
 /// A price level in an order book.

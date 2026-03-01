@@ -55,6 +55,29 @@ pub enum SignalMetadata {
         close: f64,
         timeframe: String,
     },
+    Unified {
+        estimated_prob: f64,
+        implied_prob: f64,
+        raw_edge: f64,
+        adjusted_edge: f64,
+        confluence_multiplier: f64,
+        bb_score: f64,
+        ma_score: f64,
+        kelly_fraction: f64,
+    },
+    UpDown {
+        estimated_prob_up: f64,
+        implied_prob_up: f64,
+        start_price: f64,
+        spot: f64,
+        time_remaining_secs: f64,
+        raw_edge: f64,
+        adjusted_edge: f64,
+        confluence_multiplier: f64,
+        bb_score: f64,
+        ma_score: f64,
+        kelly_fraction: f64,
+    },
 }
 
 /// Trading signals from the strategy engine.
@@ -67,6 +90,8 @@ pub struct TradeSignal {
     pub price: Decimal,
     pub metadata: SignalMetadata,
     pub timestamp: DateTime<Utc>,
+    /// true = selling tokens we already own (exit), false = buying tokens (entry)
+    pub is_exit: bool,
 }
 
 /// Feedback from execution engine to strategy.

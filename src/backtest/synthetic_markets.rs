@@ -1,5 +1,5 @@
 use crate::types::events::PolymarketUpdate;
-use crate::types::market::{MarketDirection, PolymarketMarket};
+use crate::types::market::{MarketDirection, MarketType, PolymarketMarket};
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -41,6 +41,7 @@ pub fn generate_markets(
                 implied_prob_yes: dec!(0.50),
                 implied_prob_no: dec!(0.50),
                 direction: *direction,
+                market_type: MarketType::StrikeAbove,
             });
         }
     }

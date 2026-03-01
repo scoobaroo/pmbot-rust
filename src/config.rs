@@ -45,12 +45,11 @@ pub struct Config {
     pub backtest_file: String,
 
     // API keys
-    pub kraken_api_key: String,
-    pub kraken_api_secret: String,
     pub coinbase_api_key: String,
     pub coinbase_api_secret: String,
     pub polymarket_private_key: String,
     pub polygon_rpc_url: String,
+    pub ethereum_rpc_url: String,
 
     // Trading parameters
     pub symbols: Vec<String>,
@@ -85,6 +84,10 @@ pub struct Config {
     pub unified_bb_weight: f64,
     pub unified_ma_weight: f64,
 
+    // Up/Down 5-minute markets
+    pub updown_enabled: bool,
+    pub updown_only: bool,
+
     // System
     pub log_level: String,
     pub stale_feed_timeout_secs: u64,
@@ -114,12 +117,11 @@ impl Config {
             mode: cli.mode,
             strategy: cli.strategy,
             backtest_file: cli.backtest_file.clone(),
-            kraken_api_key: env_or("KRAKEN_API_KEY", ""),
-            kraken_api_secret: env_or("KRAKEN_API_SECRET", ""),
             coinbase_api_key: env_or("COINBASE_API_KEY", ""),
             coinbase_api_secret: env_or("COINBASE_API_SECRET", ""),
             polymarket_private_key: env_or("POLYMARKET_PRIVATE_KEY", ""),
             polygon_rpc_url: env_or("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+            ethereum_rpc_url: env_or("ETHEREUM_RPC_URL", "https://eth.llamarpc.com"),
             symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD")
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -146,6 +148,8 @@ impl Config {
             ws_book_max_stale_secs: u64_or("WS_BOOK_MAX_STALE_SECS", 30),
             unified_bb_weight: f64_or("UNIFIED_BB_WEIGHT", 0.4),
             unified_ma_weight: f64_or("UNIFIED_MA_WEIGHT", 0.4),
+            updown_enabled: bool_or("UPDOWN_ENABLED", true),
+            updown_only: bool_or("UPDOWN_ONLY", false),
             log_level: env_or("LOG_LEVEL", "info"),
             stale_feed_timeout_secs: u64_or("STALE_FEED_TIMEOUT_SECS", 30),
         }
@@ -174,5 +178,9 @@ fn usize_or(key: &str, default: usize) -> usize {
 }
 
 fn f64_or(key: &str, default: f64) -> f64 {
+    env_or(key, &default.to_string()).parse().unwrap_or(default)
+}
+
+fn bool_or(key: &str, default: bool) -> bool {
     env_or(key, &default.to_string()).parse().unwrap_or(default)
 }

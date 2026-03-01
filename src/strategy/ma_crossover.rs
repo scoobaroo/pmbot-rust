@@ -123,6 +123,7 @@ impl MACrossoverStrategy {
                         timeframe: self.timeframe.to_string(),
                     },
                     timestamp: Utc::now(),
+                    is_exit: false,
                 })
             }
             _ => None,
@@ -167,12 +168,11 @@ mod tests {
             mode: crate::config::RunMode::Paper,
             strategy: crate::config::StrategyName::MaCrossover,
             backtest_file: String::new(),
-            kraken_api_key: String::new(),
-            kraken_api_secret: String::new(),
             coinbase_api_key: String::new(),
             coinbase_api_secret: String::new(),
             polymarket_private_key: String::new(),
             polygon_rpc_url: String::new(),
+            ethereum_rpc_url: String::new(),
             symbols: vec!["BTC-USD".into()],
             min_edge_threshold: Decimal::new(3, 2),
             kelly_fraction_cap: Decimal::new(5, 1),
@@ -194,6 +194,10 @@ mod tests {
             maker_mode: true,
             heartbeat_interval_secs: 10,
             ws_book_max_stale_secs: 30,
+            unified_bb_weight: 0.4,
+            unified_ma_weight: 0.4,
+            updown_enabled: true,
+            updown_only: false,
             log_level: "info".into(),
             stale_feed_timeout_secs: 30,
         }

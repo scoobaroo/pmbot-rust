@@ -107,9 +107,17 @@ impl ExecutionEngine {
         market: &crate::types::market::PolymarketMarket,
         exec_tx: &mpsc::Sender<ExecutionEvent>,
     ) {
+        // Token selection: Buy → yes token, Sell → no token
         let token_id = match signal.side {
             Side::Buy => &market.token_id_yes,
             Side::Sell => &market.token_id_no,
+        };
+
+        // CLOB side: BUY for entries (acquiring tokens), SELL for exits (selling owned tokens)
+        let clob_side = if signal.is_exit {
+            Side::Sell
+        } else {
+            Side::Buy
         };
 
         let price = signal.price;
@@ -123,7 +131,7 @@ impl ExecutionEngine {
         let order = Order::new(
             market.condition_id.clone(),
             token_id.clone(),
-            signal.side,
+            clob_side,
             OrderType::Limit,
             price,
             token_size,

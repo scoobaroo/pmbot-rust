@@ -109,21 +109,40 @@ impl Aggregator {
             return None;
         }
 
-        // VWAP: sum(price * volume) / sum(volume)
-        let total_volume: Decimal = ticks.iter().map(|t| t.volume_24h).sum();
-        let vwap = if total_volume > Decimal::ZERO {
-            ticks
-                .iter()
-                .map(|t| t.mid() * t.volume_24h)
-                .sum::<Decimal>()
-                / total_volume
+        // Separate Chainlink ticks from exchange ticks
+        let exchange_ticks: Vec<&&MarketTick> = ticks
+            .iter()
+            .filter(|t| t.exchange != Exchange::Chainlink)
+            .collect();
+        let chainlink_tick = ticks.iter().find(|t| t.exchange == Exchange::Chainlink);
+
+        let oracle_price = chainlink_tick.map(|t| t.mid());
+
+        // Exchange VWAP (excluding Chainlink — it has zero volume)
+        let exchange_vwap = if exchange_ticks.is_empty() {
+            // Only Chainlink available — use its price
+            oracle_price.unwrap_or(Decimal::ZERO)
         } else {
-            // Fallback: simple average of mids
-            let sum: Decimal = ticks.iter().map(|t| t.mid()).sum();
-            sum / Decimal::from(ticks.len())
+            let total_volume: Decimal = exchange_ticks.iter().map(|t| t.volume_24h).sum();
+            if total_volume > Decimal::ZERO {
+                exchange_ticks
+                    .iter()
+                    .map(|t| t.mid() * t.volume_24h)
+                    .sum::<Decimal>()
+                    / total_volume
+            } else {
+                let sum: Decimal = exchange_ticks.iter().map(|t| t.mid()).sum();
+                sum / Decimal::from(exchange_ticks.len())
+            }
         };
 
-        // Best bid/ask across exchanges
+        // Final VWAP: equal-weight Chainlink with exchange VWAP if available
+        let vwap = match oracle_price {
+            Some(op) if !exchange_ticks.is_empty() => (exchange_vwap + op) / Decimal::TWO,
+            _ => exchange_vwap,
+        };
+
+        // Best bid/ask across all feeds (including Chainlink)
         let best_bid_tick = ticks.iter().max_by(|a, b| a.bid.cmp(&b.bid)).unwrap();
         let best_ask_tick = ticks.iter().min_by(|a, b| a.ask.cmp(&b.ask)).unwrap();
 
@@ -144,6 +163,7 @@ impl Aggregator {
             volatility,
             num_feeds: ticks.len(),
             timestamp: Utc::now(),
+            oracle_price,
         })
     }
 

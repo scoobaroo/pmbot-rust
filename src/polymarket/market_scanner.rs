@@ -1,5 +1,5 @@
 use crate::types::events::PolymarketUpdate;
-use crate::types::market::{MarketDirection, PolymarketMarket};
+use crate::types::market::{MarketDirection, MarketType, PolymarketMarket};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
@@ -11,28 +11,50 @@ use tracing::{debug, error, info, warn};
 
 const GAMMA_API_URL: &str = "https://gamma-api.polymarket.com";
 
+/// Mapping from up/down slug prefix to the exchange symbol we track.
+const UPDOWN_ASSETS: &[(&str, &str)] = &[
+    ("btc", "BTC-USD"),
+    ("eth", "ETH-USD"),
+    ("sol", "SOL-USD"),
+    ("xrp", "XRP-USD"),
+];
+
 pub struct MarketScanner {
     http: Client,
     symbols: Vec<String>,
     poll_interval_secs: u64,
     token_tx: mpsc::Sender<Vec<String>>,
+    updown_enabled: bool,
+    updown_only: bool,
 }
 
 impl MarketScanner {
-    pub fn new(symbols: Vec<String>, token_tx: mpsc::Sender<Vec<String>>) -> Self {
+    pub fn new(
+        symbols: Vec<String>,
+        token_tx: mpsc::Sender<Vec<String>>,
+        updown_enabled: bool,
+        updown_only: bool,
+    ) -> Self {
         Self {
             http: Client::new(),
             symbols,
             poll_interval_secs: 60,
             token_tx,
+            updown_enabled,
+            updown_only,
         }
     }
 
     pub async fn run(self, tx: mpsc::Sender<PolymarketUpdate>, shutdown: CancellationToken) {
-        info!("Market scanner started");
+        info!(
+            updown_enabled = self.updown_enabled,
+            updown_only = self.updown_only,
+            "Market scanner started"
+        );
 
-        let mut interval =
+        let mut strike_interval =
             tokio::time::interval(std::time::Duration::from_secs(self.poll_interval_secs));
+        let mut updown_interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
         loop {
             tokio::select! {
@@ -40,31 +62,50 @@ impl MarketScanner {
                     info!("Market scanner shutting down");
                     return;
                 }
-                _ = interval.tick() => {
-                    match self.scan_markets().await {
-                        Ok(markets) if !markets.is_empty() => {
-                            info!(count = markets.len(), "found crypto price markets");
-
-                            // Collect all token IDs and send to orderbook stream
-                            let token_ids: Vec<String> = markets
-                                .iter()
-                                .flat_map(|m| vec![m.token_id_yes.clone(), m.token_id_no.clone()])
-                                .collect();
-
-                            if let Err(e) = self.token_tx.send(token_ids).await {
-                                warn!(error = %e, "failed to send token IDs to orderbook stream");
-                            }
-
-                            let _ = tx.send(PolymarketUpdate::MarketsDiscovered(markets)).await;
-                        }
-                        Ok(_) => {
-                            debug!("no new crypto price markets found");
-                        }
-                        Err(e) => {
-                            error!(error = %e, "market scan failed");
-                        }
-                    }
+                _ = strike_interval.tick(), if !self.updown_only => {
+                    self.poll_and_send(
+                        self.scan_markets().await,
+                        "crypto price markets",
+                        &tx,
+                    ).await;
                 }
+                _ = updown_interval.tick(), if self.updown_enabled => {
+                    self.poll_and_send(
+                        self.scan_updown_markets().await,
+                        "up/down markets",
+                        &tx,
+                    ).await;
+                }
+            }
+        }
+    }
+
+    async fn poll_and_send(
+        &self,
+        result: Result<Vec<PolymarketMarket>, reqwest::Error>,
+        label: &str,
+        tx: &mpsc::Sender<PolymarketUpdate>,
+    ) {
+        match result {
+            Ok(markets) if !markets.is_empty() => {
+                info!(count = markets.len(), "found {}", label);
+
+                let token_ids: Vec<String> = markets
+                    .iter()
+                    .flat_map(|m| vec![m.token_id_yes.clone(), m.token_id_no.clone()])
+                    .collect();
+
+                if let Err(e) = self.token_tx.send(token_ids).await {
+                    warn!(error = %e, "failed to send token IDs to orderbook stream");
+                }
+
+                let _ = tx.send(PolymarketUpdate::MarketsDiscovered(markets)).await;
+            }
+            Ok(_) => {
+                debug!("no new {} found", label);
+            }
+            Err(e) => {
+                error!(error = %e, "{} scan failed", label);
             }
         }
     }
@@ -104,6 +145,53 @@ impl MarketScanner {
 
         Ok(all_markets)
     }
+
+    async fn scan_updown_markets(&self) -> Result<Vec<PolymarketMarket>, reqwest::Error> {
+        let window_start = current_5m_window_start();
+        let mut all_markets = Vec::new();
+
+        for &(slug_prefix, symbol) in UPDOWN_ASSETS {
+            if !self.symbols.iter().any(|s| s == symbol) {
+                continue;
+            }
+
+            let slug = format!("{}-updown-5m-{}", slug_prefix, window_start);
+            let resp = self
+                .http
+                .get(format!("{}/events", GAMMA_API_URL))
+                .query(&[("slug", slug.as_str())])
+                .send()
+                .await?;
+
+            let events: Vec<serde_json::Value> = resp.json().await?;
+            for event in &events {
+                let nested = match event.get("markets").and_then(|m| m.as_array()) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                for m in nested {
+                    if let Some(market) = parse_updown_market(m, symbol, window_start) {
+                        info!(
+                            question = %market.question,
+                            symbol = %market.underlying_symbol,
+                            token_up = %market.token_id_yes,
+                            implied_up = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
+                            "discovered up/down market"
+                        );
+                        all_markets.push(market);
+                    }
+                }
+            }
+        }
+
+        Ok(all_markets)
+    }
+}
+
+/// Returns the Unix timestamp of the current 5-minute window start.
+fn current_5m_window_start() -> i64 {
+    let now = Utc::now().timestamp();
+    now - (now % 300)
 }
 
 /// Map full crypto names in questions to ticker symbols.
@@ -154,18 +242,13 @@ fn parse_crypto_market(
 
     let condition_id = v.get("conditionId")?.as_str()?.to_string();
 
-    // Get token IDs from clobTokenIds array (not tokens[].token_id)
-    let clob_tokens = v.get("clobTokenIds")?.as_array()?;
-    if clob_tokens.len() < 2 {
-        return None;
-    }
-    let token_yes = clob_tokens[0].as_str()?.to_string();
-    let token_no = clob_tokens[1].as_str()?.to_string();
+    // Get token IDs from clobTokenIds — may be a JSON string or a direct array
+    let (token_yes, token_no) = parse_clob_token_ids(v)?;
 
     // Parse expiry
     let end_date = v
         .get("endDate")
-        .or_else(|| v.get("end_date_iso"))
+        .or_else(|| v.get("endDateIso"))
         .and_then(|d| d.as_str())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc))
@@ -188,6 +271,7 @@ fn parse_crypto_market(
         implied_prob_yes: yes_price,
         implied_prob_no: no_price,
         direction,
+        market_type: MarketType::StrikeAbove,
     })
 }
 
@@ -206,6 +290,75 @@ fn parse_outcome_price(v: &serde_json::Value, index: usize) -> Option<Decimal> {
     } else {
         None
     }
+}
+
+/// Parse clobTokenIds which may be a JSON-encoded string or a direct array.
+fn parse_clob_token_ids(v: &serde_json::Value) -> Option<(String, String)> {
+    let raw = v.get("clobTokenIds")?;
+
+    let tokens: Vec<String> = if let Some(s) = raw.as_str() {
+        // JSON-encoded string like "[\"token1\",\"token2\"]"
+        serde_json::from_str(s).ok()?
+    } else if let Some(arr) = raw.as_array() {
+        arr.iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect()
+    } else {
+        return None;
+    };
+
+    if tokens.len() < 2 {
+        return None;
+    }
+    Some((tokens[0].clone(), tokens[1].clone()))
+}
+
+/// Parse a 5-minute up/down market from the Gamma API response.
+fn parse_updown_market(
+    v: &serde_json::Value,
+    symbol: &str,
+    window_start_ts: i64,
+) -> Option<PolymarketMarket> {
+    let condition_id = v.get("conditionId")?.as_str()?.to_string();
+    let question = v
+        .get("question")
+        .and_then(|q| q.as_str())
+        .unwrap_or("Up or Down?")
+        .to_string();
+
+    // clobTokenIds: [0] = Up, [1] = Down
+    let (token_up, token_down) = parse_clob_token_ids(v)?;
+
+    // Parse expiry
+    let end_date = v
+        .get("endDate")
+        .or_else(|| v.get("endDateIso"))
+        .and_then(|d| d.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|| {
+            DateTime::from_timestamp(window_start_ts + 300, 0).unwrap_or_else(Utc::now)
+        });
+
+    let up_price = parse_outcome_price(v, 0).unwrap_or(Decimal::new(50, 2));
+    let down_price = parse_outcome_price(v, 1).unwrap_or(Decimal::ONE - up_price);
+
+    Some(PolymarketMarket {
+        condition_id,
+        token_id_yes: token_up,  // "Up" token
+        token_id_no: token_down, // "Down" token
+        question,
+        underlying_symbol: symbol.to_string(),
+        strike: Decimal::ZERO, // No strike for up/down
+        expiry: end_date,
+        implied_prob_yes: up_price,          // P(Up)
+        implied_prob_no: down_price,         // P(Down)
+        direction: MarketDirection::Bullish, // Up = bullish
+        market_type: MarketType::UpDown {
+            window_start_ts,
+            window_secs: 300,
+        },
+    })
 }
 
 fn extract_strike_from_question(question: &str) -> Option<Decimal> {
@@ -282,10 +435,11 @@ mod tests {
 
     #[test]
     fn test_parse_crypto_market() {
+        // clobTokenIds is a JSON-encoded string in the real API
         let market_json = serde_json::json!({
             "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
             "conditionId": "0xdaa4",
-            "clobTokenIds": ["56078", "11291"],
+            "clobTokenIds": "[\"56078\",\"11291\"]",
             "outcomePrices": "[\"0.35\",\"0.65\"]",
             "outcomes": ["Yes", "No"],
             "endDate": "2027-01-01T05:00:00Z"
@@ -307,7 +461,7 @@ mod tests {
         let market_json = serde_json::json!({
             "question": "Will Ethereum dip to $1,500 by March 2026?",
             "conditionId": "0xbeef",
-            "clobTokenIds": ["token_a", "token_b"],
+            "clobTokenIds": "[\"token_a\",\"token_b\"]",
             "outcomePrices": "[\"0.20\",\"0.80\"]",
             "endDate": "2026-04-01T00:00:00Z"
         });
@@ -320,11 +474,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_updown_market() {
+        let market_json = serde_json::json!({
+            "conditionId": "0xup1",
+            "question": "Will BTC go up in the next 5 minutes?",
+            "clobTokenIds": ["up_token_123", "down_token_456"],
+            "outcomePrices": ["0.52", "0.48"],
+            "outcomes": ["Up", "Down"],
+            "endDate": "2026-02-28T12:05:00Z"
+        });
+
+        let market = parse_updown_market(&market_json, "BTC-USD", 1772280000).unwrap();
+        assert_eq!(market.condition_id, "0xup1");
+        assert_eq!(market.underlying_symbol, "BTC-USD");
+        assert_eq!(market.token_id_yes, "up_token_123");
+        assert_eq!(market.token_id_no, "down_token_456");
+        assert_eq!(market.strike, Decimal::ZERO);
+        assert_eq!(market.implied_prob_yes, Decimal::new(52, 2));
+        assert_eq!(
+            market.market_type,
+            MarketType::UpDown {
+                window_start_ts: 1772280000,
+                window_secs: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn test_current_5m_window_start() {
+        let ts = current_5m_window_start();
+        assert_eq!(ts % 300, 0, "window start must be aligned to 5 minutes");
+        let now = Utc::now().timestamp();
+        assert!(now - ts < 300, "window start must be within current window");
+        assert!(ts <= now, "window start must be <= now");
+    }
+
+    #[test]
     fn test_parse_rejects_non_crypto() {
         let market_json = serde_json::json!({
             "question": "Will Trump win the election?",
             "conditionId": "0x1234",
-            "clobTokenIds": ["aaa", "bbb"],
+            "clobTokenIds": "[\"aaa\",\"bbb\"]",
             "outcomePrices": "[\"0.50\",\"0.50\"]",
             "endDate": "2026-11-01T00:00:00Z"
         });

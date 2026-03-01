@@ -6,4 +6,5 @@ pub mod ma_crossover;
 pub mod probability;
 pub mod runner;
 pub mod traits;
+pub mod unified;
 pub mod volatility;
