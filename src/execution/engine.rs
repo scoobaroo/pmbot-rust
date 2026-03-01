@@ -1,5 +1,5 @@
 use crate::config::{Config, RunMode};
-use crate::exchanges::kraken_trading::KrakenSpotClient;
+use crate::execution::paper_tracker::PaperTracker;
 use crate::execution::risk::RiskManager;
 use crate::polymarket::client::{OrderParams, PolymarketClient};
 use crate::types::events::{ExecutionEvent, TradeSignal, TradeTarget};
@@ -15,26 +15,22 @@ use tracing::{error, info, warn};
 pub struct ExecutionEngine {
     config: Config,
     client: Option<Arc<PolymarketClient>>,
-    spot_client: Option<Arc<KrakenSpotClient>>,
     risk: RiskManager,
     open_orders: HashMap<String, Order>,
     maker_mode: bool,
+    paper_tracker: PaperTracker,
 }
 
 impl ExecutionEngine {
-    pub fn new(
-        config: Config,
-        client: Option<PolymarketClient>,
-        spot_client: Option<KrakenSpotClient>,
-    ) -> Self {
+    pub fn new(config: Config, client: Option<PolymarketClient>) -> Self {
         let risk = RiskManager::new(&config);
         let maker_mode = config.maker_mode;
         Self {
             maker_mode,
             client: client.map(Arc::new),
-            spot_client: spot_client.map(Arc::new),
             risk,
             open_orders: HashMap::new(),
+            paper_tracker: PaperTracker::new(),
             config,
         }
     }
@@ -66,7 +62,12 @@ impl ExecutionEngine {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("Execution engine shutting down");
+                    info!(
+                        realized_pnl = %self.paper_tracker.realized_pnl(),
+                        total_fees = %self.paper_tracker.total_fees(),
+                        open_positions = self.paper_tracker.open_position_count(),
+                        "Execution engine shutting down — final paper P&L"
+                    );
                     self.cancel_all_open_orders(&exec_tx).await;
                     return;
                 }
@@ -169,80 +170,17 @@ impl ExecutionEngine {
             token_size,
         );
 
-        match self.config.mode {
-            RunMode::Live if self.spot_client.is_some() => {
-                info!(
-                    order_id = %order.id,
-                    side = %order.side,
-                    symbol = symbol,
-                    price = %order.price,
-                    size = %order.size,
-                    "executing spot order (live via Kraken)"
-                );
-                self.execute_spot_live(order, symbol, exec_tx).await;
-            }
-            _ => {
-                info!(
-                    order_id = %order.id,
-                    side = %order.side,
-                    symbol = symbol,
-                    price = %order.price,
-                    size = %order.size,
-                    "executing spot order (simulated)"
-                );
-                self.execute_simulated(order, exec_tx).await;
-            }
-        }
-    }
+        info!(
+            order_id = %order.id,
+            side = %order.side,
+            symbol = symbol,
+            price = %order.price,
+            size = %order.size,
+            "executing spot order (simulated)"
+        );
 
-    async fn execute_spot_live(
-        &mut self,
-        mut order: Order,
-        symbol: &str,
-        exec_tx: &mpsc::Sender<ExecutionEvent>,
-    ) {
-        let client = match &self.spot_client {
-            Some(c) => c,
-            None => {
-                error!("no Kraken spot client configured for live mode");
-                return;
-            }
-        };
-
-        let pair = KrakenSpotClient::to_kraken_pair(symbol);
-        let order_type = match order.order_type {
-            OrderType::Market => "market",
-            OrderType::Limit => "limit",
-        };
-
-        let price = if order.order_type == OrderType::Limit {
-            Some(order.price)
-        } else {
-            None
-        };
-
-        match client
-            .place_order(&pair, order.side, order_type, order.size, price)
-            .await
-        {
-            Ok(txid) => {
-                order.id = txid;
-                order.status = OrderStatus::Open;
-                let _ = exec_tx
-                    .send(ExecutionEvent::OrderPlaced(order.clone()))
-                    .await;
-                self.open_orders.insert(order.id.clone(), order);
-            }
-            Err(e) => {
-                order.status = OrderStatus::Failed;
-                let _ = exec_tx
-                    .send(ExecutionEvent::OrderFailed {
-                        order_id: order.id,
-                        error: e.to_string(),
-                    })
-                    .await;
-            }
-        }
+        // Spot orders are always simulated — bot trades only on Polymarket
+        self.execute_simulated(order, exec_tx).await;
     }
 
     async fn execute_live(&mut self, mut order: Order, exec_tx: &mpsc::Sender<ExecutionEvent>) {
@@ -346,6 +284,10 @@ impl ExecutionEngine {
             timestamp: Utc::now(),
             fee: order.size * order.price * Decimal::new(2, 4), // 0.02% fee
         };
+
+        // Track paper P&L
+        self.paper_tracker.record_fill(&order.condition_id, &fill);
+        self.paper_tracker.maybe_report();
 
         let _ = exec_tx
             .send(ExecutionEvent::OrderPlaced(order.clone()))
