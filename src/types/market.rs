@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
     Coinbase,
-    Bitfinex,
     Binance,
     Okx,
     Chainlink,
@@ -15,7 +14,6 @@ impl std::fmt::Display for Exchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Exchange::Coinbase => write!(f, "Coinbase"),
-            Exchange::Bitfinex => write!(f, "Bitfinex"),
             Exchange::Binance => write!(f, "Binance"),
             Exchange::Okx => write!(f, "OKX"),
             Exchange::Chainlink => write!(f, "Chainlink"),

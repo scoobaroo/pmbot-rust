@@ -45,7 +45,6 @@ pub fn load_ticks(path: &Path) -> Result<Vec<MarketTick>, DataLoadError> {
 
         let exchange = match record.get(1).unwrap_or("Coinbase") {
             "Coinbase" => Exchange::Coinbase,
-            "Bitfinex" => Exchange::Bitfinex,
             "Binance" => Exchange::Binance,
             "OKX" => Exchange::Okx,
             other => {

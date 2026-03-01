@@ -1,7 +1,6 @@
 use clap::Parser;
 use pmbot_rust::config::{Cli, Config, RunMode, StrategyName};
 use pmbot_rust::exchanges::binance::BinanceFeed;
-use pmbot_rust::exchanges::bitfinex::BitfinexFeed;
 use pmbot_rust::exchanges::coinbase::CoinbaseFeed;
 use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
@@ -135,7 +134,6 @@ async fn main() {
                 }};
             }
             spawn_feed!(CoinbaseFeed::new());
-            spawn_feed!(BitfinexFeed);
             spawn_feed!(BinanceFeed);
             spawn_feed!(OkxFeed);
 

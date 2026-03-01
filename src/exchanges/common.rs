@@ -4,7 +4,6 @@ use crate::types::market::Exchange;
 pub fn normalize_symbol(exchange: Exchange, raw: &str) -> String {
     match exchange {
         Exchange::Coinbase => normalize_coinbase(raw),
-        Exchange::Bitfinex => normalize_bitfinex(raw),
         Exchange::Binance => normalize_binance(raw),
         Exchange::Okx => normalize_okx(raw),
         Exchange::Chainlink => raw.to_string(), // already canonical BTC-USD
@@ -21,13 +20,6 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
 
     match exchange {
         Exchange::Coinbase => format!("{}-{}", base, quote),
-        Exchange::Bitfinex => {
-            let base = match base {
-                "USDT" => "UST",
-                other => other,
-            };
-            format!("t{}{}", base, quote)
-        }
         Exchange::Binance => {
             // Binance WS subscriptions require lowercase: "btcusdt"
             let quote = match quote {
@@ -51,24 +43,6 @@ pub fn to_exchange_symbol(exchange: Exchange, canonical: &str) -> String {
 fn normalize_coinbase(raw: &str) -> String {
     // Coinbase already uses "BTC-USD"
     raw.to_string()
-}
-
-fn normalize_bitfinex(raw: &str) -> String {
-    // "tBTCUSD" → "BTC-USD"
-    let s = raw.strip_prefix('t').unwrap_or(raw);
-    if s.len() == 6 {
-        let (base, quote) = s.split_at(3);
-        let base = match base {
-            "UST" => "USDT",
-            other => other,
-        };
-        format!("{}-{}", base, quote)
-    } else if s.contains(':') {
-        let parts: Vec<&str> = s.split(':').collect();
-        format!("{}-{}", parts[0], parts.get(1).unwrap_or(&"USD"))
-    } else {
-        s.to_string()
-    }
 }
 
 fn normalize_binance(raw: &str) -> String {
@@ -105,12 +79,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bitfinex_normalization() {
-        assert_eq!(normalize_symbol(Exchange::Bitfinex, "tBTCUSD"), "BTC-USD");
-        assert_eq!(normalize_symbol(Exchange::Bitfinex, "tETHUSD"), "ETH-USD");
-    }
-
-    #[test]
     fn test_binance_normalization() {
         assert_eq!(normalize_symbol(Exchange::Binance, "BTCUSDT"), "BTC-USD");
         assert_eq!(normalize_symbol(Exchange::Binance, "ETHUSDT"), "ETH-USD");
@@ -141,7 +109,6 @@ mod tests {
     #[test]
     fn test_to_exchange_symbol() {
         assert_eq!(to_exchange_symbol(Exchange::Coinbase, "BTC-USD"), "BTC-USD");
-        assert_eq!(to_exchange_symbol(Exchange::Bitfinex, "BTC-USD"), "tBTCUSD");
         assert_eq!(to_exchange_symbol(Exchange::Binance, "BTC-USD"), "btcusdt");
         assert_eq!(to_exchange_symbol(Exchange::Okx, "BTC-USD"), "BTC-USDT");
     }

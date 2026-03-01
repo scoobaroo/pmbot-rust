@@ -1,5 +1,4 @@
 pub mod binance;
-pub mod bitfinex;
 pub mod chainlink;
 pub mod coinbase;
 pub mod common;
