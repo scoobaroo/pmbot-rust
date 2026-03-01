@@ -13,6 +13,7 @@ pub enum RunMode {
 pub enum StrategyName {
     BlackScholes,
     MaCrossover,
+    BollingerBands,
 }
 
 #[derive(Parser, Debug)]
@@ -61,6 +62,12 @@ pub struct Config {
     pub ma_timeframe: String,
     pub ma_size_usd: Decimal,
 
+    // Bollinger Bands strategy parameters
+    pub bb_period: usize,
+    pub bb_num_std: f64,
+    pub bb_timeframe: String,
+    pub bb_size_usd: Decimal,
+
     // Polymarket fee/execution settings
     pub fee_rate_bps: u32,
     pub maker_mode: bool,
@@ -101,6 +108,10 @@ impl Config {
             ma_slow_period: usize_or("MA_SLOW_PERIOD", 21),
             ma_timeframe: env_or("MA_TIMEFRAME", "5m"),
             ma_size_usd: dec_or("MA_SIZE_USD", "500"),
+            bb_period: usize_or("BB_PERIOD", 20),
+            bb_num_std: f64_or("BB_NUM_STD", 2.0),
+            bb_timeframe: env_or("BB_TIMEFRAME", "5m"),
+            bb_size_usd: dec_or("BB_SIZE_USD", "500"),
             fee_rate_bps: u32_or("FEE_RATE_BPS", 156),
             maker_mode: cli.maker_mode,
             heartbeat_interval_secs: u64_or("HEARTBEAT_INTERVAL_SECS", 10),
@@ -129,5 +140,9 @@ fn u32_or(key: &str, default: u32) -> u32 {
 }
 
 fn usize_or(key: &str, default: usize) -> usize {
+    env_or(key, &default.to_string()).parse().unwrap_or(default)
+}
+
+fn f64_or(key: &str, default: f64) -> f64 {
     env_or(key, &default.to_string()).parse().unwrap_or(default)
 }

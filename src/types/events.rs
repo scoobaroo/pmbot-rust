@@ -48,6 +48,13 @@ pub enum SignalMetadata {
         slow_ema: f64,
         timeframe: String,
     },
+    BollingerBands {
+        sma: f64,
+        upper: f64,
+        lower: f64,
+        close: f64,
+        timeframe: String,
+    },
 }
 
 /// Trading signals from the strategy engine.

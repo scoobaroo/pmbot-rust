@@ -39,6 +39,10 @@ async fn main() {
             let tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
             vec![tf]
         }
+        StrategyName::BollingerBands => {
+            let tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
+            vec![tf]
+        }
         StrategyName::BlackScholes => vec![], // no candles needed
     };
 
@@ -52,7 +56,9 @@ async fn main() {
                 .with_book_cache(book_cache.clone());
             Box::new(bs)
         }
-        StrategyName::MaCrossover => pmbot_rust::strategy::factory::create_strategy(&config),
+        StrategyName::MaCrossover | StrategyName::BollingerBands => {
+            pmbot_rust::strategy::factory::create_strategy(&config)
+        }
     };
     let needs_polymarket = strategy.subscriptions().polymarket_updates;
 
