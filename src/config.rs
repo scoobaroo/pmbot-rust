@@ -83,6 +83,12 @@ pub struct Config {
     // Unified strategy weights
     pub unified_bb_weight: f64,
     pub unified_ma_weight: f64,
+    pub unified_book_weight: f64,
+
+    // Arb fallback parameters
+    pub arb_threshold: Decimal,
+    pub min_arb_profit: Decimal,
+    pub arb_size_usd: Decimal,
 
     // Up/Down 5-minute markets
     pub updown_enabled: bool,
@@ -148,6 +154,10 @@ impl Config {
             ws_book_max_stale_secs: u64_or("WS_BOOK_MAX_STALE_SECS", 30),
             unified_bb_weight: f64_or("UNIFIED_BB_WEIGHT", 0.4),
             unified_ma_weight: f64_or("UNIFIED_MA_WEIGHT", 0.4),
+            unified_book_weight: f64_or("UNIFIED_BOOK_WEIGHT", 0.3),
+            arb_threshold: dec_or("ARB_THRESHOLD", "0.97"),
+            min_arb_profit: dec_or("MIN_ARB_PROFIT", "0.03"),
+            arb_size_usd: dec_or("ARB_SIZE_USD", "5"),
             updown_enabled: bool_or("UPDOWN_ENABLED", true),
             updown_only: bool_or("UPDOWN_ONLY", false),
             log_level: env_or("LOG_LEVEL", "info"),

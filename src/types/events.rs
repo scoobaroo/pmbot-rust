@@ -63,6 +63,7 @@ pub enum SignalMetadata {
         confluence_multiplier: f64,
         bb_score: f64,
         ma_score: f64,
+        book_score: f64,
         kelly_fraction: f64,
     },
     UpDown {
@@ -76,7 +77,14 @@ pub enum SignalMetadata {
         confluence_multiplier: f64,
         bb_score: f64,
         ma_score: f64,
+        book_score: f64,
         kelly_fraction: f64,
+    },
+    Arbitrage {
+        yes_ask: Decimal,
+        no_ask: Decimal,
+        total_cost: Decimal,
+        profit_pct: Decimal,
     },
 }
 

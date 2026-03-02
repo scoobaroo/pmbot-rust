@@ -12,7 +12,7 @@ use chrono::Utc;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
 /// Default half-spread estimate when no live book data is available.
@@ -100,12 +100,19 @@ pub struct UnifiedStrategy {
     // Confluence weights
     bb_weight: f64,
     ma_weight: f64,
+    book_weight: f64,
 
     // Open positions for exit logic (keyed by condition_id)
     open_positions: HashMap<String, OpenPosition>,
 
     // Up/down: captured VWAP at window start, keyed by condition_id → (start_price, window_start_ts)
     updown_start_prices: HashMap<String, (f64, i64)>,
+
+    // Arb fallback state
+    active_arbs: HashSet<String>,
+    arb_threshold: Decimal,
+    min_arb_profit: Decimal,
+    arb_size_usd: Decimal,
 }
 
 impl UnifiedStrategy {
@@ -144,9 +151,15 @@ impl UnifiedStrategy {
 
             bb_weight: config.unified_bb_weight,
             ma_weight: config.unified_ma_weight,
+            book_weight: config.unified_book_weight,
 
             open_positions: HashMap::new(),
             updown_start_prices: HashMap::new(),
+
+            active_arbs: HashSet::new(),
+            arb_threshold: config.arb_threshold,
+            min_arb_profit: config.min_arb_profit,
+            arb_size_usd: config.arb_size_usd,
         }
     }
 
@@ -328,6 +341,46 @@ impl UnifiedStrategy {
     }
 
     // -------------------------------------------------------------------
+    // Confluence: Order book depth imbalance
+    // -------------------------------------------------------------------
+
+    /// Compute a book depth imbalance score for a market.
+    /// Returns -1.0 (bearish) to +1.0 (bullish), or 0.0 if no fresh data.
+    ///
+    /// Bullish pressure = YES bids + NO asks (people buying YES / selling NO)
+    /// Bearish pressure = YES asks + NO bids (people selling YES / buying NO)
+    fn book_imbalance_score(&self, market: &PolymarketMarket) -> f64 {
+        let cache = match self.book_cache.as_ref() {
+            Some(c) => c,
+            None => return 0.0,
+        };
+        let books = match cache.try_read() {
+            Ok(b) => b,
+            Err(_) => return 0.0,
+        };
+
+        let yes_snap = match books.get(&market.token_id_yes) {
+            Some(s) if s.is_fresh(self.ws_book_max_stale_secs) => s,
+            _ => return 0.0,
+        };
+        let no_snap = match books.get(&market.token_id_no) {
+            Some(s) if s.is_fresh(self.ws_book_max_stale_secs) => s,
+            _ => return 0.0,
+        };
+
+        let bullish = yes_snap.depth_bid + no_snap.depth_ask;
+        let bearish = yes_snap.depth_ask + no_snap.depth_bid;
+        let total = bullish + bearish;
+
+        if total.is_zero() {
+            return 0.0;
+        }
+
+        let score = (bullish - bearish) / total;
+        score.to_f64().unwrap_or(0.0).clamp(-1.0, 1.0)
+    }
+
+    // -------------------------------------------------------------------
     // Cooldown management
     // -------------------------------------------------------------------
 
@@ -416,7 +469,9 @@ impl UnifiedStrategy {
         // 3. Stop-loss: adjusted edge deeply negative (entry_edge eroded by >50%)
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma).clamp(0.0, 2.0);
+        let book = self.book_imbalance_score(market);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+            .clamp(0.0, 2.0);
         let current_adjusted = raw_edge.abs() * multiplier;
         if current_adjusted < pos.entry_edge * -0.5 {
             info!(
@@ -454,11 +509,97 @@ impl UnifiedStrategy {
                 confluence_multiplier: 0.0,
                 bb_score: 0.0,
                 ma_score: 0.0,
+                book_score: 0.0,
                 kelly_fraction: 0.0,
             },
             timestamp: Utc::now(),
             is_exit: true,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Arb fallback: buy YES + NO when combined ask < threshold
+    // -------------------------------------------------------------------
+
+    fn check_arb_opportunity(&self, market: &PolymarketMarket) -> Option<Vec<TradeSignal>> {
+        // Skip if already have an arb position on this market
+        if self.active_arbs.contains(&market.condition_id) {
+            return None;
+        }
+
+        let cache = self.book_cache.as_ref()?;
+        let books = cache.try_read().ok()?;
+
+        let yes_snap = books.get(&market.token_id_yes)?;
+        let no_snap = books.get(&market.token_id_no)?;
+
+        // Both must be fresh
+        if !yes_snap.is_fresh(self.ws_book_max_stale_secs)
+            || !no_snap.is_fresh(self.ws_book_max_stale_secs)
+        {
+            return None;
+        }
+
+        let yes_ask = yes_snap.best_ask;
+        let no_ask = no_snap.best_ask;
+        let total = yes_ask + no_ask;
+
+        if total >= self.arb_threshold {
+            return None;
+        }
+
+        let profit_pct = (Decimal::ONE - total) / total;
+        if profit_pct < self.min_arb_profit {
+            return None;
+        }
+
+        let confidence = profit_pct.to_f64().unwrap_or(0.0);
+        let size_per_side = self.arb_size_usd;
+
+        info!(
+            condition_id = %market.condition_id,
+            yes_ask = %yes_ask,
+            no_ask = %no_ask,
+            total = %total,
+            profit_pct = format!("{:.2}%", confidence * 100.0),
+            size_per_side = %size_per_side,
+            "arb opportunity detected"
+        );
+
+        let meta = SignalMetadata::Arbitrage {
+            yes_ask,
+            no_ask,
+            total_cost: total,
+            profit_pct,
+        };
+
+        let yes_signal = TradeSignal {
+            target: TradeTarget::Polymarket(market.clone()),
+            side: Side::Buy,
+            size_usd: size_per_side,
+            price: yes_ask,
+            confidence,
+            metadata: meta.clone(),
+            timestamp: Utc::now(),
+            is_exit: false,
+        };
+        let no_signal = TradeSignal {
+            target: TradeTarget::Polymarket(market.clone()),
+            side: Side::Sell, // Buy NO token
+            size_usd: size_per_side,
+            price: no_ask,
+            confidence,
+            metadata: SignalMetadata::Arbitrage {
+                yes_ask,
+                no_ask,
+                total_cost: total,
+                profit_pct,
+            },
+            timestamp: Utc::now(),
+            is_exit: false,
+        };
+
+        Some(vec![yes_signal, no_signal])
     }
 
     // -------------------------------------------------------------------
@@ -474,6 +615,11 @@ impl UnifiedStrategy {
             };
             if let Some(s) = signal {
                 signals.push(s);
+            } else {
+                // Directional says NO — check arb fallback
+                if let Some(arb_signals) = self.check_arb_opportunity(market) {
+                    signals.extend(arb_signals);
+                }
             }
         }
         signals
@@ -526,7 +672,9 @@ impl UnifiedStrategy {
         // --- Confluence modifier ---
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma).clamp(0.0, 2.0);
+        let book = self.book_imbalance_score(market);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+            .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
         // --- Gates ---
@@ -544,6 +692,7 @@ impl UnifiedStrategy {
                 multiplier = format!("{:.2}", multiplier),
                 bb_score = format!("{:.2}", bb),
                 ma_score = format!("{:.2}", ma),
+                book_score = format!("{:.2}", book),
                 "below adjusted edge threshold"
             );
             return None;
@@ -628,6 +777,7 @@ impl UnifiedStrategy {
             multiplier = format!("{:.2}", multiplier),
             bb_score = format!("{:.2}", bb),
             ma_score = format!("{:.2}", ma),
+            book_score = format!("{:.2}", book),
             kelly = format!("{:.1}%", kelly_scaled * 100.0),
             size_usd = %size_usd,
             side = %side,
@@ -653,6 +803,7 @@ impl UnifiedStrategy {
                 confluence_multiplier: multiplier,
                 bb_score: bb,
                 ma_score: ma,
+                book_score: book,
                 kelly_fraction: kelly_scaled,
             },
             timestamp: Utc::now(),
@@ -739,7 +890,9 @@ impl UnifiedStrategy {
         // Confluence modifier
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma).clamp(0.0, 2.0);
+        let book = self.book_imbalance_score(market);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+            .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
         // Threshold gate
@@ -749,6 +902,7 @@ impl UnifiedStrategy {
                 prob_up = format!("{:.1}%", prob_up * 100.0),
                 implied_up = format!("{:.1}%", implied_prob_up * 100.0),
                 adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
+                book_score = format!("{:.2}", book),
                 "up/down: below edge threshold"
             );
             return None;
@@ -796,6 +950,7 @@ impl UnifiedStrategy {
             kelly = format!("{:.1}%", kelly_scaled * 100.0),
             size_usd = %size_usd,
             side = %side,
+            book_score = format!("{:.2}", book),
             time_remaining = format!("{:.0}s", time_remaining_secs),
             "up/down signal"
         );
@@ -817,6 +972,7 @@ impl UnifiedStrategy {
                 confluence_multiplier: multiplier,
                 bb_score: bb,
                 ma_score: ma,
+                book_score: book,
                 kelly_fraction: kelly_scaled,
             },
             timestamp: Utc::now(),
@@ -849,6 +1005,7 @@ impl UnifiedStrategy {
             self.markets.remove(cid);
             self.updown_start_prices.remove(cid);
             self.open_positions.remove(cid);
+            self.active_arbs.remove(cid);
         }
         if !expired_ids.is_empty() {
             debug!(
@@ -913,6 +1070,12 @@ impl Strategy for UnifiedStrategy {
                 // Track new positions
                 for sig in &entry_signals {
                     if let TradeTarget::Polymarket(ref m) = sig.target {
+                        // Track arb positions separately
+                        if matches!(sig.metadata, SignalMetadata::Arbitrage { .. }) {
+                            self.active_arbs.insert(m.condition_id.clone());
+                            continue;
+                        }
+
                         // UpDown markets: hold until resolution, don't set symbol-level
                         // position/cooldown since each window is independent
                         let is_updown = matches!(m.market_type, MarketType::UpDown { .. });
@@ -1068,6 +1231,10 @@ mod tests {
             stale_feed_timeout_secs: 30,
             unified_bb_weight: 0.4,
             unified_ma_weight: 0.4,
+            unified_book_weight: 0.3,
+            arb_threshold: Decimal::new(97, 2),
+            min_arb_profit: Decimal::new(3, 2),
+            arb_size_usd: Decimal::from(5),
             updown_enabled: true,
             updown_only: false,
         }
