@@ -361,6 +361,75 @@ fn parse_updown_market(
     })
 }
 
+/// Check resolution status for expired markets via Gamma API.
+/// Returns Vec<(condition_id, up_won: bool)> for resolved markets only.
+pub async fn check_resolutions(
+    http: &reqwest::Client,
+    condition_ids: &[String],
+) -> Vec<(String, bool)> {
+    let mut resolved = Vec::new();
+
+    for cid in condition_ids {
+        let url = format!("{}/markets/{}", GAMMA_API_URL, cid);
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(condition_id = %cid, error = %e, "failed to query Gamma API for resolution");
+                continue;
+            }
+        };
+
+        let market: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(condition_id = %cid, error = %e, "failed to parse Gamma API response");
+                continue;
+            }
+        };
+
+        // Only process closed markets
+        let closed = market
+            .get("closed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !closed {
+            continue;
+        }
+
+        // Parse outcomePrices: ["1","0"] = Up won, ["0","1"] = Down won
+        let outcome_prices = market.get("outcomePrices");
+        let up_won = if let Some(prices) = outcome_prices {
+            let parsed: Option<Vec<String>> = if let Some(s) = prices.as_str() {
+                serde_json::from_str(s).ok()
+            } else {
+                prices.as_array().map(|arr| {
+                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                })
+            };
+
+            match parsed {
+                Some(p) if p.len() >= 2 => p[0] == "1",
+                _ => {
+                    warn!(condition_id = %cid, "closed market has invalid outcomePrices");
+                    continue;
+                }
+            }
+        } else {
+            warn!(condition_id = %cid, "closed market missing outcomePrices");
+            continue;
+        };
+
+        info!(
+            condition_id = %cid,
+            up_won = up_won,
+            "market resolution confirmed via Gamma API"
+        );
+        resolved.push((cid.clone(), up_won));
+    }
+
+    resolved
+}
+
 fn extract_strike_from_question(question: &str) -> Option<Decimal> {
     // Match patterns like "$100,000", "$50000", "$1,234.56"
     let mut i = 0;

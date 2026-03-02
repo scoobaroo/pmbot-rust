@@ -2,7 +2,9 @@ use crate::config::{Config, RunMode};
 use crate::execution::paper_tracker::PaperTracker;
 use crate::execution::risk::RiskManager;
 use crate::polymarket::client::{OrderParams, PolymarketClient};
-use crate::types::events::{ExecutionEvent, TradeSignal, TradeTarget};
+use crate::polymarket::market_scanner::check_resolutions;
+use crate::types::events::{ExecutionEvent, SignalMetadata, TradeSignal, TradeTarget};
+use crate::types::market::MarketType;
 use crate::types::order::{Fill, Order, OrderStatus, OrderType, Side};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -10,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct ExecutionEngine {
     config: Config,
@@ -19,6 +21,8 @@ pub struct ExecutionEngine {
     open_orders: HashMap<String, Order>,
     maker_mode: bool,
     paper_tracker: PaperTracker,
+    /// HTTP client for querying Gamma API resolution status.
+    http: reqwest::Client,
 }
 
 impl ExecutionEngine {
@@ -30,7 +34,8 @@ impl ExecutionEngine {
             client: client.map(Arc::new),
             risk,
             open_orders: HashMap::new(),
-            paper_tracker: PaperTracker::new(),
+            paper_tracker: PaperTracker::new(Decimal::from(100)),
+            http: reqwest::Client::new(),
             config,
         }
     }
@@ -59,10 +64,19 @@ impl ExecutionEngine {
             }
         }
 
+        // Resolve expired UpDown positions every 10 seconds
+        let mut resolve_interval =
+            tokio::time::interval(std::time::Duration::from_secs(10));
+
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
+                    // Final resolution pass before reporting
+                    self.resolve_expired_via_api().await;
                     info!(
+                        starting_capital = %self.paper_tracker.starting_capital(),
+                        portfolio_value = %self.paper_tracker.portfolio_value(),
+                        return_pct = %format!("{:.2}%", self.paper_tracker.return_pct()),
                         realized_pnl = %self.paper_tracker.realized_pnl(),
                         total_fees = %self.paper_tracker.total_fees(),
                         open_positions = self.paper_tracker.open_position_count(),
@@ -73,6 +87,9 @@ impl ExecutionEngine {
                 }
                 Some(signal) = signal_rx.recv() => {
                     self.handle_signal(signal, &exec_tx).await;
+                }
+                _ = resolve_interval.tick() => {
+                    self.resolve_expired_via_api().await;
                 }
             }
         }
@@ -107,6 +124,8 @@ impl ExecutionEngine {
         market: &crate::types::market::PolymarketMarket,
         exec_tx: &mpsc::Sender<ExecutionEvent>,
     ) {
+        let is_arb = matches!(signal.metadata, SignalMetadata::Arbitrage { .. });
+
         // Token selection: Buy → yes token, Sell → no token
         let token_id = match signal.side {
             Side::Buy => &market.token_id_yes,
@@ -142,16 +161,64 @@ impl ExecutionEngine {
             side = %order.side,
             price = %order.price,
             size = %order.size,
+            is_arb = is_arb,
             "executing polymarket order"
         );
+
+        // Extract UpDown metadata before execution (for paper tracking resolution)
+        let updown_meta = match (&market.market_type, &signal.metadata) {
+            (
+                MarketType::UpDown {
+                    window_start_ts,
+                    window_secs,
+                },
+                SignalMetadata::UpDown {
+                    start_price, ..
+                },
+            ) => {
+                let window_end_ts = window_start_ts + *window_secs as i64;
+                Some((
+                    market.condition_id.clone(),
+                    window_end_ts,
+                    market.underlying_symbol.clone(),
+                    *start_price,
+                    signal.side,
+                ))
+            }
+            _ => None,
+        };
+
+        // Store arb metadata for paper tracking after execution
+        let arb_meta = if is_arb {
+            Some((market.condition_id.clone(), signal.side, price, token_size))
+        } else {
+            None
+        };
 
         match self.config.mode {
             RunMode::Live => {
                 self.execute_live(order, exec_tx).await;
             }
             RunMode::Paper | RunMode::Backtest => {
-                self.execute_simulated(order, exec_tx).await;
+                if is_arb {
+                    // For arb signals, use arb-specific paper tracking instead of regular record_fill
+                    self.execute_simulated_arb(order, exec_tx).await;
+                } else {
+                    self.execute_simulated(order, exec_tx).await;
+                }
             }
+        }
+
+        // Attach UpDown resolution metadata to the paper position
+        if let Some((condition_id, window_end_ts, symbol, start_price, signal_side)) = updown_meta {
+            self.paper_tracker
+                .set_updown_meta(&condition_id, window_end_ts, &symbol, start_price, signal_side);
+        }
+
+        // Record arb fill in paper tracker
+        if let Some((condition_id, side, fill_price, fill_size)) = arb_meta {
+            self.paper_tracker
+                .record_arb_fill(&condition_id, side, fill_price, fill_size);
         }
     }
 
@@ -301,6 +368,49 @@ impl ExecutionEngine {
             .send(ExecutionEvent::OrderPlaced(order.clone()))
             .await;
         let _ = exec_tx.send(ExecutionEvent::OrderFilled(fill)).await;
+    }
+
+    /// Simulated execution for arb signals — sends fill events but skips record_fill
+    /// (arb P&L is tracked separately via record_arb_fill).
+    async fn execute_simulated_arb(
+        &mut self,
+        mut order: Order,
+        exec_tx: &mpsc::Sender<ExecutionEvent>,
+    ) {
+        order.status = OrderStatus::Filled;
+        order.filled_size = order.size;
+        order.updated_at = Utc::now();
+
+        let fill = Fill {
+            order_id: order.id.clone(),
+            price: order.price,
+            size: order.size,
+            side: order.side,
+            timestamp: Utc::now(),
+            fee: order.size * order.price * Decimal::new(2, 4),
+        };
+
+        let _ = exec_tx
+            .send(ExecutionEvent::OrderPlaced(order.clone()))
+            .await;
+        let _ = exec_tx.send(ExecutionEvent::OrderFilled(fill)).await;
+    }
+
+    /// Poll Gamma API for expired UpDown market resolutions.
+    async fn resolve_expired_via_api(&mut self) {
+        let expired_ids = self.paper_tracker.expired_updown_condition_ids();
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        debug!(count = expired_ids.len(), "checking expired markets for resolution");
+
+        let resolved = check_resolutions(&self.http, &expired_ids).await;
+        for (condition_id, up_won) in resolved {
+            self.paper_tracker.resolve_by_outcome(&condition_id, up_won);
+        }
+
+        self.paper_tracker.maybe_report();
     }
 
     async fn cancel_all_open_orders(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
