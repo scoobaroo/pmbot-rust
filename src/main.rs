@@ -4,10 +4,11 @@ use pmbot_rust::exchanges::binance::BinanceFeed;
 use pmbot_rust::exchanges::coinbase::CoinbaseFeed;
 use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
+use pmbot_rust::ml::bridge::{MlBridge, MlBridgeConfig};
 use pmbot_rust::polymarket::ws_orderbook;
 use pmbot_rust::types::candle::Timeframe;
 use pmbot_rust::types::events::{
-    AggregatorEvent, ExchangeEvent, ExecutionEvent, PolymarketUpdate, TradeSignal,
+    AggregatorEvent, ExchangeEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal,
 };
 use tokio::sync::mpsc;
 use tracing::info;
@@ -184,6 +185,26 @@ async fn main() {
     // Drop the original sender so channels close when all producers finish
     drop(exchange_tx);
 
+    // Conditionally create ML channels and bridge
+    let (ml_candle_tx, ml_prediction_rx) = if config.ml_enabled {
+        let (candle_tx, candle_rx) = mpsc::channel::<AggregatorEvent>(256);
+        let (prediction_tx, prediction_rx) = mpsc::channel::<MlPrediction>(64);
+
+        let bridge = MlBridge::new(MlBridgeConfig {
+            server_url: config.ml_server_url.clone(),
+            timeout_ms: config.ml_timeout_ms,
+        });
+        let ml_sd = shutdown.clone();
+        tokio::spawn(async move {
+            bridge.run(candle_rx, prediction_tx, ml_sd).await;
+        });
+        info!(server_url = %config.ml_server_url, "ML bridge spawned");
+
+        (Some(candle_tx), Some(prediction_rx))
+    } else {
+        (None, None)
+    };
+
     // Spawn aggregator
     let aggregator = pmbot_rust::aggregator::Aggregator::new(
         config.stale_feed_timeout_secs,
@@ -194,7 +215,7 @@ async fn main() {
     let vol_window = config.volatility_window_hours;
     tokio::spawn(async move {
         aggregator
-            .run(exchange_rx, aggregator_tx, agg_sd, vol_window)
+            .run(exchange_rx, aggregator_tx, ml_candle_tx, agg_sd, vol_window)
             .await;
     });
 
@@ -207,6 +228,7 @@ async fn main() {
                 aggregator_rx,
                 execution_rx,
                 polymarket_rx,
+                ml_prediction_rx,
                 signal_tx,
                 strat_sd,
             )

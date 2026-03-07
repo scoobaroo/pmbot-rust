@@ -1,5 +1,5 @@
 use crate::types::candle::Candle;
-use crate::types::events::{ExecutionEvent, PolymarketUpdate, TradeSignal};
+use crate::types::events::{ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal};
 use crate::types::market::AggregatedPrice;
 
 /// What events a strategy wants to receive.
@@ -8,6 +8,7 @@ pub struct StrategySubscriptions {
     pub candles: bool,
     pub execution_feedback: bool,
     pub polymarket_updates: bool,
+    pub ml_predictions: bool,
 }
 
 /// Events dispatched to strategies.
@@ -16,6 +17,7 @@ pub enum StrategyEvent {
     CandleComplete(Candle),
     ExecutionFeedback(ExecutionEvent),
     PolymarketUpdate(PolymarketUpdate),
+    MlUpdate(MlPrediction),
 }
 
 /// Pluggable strategy trait. `on_event` is synchronous — pure computation, no I/O.

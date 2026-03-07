@@ -94,6 +94,12 @@ pub struct Config {
     pub updown_enabled: bool,
     pub updown_only: bool,
 
+    // ML prediction service
+    pub ml_enabled: bool,
+    pub ml_server_url: String,
+    pub ml_timeout_ms: u64,
+    pub ml_signal_weight: f64,
+
     // System
     pub log_level: String,
     pub stale_feed_timeout_secs: u64,
@@ -160,6 +166,10 @@ impl Config {
             arb_size_usd: dec_or("ARB_SIZE_USD", "5"),
             updown_enabled: bool_or("UPDOWN_ENABLED", true),
             updown_only: bool_or("UPDOWN_ONLY", false),
+            ml_enabled: bool_or("ML_ENABLED", false),
+            ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
+            ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
+            ml_signal_weight: f64_or("ML_SIGNAL_WEIGHT", 0.5),
             log_level: env_or("LOG_LEVEL", "info"),
             stale_feed_timeout_secs: u64_or("STALE_FEED_TIMEOUT_SECS", 30),
         }

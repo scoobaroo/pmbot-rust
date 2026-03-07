@@ -146,12 +146,14 @@ impl Strategy for MACrossoverStrategy {
             candles: true,
             execution_feedback: false,
             polymarket_updates: false,
+            ml_predictions: false,
         }
     }
 
     fn on_event(&mut self, event: StrategyEvent) -> Vec<TradeSignal> {
         match event {
             StrategyEvent::CandleComplete(candle) => self.process_candle(&candle),
+            StrategyEvent::MlUpdate(_) => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -203,6 +205,10 @@ mod tests {
             updown_enabled: true,
             updown_only: false,
             log_level: "info".into(),
+            ml_enabled: false,
+            ml_server_url: String::new(),
+            ml_timeout_ms: 50,
+            ml_signal_weight: 0.5,
             stale_feed_timeout_secs: 30,
         }
     }

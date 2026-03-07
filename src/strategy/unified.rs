@@ -5,7 +5,7 @@ use crate::strategy::kelly;
 use crate::strategy::probability;
 use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
 use crate::types::candle::{Candle, Timeframe};
-use crate::types::events::{PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
+use crate::types::events::{MlDirection, MlPrediction, PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
 use crate::types::market::{AggregatedPrice, MarketDirection, MarketType, PolymarketMarket};
 use crate::types::order::Side;
 use chrono::Utc;
@@ -65,6 +65,9 @@ struct OpenPosition {
 /// Minimum time-to-expiry (in hours) before we flatten the position.
 const EXPIRY_FLATTEN_HOURS: f64 = 1.0;
 
+/// ML predictions older than this are considered stale and ignored.
+const ML_STALE_SECS: i64 = 300; // 5 minutes
+
 // ---------------------------------------------------------------------------
 // UnifiedStrategy
 // ---------------------------------------------------------------------------
@@ -101,6 +104,11 @@ pub struct UnifiedStrategy {
     bb_weight: f64,
     ma_weight: f64,
     book_weight: f64,
+
+    // ML confluence
+    ml_weight: f64,
+    ml_enabled: bool,
+    latest_ml: HashMap<String, MlPrediction>,
 
     // Open positions for exit logic (keyed by condition_id)
     open_positions: HashMap<String, OpenPosition>,
@@ -152,6 +160,10 @@ impl UnifiedStrategy {
             bb_weight: config.unified_bb_weight,
             ma_weight: config.unified_ma_weight,
             book_weight: config.unified_book_weight,
+
+            ml_weight: config.ml_signal_weight,
+            ml_enabled: config.ml_enabled,
+            latest_ml: HashMap::new(),
 
             open_positions: HashMap::new(),
             updown_start_prices: HashMap::new(),
@@ -381,6 +393,38 @@ impl UnifiedStrategy {
     }
 
     // -------------------------------------------------------------------
+    // ML confluence score
+    // -------------------------------------------------------------------
+
+    /// Returns [-1, 1] based on latest ML prediction for the symbol.
+    /// Positive = bullish (up), negative = bearish (down).
+    /// Returns 0.0 if no prediction, prediction is stale, or ML disabled.
+    fn ml_score(&self, symbol: &str) -> f64 {
+        if !self.ml_enabled {
+            return 0.0;
+        }
+        let pred = match self.latest_ml.get(symbol) {
+            Some(p) => p,
+            None => return 0.0,
+        };
+
+        // Staleness check: ignore predictions older than ML_STALE_SECS
+        let age_secs = (Utc::now() - pred.timestamp).num_seconds();
+        if age_secs > ML_STALE_SECS {
+            return 0.0;
+        }
+
+        // Map confidence from 0.5→1.0 range to 0.0→1.0 magnitude
+        // Below 0.5 confidence means the model is uncertain — treat as 0
+        let magnitude = (pred.confidence - 0.5).max(0.0) * 2.0;
+
+        match pred.direction {
+            MlDirection::Up => magnitude,
+            MlDirection::Down => -magnitude,
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Cooldown management
     // -------------------------------------------------------------------
 
@@ -470,7 +514,8 @@ impl UnifiedStrategy {
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+        let ml = self.ml_score(&market.underlying_symbol);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let current_adjusted = raw_edge.abs() * multiplier;
         if current_adjusted < pos.entry_edge * -0.5 {
@@ -510,6 +555,7 @@ impl UnifiedStrategy {
                 bb_score: 0.0,
                 ma_score: 0.0,
                 book_score: 0.0,
+                ml_score: 0.0,
                 kelly_fraction: 0.0,
             },
             timestamp: Utc::now(),
@@ -673,7 +719,8 @@ impl UnifiedStrategy {
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+        let ml = self.ml_score(&market.underlying_symbol);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
@@ -693,6 +740,7 @@ impl UnifiedStrategy {
                 bb_score = format!("{:.2}", bb),
                 ma_score = format!("{:.2}", ma),
                 book_score = format!("{:.2}", book),
+                ml_score = format!("{:.2}", ml),
                 "below adjusted edge threshold"
             );
             return None;
@@ -804,6 +852,7 @@ impl UnifiedStrategy {
                 bb_score: bb,
                 ma_score: ma,
                 book_score: book,
+                ml_score: ml,
                 kelly_fraction: kelly_scaled,
             },
             timestamp: Utc::now(),
@@ -891,7 +940,8 @@ impl UnifiedStrategy {
         let bb = self.bb_score(&market.underlying_symbol);
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book)
+        let ml = self.ml_score(&market.underlying_symbol);
+        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
@@ -973,6 +1023,7 @@ impl UnifiedStrategy {
                 bb_score: bb,
                 ma_score: ma,
                 book_score: book,
+                ml_score: ml,
                 kelly_fraction: kelly_scaled,
             },
             timestamp: Utc::now(),
@@ -1027,6 +1078,7 @@ impl Strategy for UnifiedStrategy {
             candles: true,
             execution_feedback: true,
             polymarket_updates: true,
+            ml_predictions: self.ml_enabled,
         }
     }
 
@@ -1182,6 +1234,16 @@ impl Strategy for UnifiedStrategy {
                 }
                 Vec::new()
             }
+            StrategyEvent::MlUpdate(prediction) => {
+                debug!(
+                    symbol = %prediction.symbol,
+                    direction = ?prediction.direction,
+                    confidence = prediction.confidence,
+                    "ML prediction stored"
+                );
+                self.latest_ml.insert(prediction.symbol.clone(), prediction);
+                Vec::new() // ML signals modulate future evaluations, don't directly produce signals
+            }
         }
     }
 }
@@ -1237,6 +1299,10 @@ mod tests {
             arb_size_usd: Decimal::from(5),
             updown_enabled: true,
             updown_only: false,
+            ml_enabled: false,
+            ml_server_url: String::new(),
+            ml_timeout_ms: 50,
+            ml_signal_weight: 0.5,
         }
     }
 

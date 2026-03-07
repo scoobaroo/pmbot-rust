@@ -34,6 +34,24 @@ pub enum TradeTarget {
     },
 }
 
+/// ML prediction from the Python prediction server.
+#[derive(Debug, Clone)]
+pub struct MlPrediction {
+    pub symbol: String,
+    pub direction: MlDirection,
+    pub confidence: f64,
+    pub model: String,
+    pub latency_ms: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// ML predicted direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlDirection {
+    Up,
+    Down,
+}
+
 /// Strategy-specific metadata attached to a signal.
 #[derive(Debug, Clone)]
 pub enum SignalMetadata {
@@ -64,6 +82,7 @@ pub enum SignalMetadata {
         bb_score: f64,
         ma_score: f64,
         book_score: f64,
+        ml_score: f64,
         kelly_fraction: f64,
     },
     UpDown {
@@ -78,6 +97,7 @@ pub enum SignalMetadata {
         bb_score: f64,
         ma_score: f64,
         book_score: f64,
+        ml_score: f64,
         kelly_fraction: f64,
     },
     Arbitrage {

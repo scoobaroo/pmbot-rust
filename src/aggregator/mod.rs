@@ -42,6 +42,7 @@ impl Aggregator {
         mut self,
         mut rx: mpsc::Receiver<ExchangeEvent>,
         tx: mpsc::Sender<AggregatorEvent>,
+        ml_tx: Option<mpsc::Sender<AggregatorEvent>>,
         shutdown: CancellationToken,
         volatility_window_hours: u64,
     ) {
@@ -80,7 +81,12 @@ impl Aggregator {
                             let completed_candles = self.candle_builder.on_tick(&tick);
                             for candle in completed_candles {
                                 debug!(symbol = %candle.symbol, timeframe = %candle.timeframe, close = %candle.close, "candle complete");
-                                let _ = tx.send(AggregatorEvent::CandleComplete(candle)).await;
+                                let event = AggregatorEvent::CandleComplete(candle);
+                                // Forward to ML bridge if configured
+                                if let Some(ref ml) = ml_tx {
+                                    let _ = ml.send(event.clone()).await;
+                                }
+                                let _ = tx.send(event).await;
                             }
                         }
                         ExchangeEvent::Connected(ex) => {

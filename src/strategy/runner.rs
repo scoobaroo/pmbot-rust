@@ -1,5 +1,5 @@
 use crate::strategy::traits::{Strategy, StrategyEvent};
-use crate::types::events::{AggregatorEvent, ExecutionEvent, PolymarketUpdate, TradeSignal};
+use crate::types::events::{AggregatorEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -15,6 +15,7 @@ struct RunnerStats {
     signals_emitted: u64,
     fills: u64,
     rejections: u64,
+    ml_predictions: u64,
     last_report: std::time::Instant,
 }
 
@@ -26,6 +27,7 @@ impl RunnerStats {
             signals_emitted: 0,
             fills: 0,
             rejections: 0,
+            ml_predictions: 0,
             last_report: std::time::Instant::now(),
         }
     }
@@ -40,6 +42,7 @@ impl RunnerStats {
                 signals = self.signals_emitted,
                 fills = self.fills,
                 rejections = self.rejections,
+                ml_predictions = self.ml_predictions,
                 elapsed_secs = elapsed.as_secs(),
                 "strategy runner stats"
             );
@@ -49,6 +52,7 @@ impl RunnerStats {
             self.signals_emitted = 0;
             self.fills = 0;
             self.rejections = 0;
+            self.ml_predictions = 0;
             self.last_report = std::time::Instant::now();
         }
     }
@@ -64,6 +68,7 @@ impl StrategyRunner {
         mut agg_rx: mpsc::Receiver<AggregatorEvent>,
         mut exec_rx: mpsc::Receiver<ExecutionEvent>,
         mut poly_rx: mpsc::Receiver<PolymarketUpdate>,
+        mut ml_rx: Option<mpsc::Receiver<MlPrediction>>,
         signal_tx: mpsc::Sender<TradeSignal>,
         shutdown: CancellationToken,
     ) {
@@ -111,6 +116,17 @@ impl StrategyRunner {
                         _ => {}
                     }
                     let signals = self.strategy.on_event(StrategyEvent::ExecutionFeedback(event));
+                    stats.signals_emitted += signals.len() as u64;
+                    self.send_signals(&signals, &signal_tx).await;
+                }
+                Some(prediction) = async {
+                    match ml_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if subs.ml_predictions => {
+                    stats.ml_predictions += 1;
+                    let signals = self.strategy.on_event(StrategyEvent::MlUpdate(prediction));
                     stats.signals_emitted += signals.len() as u64;
                     self.send_signals(&signals, &signal_tx).await;
                 }

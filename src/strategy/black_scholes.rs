@@ -225,6 +225,7 @@ impl Strategy for BlackScholesStrategy {
             candles: false,
             execution_feedback: true,
             polymarket_updates: true,
+            ml_predictions: false,
         }
     }
 
