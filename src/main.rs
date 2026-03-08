@@ -182,10 +182,14 @@ async fn main() {
         let (candle_tx, candle_rx) = mpsc::channel::<AggregatorEvent>(256);
         let (prediction_tx, prediction_rx) = mpsc::channel::<MlPrediction>(64);
 
-        let bridge = MlBridge::new(MlBridgeConfig {
-            server_url: config.ml_server_url.clone(),
-            timeout_ms: config.ml_timeout_ms,
-        });
+        let bridge = MlBridge::new(
+            MlBridgeConfig {
+                server_url: config.ml_server_url.clone(),
+                timeout_ms: config.ml_timeout_ms,
+                active_yes_token_id: std::env::var("ML_POLY_YES_TOKEN").ok(),
+            },
+            if needs_polymarket { Some(book_cache.clone()) } else { None },
+        );
         let ml_sd = shutdown.clone();
         tokio::spawn(async move {
             bridge.run(candle_rx, prediction_tx, ml_sd).await;

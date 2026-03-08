@@ -74,6 +74,10 @@ impl Aggregator {
                             // Compute aggregated price
                             if let Some(agg) = self.aggregate(&symbol) {
                                 debug!(symbol = %agg.symbol, vwap = %agg.vwap, spread = %agg.spread, vol = agg.volatility, "aggregated");
+                                // Forward to ML bridge if configured
+                                if let Some(ref ml) = ml_tx {
+                                    let _ = ml.send(AggregatorEvent::PriceUpdate(agg.clone())).await;
+                                }
                                 let _ = tx.send(AggregatorEvent::PriceUpdate(agg)).await;
                             }
 
