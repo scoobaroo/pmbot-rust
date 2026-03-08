@@ -162,7 +162,13 @@ impl PaperTracker {
     }
 
     /// Record one leg of an arb fill. When both legs arrive, registers the pair.
-    pub fn record_arb_fill(&mut self, condition_id: &str, side: Side, price: Decimal, size: Decimal) {
+    pub fn record_arb_fill(
+        &mut self,
+        condition_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    ) {
         self.total_fills += 1;
         self.total_volume += price * size;
         let fee = size * price * Decimal::new(2, 4); // 0.02% fee
@@ -309,20 +315,26 @@ impl PaperTracker {
         }
     }
 
-    /// Return condition_ids of expired UpDown positions (window_end_ts < now).
-    pub fn expired_updown_condition_ids(&self) -> Vec<String> {
-        let now = chrono::Utc::now().timestamp();
+    /// Return condition_ids of expired UpDown positions (window_end_ts < now_ts).
+    pub fn expired_updown_condition_ids(&self, now_ts: i64) -> Vec<String> {
         self.positions
             .iter()
             .filter_map(|(cid, pos)| {
                 let (window_end_ts, _, _, _) = pos.updown_meta.as_ref()?;
-                if now > *window_end_ts {
+                if now_ts > *window_end_ts {
                     Some(cid.clone())
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    /// Get UpDown metadata for a position: (underlying_symbol, start_price).
+    pub fn get_updown_meta(&self, condition_id: &str) -> Option<(String, f64)> {
+        let pos = self.positions.get(condition_id)?;
+        let (_, ref symbol, start_price, _) = pos.updown_meta.as_ref()?;
+        Some((symbol.clone(), *start_price))
     }
 
     /// Resolve an UpDown position using the actual Polymarket outcome.
@@ -343,8 +355,8 @@ impl PaperTracker {
             .unwrap_or(pos.side);
 
         let won = match signal_side {
-            Side::Buy => up_won,      // We hold Up token
-            Side::Sell => !up_won,     // We hold Down token
+            Side::Buy => up_won,   // We hold Up token
+            Side::Sell => !up_won, // We hold Down token
         };
 
         let resolve_price = if won { Decimal::ONE } else { Decimal::ZERO };
@@ -529,7 +541,7 @@ mod tests {
         tracker.set_updown_meta("updown-1", future_ts, "BTC-USD", 67000.0, Side::Buy);
 
         // expired_updown_condition_ids should return empty
-        let expired = tracker.expired_updown_condition_ids();
+        let expired = tracker.expired_updown_condition_ids(Utc::now().timestamp());
         assert!(expired.is_empty());
 
         // Position should still be open
@@ -569,7 +581,7 @@ mod tests {
         // expired-2: window already ended
         tracker.set_updown_meta("expired-2", 0, "SOL-USD", 150.0, Side::Sell);
 
-        let mut expired = tracker.expired_updown_condition_ids();
+        let mut expired = tracker.expired_updown_condition_ids(Utc::now().timestamp());
         expired.sort();
         assert_eq!(expired, vec!["expired-1", "expired-2"]);
     }

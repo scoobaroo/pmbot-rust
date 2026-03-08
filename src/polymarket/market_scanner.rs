@@ -403,7 +403,9 @@ pub async fn check_resolutions(
                 serde_json::from_str(s).ok()
             } else {
                 prices.as_array().map(|arr| {
-                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
                 })
             };
 

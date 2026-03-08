@@ -5,10 +5,12 @@ use crate::strategy::kelly;
 use crate::strategy::probability;
 use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
 use crate::types::candle::{Candle, Timeframe};
-use crate::types::events::{MlDirection, MlPrediction, PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
+use crate::types::events::{
+    MlDirection, MlPrediction, PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget,
+};
 use crate::types::market::{AggregatedPrice, MarketDirection, MarketType, PolymarketMarket};
 use crate::types::order::Side;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -178,6 +180,16 @@ impl UnifiedStrategy {
     pub fn with_book_cache(mut self, cache: BookCache) -> Self {
         self.book_cache = Some(cache);
         self
+    }
+
+    /// Current time derived from latest price timestamps.
+    /// In backtest mode this reflects historical tick time, not wall-clock time.
+    fn current_time(&self) -> DateTime<Utc> {
+        self.latest_prices
+            .values()
+            .map(|p| p.timestamp)
+            .max()
+            .unwrap_or_else(Utc::now)
     }
 
     /// Timeframes this strategy needs candles for (deduplicated).
@@ -409,7 +421,7 @@ impl UnifiedStrategy {
         };
 
         // Staleness check: ignore predictions older than ML_STALE_SECS
-        let age_secs = (Utc::now() - pred.timestamp).num_seconds();
+        let age_secs = (self.current_time() - pred.timestamp).num_seconds();
         if age_secs > ML_STALE_SECS {
             return 0.0;
         }
@@ -462,7 +474,7 @@ impl UnifiedStrategy {
         let price = self.latest_prices.get(&market.underlying_symbol)?;
         let spot = price.vwap.to_string().parse::<f64>().ok()?;
         let strike = market.strike.to_string().parse::<f64>().ok()?;
-        let time_to_expiry = probability::time_to_expiry_years(market.expiry);
+        let time_to_expiry = probability::time_to_expiry_years(market.expiry, self.current_time());
         let volatility = price.volatility;
 
         // 1. Flatten near expiry (< 1 hour)
@@ -515,7 +527,11 @@ impl UnifiedStrategy {
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
         let ml = self.ml_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
+        let multiplier = (1.0
+            + self.bb_weight * bb
+            + self.ma_weight * ma
+            + self.book_weight * book
+            + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let current_adjusted = raw_edge.abs() * multiplier;
         if current_adjusted < pos.entry_edge * -0.5 {
@@ -559,7 +575,7 @@ impl UnifiedStrategy {
                 kelly_fraction: 0.0,
                 spot: 0.0,
             },
-            timestamp: Utc::now(),
+            timestamp: self.current_time(),
             is_exit: true,
         }
     }
@@ -620,6 +636,7 @@ impl UnifiedStrategy {
             profit_pct,
         };
 
+        let now = self.current_time();
         let yes_signal = TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
             side: Side::Buy,
@@ -627,7 +644,7 @@ impl UnifiedStrategy {
             price: yes_ask,
             confidence,
             metadata: meta.clone(),
-            timestamp: Utc::now(),
+            timestamp: now,
             is_exit: false,
         };
         let no_signal = TradeSignal {
@@ -642,7 +659,7 @@ impl UnifiedStrategy {
                 total_cost: total,
                 profit_pct,
             },
-            timestamp: Utc::now(),
+            timestamp: now,
             is_exit: false,
         };
 
@@ -677,7 +694,7 @@ impl UnifiedStrategy {
 
         let spot = price.vwap.to_string().parse::<f64>().ok()?;
         let strike = market.strike.to_string().parse::<f64>().ok()?;
-        let time_to_expiry = probability::time_to_expiry_years(market.expiry);
+        let time_to_expiry = probability::time_to_expiry_years(market.expiry, self.current_time());
         let volatility = price.volatility;
 
         if volatility <= 0.0 || time_to_expiry <= 0.0 {
@@ -721,7 +738,11 @@ impl UnifiedStrategy {
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
         let ml = self.ml_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
+        let multiplier = (1.0
+            + self.bb_weight * bb
+            + self.ma_weight * ma
+            + self.book_weight * book
+            + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
@@ -857,7 +878,7 @@ impl UnifiedStrategy {
                 kelly_fraction: kelly_scaled,
                 spot,
             },
-            timestamp: Utc::now(),
+            timestamp: self.current_time(),
             is_exit: false,
         })
     }
@@ -888,8 +909,8 @@ impl UnifiedStrategy {
         let (start_price, _) = self.updown_start_prices.get(&market.condition_id)?;
         let start_price = *start_price;
 
-        // Time remaining
-        let now = Utc::now().timestamp();
+        // Time remaining (use tick-derived time for backtest correctness)
+        let now = self.current_time().timestamp();
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now) as f64;
 
@@ -943,7 +964,11 @@ impl UnifiedStrategy {
         let ma = self.ma_score(&market.underlying_symbol);
         let book = self.book_imbalance_score(market);
         let ml = self.ml_score(&market.underlying_symbol);
-        let multiplier = (1.0 + self.bb_weight * bb + self.ma_weight * ma + self.book_weight * book + self.ml_weight * ml)
+        let multiplier = (1.0
+            + self.bb_weight * bb
+            + self.ma_weight * ma
+            + self.book_weight * book
+            + self.ml_weight * ml)
             .clamp(0.0, 2.0);
         let adjusted_edge = net_edge * multiplier;
 
@@ -1028,14 +1053,14 @@ impl UnifiedStrategy {
                 ml_score: ml,
                 kelly_fraction: kelly_scaled,
             },
-            timestamp: Utc::now(),
+            timestamp: self.current_time(),
             is_exit: false,
         })
     }
 
     /// Remove expired up/down markets and their start prices.
     fn cleanup_expired_updown(&mut self) {
-        let now = Utc::now().timestamp();
+        let now = self.current_time().timestamp();
         let expired_ids: Vec<String> = self
             .markets
             .iter()

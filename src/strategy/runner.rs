@@ -1,5 +1,7 @@
 use crate::strategy::traits::{Strategy, StrategyEvent};
-use crate::types::events::{AggregatorEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal};
+use crate::types::events::{
+    AggregatorEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;

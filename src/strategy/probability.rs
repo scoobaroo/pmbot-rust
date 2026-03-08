@@ -64,9 +64,12 @@ pub fn prob_price_up(
     prob_above_strike(spot, start_price, time_years, volatility, 0.0)
 }
 
-/// Time to expiry in years from now to target datetime.
-pub fn time_to_expiry_years(expiry: chrono::DateTime<chrono::Utc>) -> f64 {
-    let now = chrono::Utc::now();
+/// Time to expiry in years from `now` to target datetime.
+/// Accepts explicit `now` so backtest can pass tick-derived time.
+pub fn time_to_expiry_years(
+    expiry: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> f64 {
     let duration = expiry - now;
     let secs = duration.num_seconds().max(0) as f64;
     secs / (365.25 * 24.0 * 3600.0)

@@ -6,7 +6,7 @@ use crate::polymarket::market_scanner::check_resolutions;
 use crate::types::events::{ExecutionEvent, SignalMetadata, TradeSignal, TradeTarget};
 use crate::types::market::{MarketDirection, MarketType};
 use crate::types::order::{Fill, Order, OrderStatus, OrderType, Side};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +34,8 @@ pub struct ExecutionEngine {
     last_underlying_prices: HashMap<String, f64>,
     /// Market metadata per condition_id (for backtest resolution).
     backtest_market_meta: HashMap<String, BacktestMarketMeta>,
+    /// In backtest mode, tracks the latest signal timestamp for time-aware resolution.
+    backtest_time: Option<DateTime<Utc>>,
 }
 
 impl ExecutionEngine {
@@ -49,6 +51,7 @@ impl ExecutionEngine {
             http: reqwest::Client::new(),
             last_underlying_prices: HashMap::new(),
             backtest_market_meta: HashMap::new(),
+            backtest_time: None,
             config,
         }
     }
@@ -78,8 +81,7 @@ impl ExecutionEngine {
         }
 
         // Resolve expired UpDown positions every 10 seconds
-        let mut resolve_interval =
-            tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut resolve_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -106,15 +108,26 @@ impl ExecutionEngine {
                 }
                 Some(signal) = signal_rx.recv() => {
                     self.handle_signal(signal, &exec_tx).await;
+                    // In backtest mode, resolve expired positions after every signal
+                    if self.config.mode == RunMode::Backtest {
+                        self.resolve_backtest_expired();
+                    }
                 }
                 _ = resolve_interval.tick() => {
-                    self.resolve_expired_via_api().await;
+                    if self.config.mode != RunMode::Backtest {
+                        self.resolve_expired_via_api().await;
+                    }
                 }
             }
         }
     }
 
     async fn handle_signal(&mut self, signal: TradeSignal, exec_tx: &mpsc::Sender<ExecutionEvent>) {
+        // Track backtest time from signal timestamps
+        if self.config.mode == RunMode::Backtest {
+            self.backtest_time = Some(signal.timestamp);
+        }
+
         // Track latest underlying price for backtest resolution
         match &signal.metadata {
             SignalMetadata::Unified { spot, .. } if *spot > 0.0 => {
@@ -145,7 +158,8 @@ impl ExecutionEngine {
             TradeTarget::Polymarket(market) => {
                 // Store market metadata for backtest resolution
                 if self.config.mode == RunMode::Backtest {
-                    self.backtest_market_meta.entry(market.condition_id.clone())
+                    self.backtest_market_meta
+                        .entry(market.condition_id.clone())
                         .or_insert_with(|| BacktestMarketMeta {
                             underlying_symbol: market.underlying_symbol.clone(),
                             strike: market.strike,
@@ -217,9 +231,7 @@ impl ExecutionEngine {
                     window_start_ts,
                     window_secs,
                 },
-                SignalMetadata::UpDown {
-                    start_price, ..
-                },
+                SignalMetadata::UpDown { start_price, .. },
             ) => {
                 let window_end_ts = window_start_ts + *window_secs as i64;
                 // Track latest underlying price for backtest resolution
@@ -259,8 +271,13 @@ impl ExecutionEngine {
 
         // Attach UpDown resolution metadata to the paper position
         if let Some((condition_id, window_end_ts, symbol, start_price, signal_side)) = updown_meta {
-            self.paper_tracker
-                .set_updown_meta(&condition_id, window_end_ts, &symbol, start_price, signal_side);
+            self.paper_tracker.set_updown_meta(
+                &condition_id,
+                window_end_ts,
+                &symbol,
+                start_price,
+                signal_side,
+            );
         }
 
         // Record arb fill in paper tracker
@@ -449,7 +466,8 @@ impl ExecutionEngine {
     /// For UpDown: up_won if spot > start_price.
     fn resolve_backtest_positions(&mut self) {
         // First try UpDown resolution via last_underlying_prices
-        self.paper_tracker.resolve_all_by_last_price(&self.last_underlying_prices);
+        self.paper_tracker
+            .resolve_all_by_last_price(&self.last_underlying_prices);
 
         // Then resolve StrikeAbove positions using market metadata
         let open_ids: Vec<String> = self.paper_tracker.open_condition_ids();
@@ -458,8 +476,8 @@ impl ExecutionEngine {
                 if let Some(&spot) = self.last_underlying_prices.get(&meta.underlying_symbol) {
                     let spot_dec = Decimal::from_f64_retain(spot).unwrap_or(Decimal::ZERO);
                     let won = match meta.direction {
-                        MarketDirection::Bullish => spot_dec > meta.strike,  // "Will BTC reach $X?"
-                        MarketDirection::Bearish => spot_dec < meta.strike,  // "Will BTC drop to $X?"
+                        MarketDirection::Bullish => spot_dec > meta.strike, // "Will BTC reach $X?"
+                        MarketDirection::Bearish => spot_dec < meta.strike, // "Will BTC drop to $X?"
                     };
                     self.paper_tracker.resolve_market(&cid, won);
                 }
@@ -467,14 +485,45 @@ impl ExecutionEngine {
         }
     }
 
-    /// Poll Gamma API for expired UpDown market resolutions.
-    async fn resolve_expired_via_api(&mut self) {
-        let expired_ids = self.paper_tracker.expired_updown_condition_ids();
+    /// Resolve expired UpDown positions during backtest replay using last known prices.
+    fn resolve_backtest_expired(&mut self) {
+        let now_ts = match self.backtest_time {
+            Some(t) => t.timestamp(),
+            None => return,
+        };
+
+        let expired_ids = self.paper_tracker.expired_updown_condition_ids(now_ts);
         if expired_ids.is_empty() {
             return;
         }
 
-        debug!(count = expired_ids.len(), "checking expired markets for resolution");
+        // Also resolve any arb pairs on expired markets
+        self.paper_tracker.resolve_arb_pairs(&expired_ids);
+
+        for cid in &expired_ids {
+            if let Some((symbol, start_price)) = self.paper_tracker.get_updown_meta(cid) {
+                if let Some(&latest_price) = self.last_underlying_prices.get(&symbol) {
+                    let up_won = latest_price >= start_price;
+                    self.paper_tracker.resolve_by_outcome(cid, up_won);
+                }
+            }
+        }
+
+        self.paper_tracker.maybe_report();
+    }
+
+    /// Poll Gamma API for expired UpDown market resolutions.
+    async fn resolve_expired_via_api(&mut self) {
+        let now_ts = Utc::now().timestamp();
+        let expired_ids = self.paper_tracker.expired_updown_condition_ids(now_ts);
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        debug!(
+            count = expired_ids.len(),
+            "checking expired markets for resolution"
+        );
 
         let resolved = check_resolutions(&self.http, &expired_ids).await;
         for (condition_id, up_won) in resolved {

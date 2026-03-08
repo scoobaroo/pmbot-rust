@@ -158,6 +158,13 @@ impl Aggregator {
             .map(|t| t.annualized_volatility())
             .unwrap_or(0.0);
 
+        // Use the most recent tick timestamp (works for both live and backtest)
+        let timestamp = ticks
+            .iter()
+            .map(|t| t.timestamp)
+            .max()
+            .unwrap_or_else(Utc::now);
+
         Some(AggregatedPrice {
             symbol: symbol.to_string(),
             vwap,
@@ -168,7 +175,7 @@ impl Aggregator {
             spread: best_ask_tick.ask - best_bid_tick.bid,
             volatility,
             num_feeds: ticks.len(),
-            timestamp: Utc::now(),
+            timestamp,
             oracle_price,
         })
     }

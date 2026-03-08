@@ -89,44 +89,30 @@ async fn main() {
     match config.mode {
         RunMode::Backtest => {
             // Backtest mode: replay CSV data through the pipeline
+            // Pass polymarket_tx so the engine can inject UpDown markets inline
             let bt_shutdown = shutdown.clone();
             let bt_exchange_tx = exchange_tx.clone();
             let bt_config = config.clone();
+            let bt_poly_tx = if needs_polymarket {
+                Some(polymarket_tx.clone())
+            } else {
+                None
+            };
             // Clone shutdown token so we can cancel it after replay + drain
             let bt_done_shutdown = shutdown.clone();
             tokio::spawn(async move {
-                pmbot_rust::backtest::engine::run_backtest(&bt_config, bt_exchange_tx, bt_shutdown)
-                    .await;
+                pmbot_rust::backtest::engine::run_backtest(
+                    &bt_config,
+                    bt_exchange_tx,
+                    bt_poly_tx,
+                    bt_shutdown,
+                )
+                .await;
                 // Let the pipeline drain (aggregator → strategy → execution)
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 info!("backtest pipeline drained, triggering shutdown");
                 bt_done_shutdown.cancel();
             });
-
-            // Inject synthetic Polymarket markets for strategies that need them
-            if needs_polymarket {
-                use pmbot_rust::backtest::synthetic_markets;
-                use rust_decimal::Decimal;
-
-                // Generate markets at standard offsets from assumed initial prices
-                let initial_prices: Vec<(String, Decimal)> = config
-                    .symbols
-                    .iter()
-                    .map(|s| {
-                        let price = match s.as_str() {
-                            "BTC-USD" => Decimal::from(100_000),
-                            "ETH-USD" => Decimal::from(3_500),
-                            _ => Decimal::from(1_000),
-                        };
-                        (s.clone(), price)
-                    })
-                    .collect();
-
-                let markets = synthetic_markets::generate_markets(&config.symbols, &initial_prices);
-                let event = synthetic_markets::as_discovery_event(markets);
-                info!(mode = "backtest", "injecting synthetic Polymarket markets");
-                let _ = polymarket_tx.send(event).await;
-            }
         }
         _ => {
             // Live/Paper: spawn all 4 exchange feeds

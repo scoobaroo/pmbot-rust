@@ -7,7 +7,7 @@ use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
 use crate::types::events::{PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
 use crate::types::market::{AggregatedPrice, MarketDirection, PolymarketMarket};
 use crate::types::order::Side;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -57,6 +57,15 @@ impl BlackScholesStrategy {
         self
     }
 
+    /// Current time derived from latest price timestamps (backtest-safe).
+    fn current_time(&self) -> DateTime<Utc> {
+        self.latest_prices
+            .values()
+            .map(|p| p.timestamp)
+            .max()
+            .unwrap_or_else(Utc::now)
+    }
+
     fn evaluate_all_markets(&self) -> Vec<TradeSignal> {
         let mut signals = Vec::new();
         for market in self.markets.values() {
@@ -92,7 +101,7 @@ impl BlackScholesStrategy {
 
         let spot = price.vwap.to_string().parse::<f64>().ok()?;
         let strike = market.strike.to_string().parse::<f64>().ok()?;
-        let time_to_expiry = probability::time_to_expiry_years(market.expiry);
+        let time_to_expiry = probability::time_to_expiry_years(market.expiry, self.current_time());
         let volatility = price.volatility;
 
         if volatility <= 0.0 || time_to_expiry <= 0.0 {
@@ -208,7 +217,7 @@ impl BlackScholesStrategy {
                 edge: net_edge,
                 kelly_fraction: kelly_frac,
             },
-            timestamp: Utc::now(),
+            timestamp: self.current_time(),
             is_exit: false,
         })
     }
