@@ -107,6 +107,16 @@ pub enum SignalMetadata {
         total_cost: Decimal,
         profit_pct: Decimal,
     },
+    HedgedLp {
+        hedge_profit: f64,
+        net_hedge_profit: f64,
+        reward_score: f64,
+        expected_return: f64,
+        kelly_fraction: f64,
+        yes_ask: f64,
+        no_ask: f64,
+        is_hedge: bool,
+    },
 }
 
 /// Trading signals from the strategy engine.

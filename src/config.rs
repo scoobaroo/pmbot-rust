@@ -15,6 +15,7 @@ pub enum StrategyName {
     MaCrossover,
     BollingerBands,
     Unified,
+    HedgedLp,
 }
 
 #[derive(Parser, Debug)]

@@ -60,6 +60,7 @@ async fn main() {
                 vec![bb_tf, ma_tf]
             }
         }
+        StrategyName::HedgedLp => vec![], // pure microstructure, no candles
     };
 
     // Create shared BookCache for Polymarket orderbook data
@@ -82,6 +83,11 @@ async fn main() {
         }
         StrategyName::BollingerBands => {
             Box::new(pmbot_rust::strategy::bollinger::BollingerBandsStrategy::new(&config))
+        }
+        StrategyName::HedgedLp => {
+            let hlp = pmbot_rust::strategy::hedged_lp::HedgedLpStrategy::new(&config)
+                .with_book_cache(book_cache.clone());
+            Box::new(hlp)
         }
     };
     let needs_polymarket = strategy.subscriptions().polymarket_updates;
