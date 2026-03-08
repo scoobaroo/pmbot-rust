@@ -4,7 +4,7 @@ use crate::execution::risk::RiskManager;
 use crate::polymarket::client::{OrderParams, PolymarketClient};
 use crate::polymarket::market_scanner::check_resolutions;
 use crate::types::events::{ExecutionEvent, SignalMetadata, TradeSignal, TradeTarget};
-use crate::types::market::MarketType;
+use crate::types::market::{MarketDirection, MarketType};
 use crate::types::order::{Fill, Order, OrderStatus, OrderType, Side};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -13,6 +13,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Market metadata stored per condition_id for backtest resolution.
+struct BacktestMarketMeta {
+    underlying_symbol: String,
+    strike: Decimal,
+    direction: MarketDirection,
+}
 
 pub struct ExecutionEngine {
     config: Config,
@@ -23,6 +30,10 @@ pub struct ExecutionEngine {
     paper_tracker: PaperTracker,
     /// HTTP client for querying Gamma API resolution status.
     http: reqwest::Client,
+    /// Latest known underlying prices per symbol (for backtest resolution).
+    last_underlying_prices: HashMap<String, f64>,
+    /// Market metadata per condition_id (for backtest resolution).
+    backtest_market_meta: HashMap<String, BacktestMarketMeta>,
 }
 
 impl ExecutionEngine {
@@ -36,6 +47,8 @@ impl ExecutionEngine {
             open_orders: HashMap::new(),
             paper_tracker: PaperTracker::new(Decimal::from(100)),
             http: reqwest::Client::new(),
+            last_underlying_prices: HashMap::new(),
+            backtest_market_meta: HashMap::new(),
             config,
         }
     }
@@ -72,7 +85,13 @@ impl ExecutionEngine {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     // Final resolution pass before reporting
-                    self.resolve_expired_via_api().await;
+                    if self.config.mode == RunMode::Backtest {
+                        // Backtest: resolve all positions using last known prices
+                        // (Gamma API unavailable for synthetic condition IDs)
+                        self.resolve_backtest_positions();
+                    } else {
+                        self.resolve_expired_via_api().await;
+                    }
                     info!(
                         starting_capital = %self.paper_tracker.starting_capital(),
                         portfolio_value = %self.paper_tracker.portfolio_value(),
@@ -96,6 +115,23 @@ impl ExecutionEngine {
     }
 
     async fn handle_signal(&mut self, signal: TradeSignal, exec_tx: &mpsc::Sender<ExecutionEvent>) {
+        // Track latest underlying price for backtest resolution
+        match &signal.metadata {
+            SignalMetadata::Unified { spot, .. } if *spot > 0.0 => {
+                if let TradeTarget::Polymarket(market) = &signal.target {
+                    self.last_underlying_prices
+                        .insert(market.underlying_symbol.clone(), *spot);
+                }
+            }
+            SignalMetadata::UpDown { spot, .. } if *spot > 0.0 => {
+                if let TradeTarget::Polymarket(market) = &signal.target {
+                    self.last_underlying_prices
+                        .insert(market.underlying_symbol.clone(), *spot);
+                }
+            }
+            _ => {}
+        }
+
         // Risk check
         match self.risk.check(&signal) {
             Ok(()) => {}
@@ -107,6 +143,15 @@ impl ExecutionEngine {
 
         match &signal.target {
             TradeTarget::Polymarket(market) => {
+                // Store market metadata for backtest resolution
+                if self.config.mode == RunMode::Backtest {
+                    self.backtest_market_meta.entry(market.condition_id.clone())
+                        .or_insert_with(|| BacktestMarketMeta {
+                            underlying_symbol: market.underlying_symbol.clone(),
+                            strike: market.strike,
+                            direction: market.direction,
+                        });
+                }
                 self.handle_polymarket_signal(&signal, market, exec_tx)
                     .await;
             }
@@ -177,6 +222,9 @@ impl ExecutionEngine {
                 },
             ) => {
                 let window_end_ts = window_start_ts + *window_secs as i64;
+                // Track latest underlying price for backtest resolution
+                self.last_underlying_prices
+                    .insert(market.underlying_symbol.clone(), *start_price);
                 Some((
                     market.condition_id.clone(),
                     window_end_ts,
@@ -394,6 +442,29 @@ impl ExecutionEngine {
             .send(ExecutionEvent::OrderPlaced(order.clone()))
             .await;
         let _ = exec_tx.send(ExecutionEvent::OrderFilled(fill)).await;
+    }
+
+    /// Resolve all open positions at backtest shutdown using last known prices.
+    /// For StrikeAbove: Bullish ("reach $X") wins if spot > strike; Bearish ("drop to $X") wins if spot < strike.
+    /// For UpDown: up_won if spot > start_price.
+    fn resolve_backtest_positions(&mut self) {
+        // First try UpDown resolution via last_underlying_prices
+        self.paper_tracker.resolve_all_by_last_price(&self.last_underlying_prices);
+
+        // Then resolve StrikeAbove positions using market metadata
+        let open_ids: Vec<String> = self.paper_tracker.open_condition_ids();
+        for cid in open_ids {
+            if let Some(meta) = self.backtest_market_meta.get(&cid) {
+                if let Some(&spot) = self.last_underlying_prices.get(&meta.underlying_symbol) {
+                    let spot_dec = Decimal::from_f64_retain(spot).unwrap_or(Decimal::ZERO);
+                    let won = match meta.direction {
+                        MarketDirection::Bullish => spot_dec > meta.strike,  // "Will BTC reach $X?"
+                        MarketDirection::Bearish => spot_dec < meta.strike,  // "Will BTC drop to $X?"
+                    };
+                    self.paper_tracker.resolve_market(&cid, won);
+                }
+            }
+        }
     }
 
     /// Poll Gamma API for expired UpDown market resolutions.

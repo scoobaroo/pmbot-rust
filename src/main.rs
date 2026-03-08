@@ -92,9 +92,15 @@ async fn main() {
             let bt_shutdown = shutdown.clone();
             let bt_exchange_tx = exchange_tx.clone();
             let bt_config = config.clone();
+            // Clone shutdown token so we can cancel it after replay + drain
+            let bt_done_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 pmbot_rust::backtest::engine::run_backtest(&bt_config, bt_exchange_tx, bt_shutdown)
                     .await;
+                // Let the pipeline drain (aggregator → strategy → execution)
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                info!("backtest pipeline drained, triggering shutdown");
+                bt_done_shutdown.cancel();
             });
 
             // Inject synthetic Polymarket markets for strategies that need them

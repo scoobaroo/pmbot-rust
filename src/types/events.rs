@@ -84,6 +84,7 @@ pub enum SignalMetadata {
         book_score: f64,
         ml_score: f64,
         kelly_fraction: f64,
+        spot: f64,
     },
     UpDown {
         estimated_prob_up: f64,

@@ -369,6 +369,33 @@ impl PaperTracker {
         );
     }
 
+    /// Resolve ALL open UpDown positions using the latest known underlying prices.
+    /// Used in backtest mode where the Gamma API is unavailable.
+    /// Determines up_won by comparing start_price to latest_price for each symbol.
+    pub fn resolve_all_by_last_price(&mut self, latest_prices: &HashMap<String, f64>) {
+        let condition_ids: Vec<String> = self.positions.keys().cloned().collect();
+
+        // Resolve arb pairs first
+        self.resolve_arb_pairs(&condition_ids);
+
+        // Collect UpDown positions to resolve
+        let mut to_resolve: Vec<(String, bool)> = Vec::new();
+        for cid in &condition_ids {
+            if let Some(pos) = self.positions.get(cid) {
+                if let Some((_, ref symbol, start_price, _)) = pos.updown_meta {
+                    if let Some(&latest_price) = latest_prices.get(symbol) {
+                        let up_won = latest_price > start_price;
+                        to_resolve.push((cid.clone(), up_won));
+                    }
+                }
+            }
+        }
+
+        for (cid, up_won) in to_resolve {
+            self.resolve_by_outcome(&cid, up_won);
+        }
+    }
+
     pub fn realized_pnl(&self) -> Decimal {
         self.realized_pnl
     }
@@ -379,6 +406,11 @@ impl PaperTracker {
 
     pub fn open_position_count(&self) -> usize {
         self.positions.len()
+    }
+
+    /// Return condition IDs of all open positions.
+    pub fn open_condition_ids(&self) -> Vec<String> {
+        self.positions.keys().cloned().collect()
     }
 }
 
