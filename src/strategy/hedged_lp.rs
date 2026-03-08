@@ -56,6 +56,12 @@ pub struct HedgedLpStrategy {
 
     // Track active condition_ids to avoid double-trading
     active_conditions: HashMap<String, DateTime<Utc>>,
+
+    // Start prices for UpDown markets (condition_id → VWAP at first discovery)
+    updown_start_prices: HashMap<String, f64>,
+
+    // Rate-limit diagnostic logging (condition_id → last log time)
+    last_eval_log: HashMap<String, DateTime<Utc>>,
 }
 
 impl HedgedLpStrategy {
@@ -75,6 +81,8 @@ impl HedgedLpStrategy {
             latest_ml: HashMap::new(),
             min_edge_threshold: config.min_edge_threshold.to_f64().unwrap_or(0.03),
             active_conditions: HashMap::new(),
+            updown_start_prices: HashMap::new(),
+            last_eval_log: HashMap::new(),
         }
     }
 
@@ -254,6 +262,29 @@ impl HedgedLpStrategy {
         let fill_risk = self.fill_risk_fraction * capital_at_risk;
         let er = Self::expected_return(reward + edge, fill_risk, capital_at_risk);
 
+        // Diagnostic log (rate-limited to 1 per 10s per market)
+        let should_log = self
+            .last_eval_log
+            .get(&market.condition_id)
+            .map_or(true, |last| (Utc::now() - *last).num_seconds() >= 10);
+        if should_log {
+            info!(
+                symbol = %market.underlying_symbol,
+                implied_prob = format!("{:.3}", implied_prob),
+                estimated_prob = format!("{:.3}", estimated_prob),
+                edge = format!("{:.4}", edge),
+                expected_return = format!("{:.4}", er),
+                reward = format!("{:.4}", reward),
+                hedge_pi = format!("{:.4}", hedge_pi),
+                yes_ask = format!("{:.3}", yes_ask_f64),
+                no_ask = format!("{:.3}", no_ask_f64),
+                time_remaining_s = time_remaining,
+                "EVAL"
+            );
+            self.last_eval_log
+                .insert(market.condition_id.clone(), Utc::now());
+        }
+
         // Gate: only trade if E[R] > 0 and edge exceeds threshold
         if er > 0.0 && edge.abs() >= self.min_edge_threshold {
             let (side, price) = if edge > 0.0 {
@@ -329,11 +360,56 @@ impl HedgedLpStrategy {
     }
 
     /// Estimate probability of UP outcome using available signals.
+    ///
+    /// Signal hierarchy:
+    /// 1. Spot price vs start price (strongest for UpDown — actual price movement)
+    /// 2. ML prediction (if available and fresh)
+    /// 3. Orderbook imbalance (if book cache available)
     fn estimate_probability(&self, market: &PolymarketMarket) -> f64 {
         let implied = market.implied_prob_yes.to_f64().unwrap_or(0.5);
 
-        // Start with market implied as base
-        let mut prob = implied;
+        // For UpDown markets, use spot price vs start price as primary signal
+        let mut prob = if let MarketType::UpDown {
+            window_start_ts,
+            window_secs,
+        } = market.market_type
+        {
+            let start_price = self
+                .updown_start_prices
+                .get(&market.condition_id)
+                .copied()
+                .unwrap_or(0.0);
+            if let Some(agg) = self.latest_prices.get(&market.underlying_symbol) {
+                let spot = agg.vwap.to_f64().unwrap_or(start_price);
+                if start_price > 0.0 {
+                    let pct_move = (spot - start_price) / start_price;
+                    // Map price movement to probability via logistic function
+                    // Larger moves → higher conviction
+                    let now = Utc::now().timestamp();
+                    let time_remaining =
+                        (window_start_ts + window_secs as i64 - now).max(1) as f64;
+                    let time_fraction = time_remaining / window_secs as f64;
+
+                    // Scale: as time runs out, current direction becomes more certain
+                    let conviction = if time_fraction < 0.3 {
+                        3.0 // very confident near expiry
+                    } else {
+                        1.5
+                    };
+
+                    // Logistic: 1 / (1 + exp(-k * pct_move))
+                    // k scales with conviction
+                    let k = conviction * 500.0; // 500 = sensitivity to 0.1% moves
+                    1.0 / (1.0 + (-k * pct_move).exp())
+                } else {
+                    implied
+                }
+            } else {
+                implied
+            }
+        } else {
+            implied
+        };
 
         // Incorporate ML prediction if available
         if let Some(ml) = self.latest_ml.get(&market.underlying_symbol) {
@@ -343,8 +419,8 @@ impl HedgedLpStrategy {
                     MlDirection::Up => 0.5 + ml.confidence * 0.5,
                     MlDirection::Down => 0.5 - ml.confidence * 0.5,
                 };
-                // Blend: 60% implied, 40% ML
-                prob = 0.6 * implied + 0.4 * ml_prob;
+                // Blend: 70% price-based, 30% ML
+                prob = 0.7 * prob + 0.3 * ml_prob;
             }
         }
 
@@ -359,9 +435,8 @@ impl HedgedLpStrategy {
                         } else {
                             1.0
                         };
-                        // depth_ratio > 1 = more buying pressure = higher prob up
                         let book_signal = (depth_ratio - 1.0).clamp(-0.1, 0.1);
-                        prob += book_signal * 0.5; // dampened
+                        prob += book_signal * 0.5;
                     }
                 }
             }
@@ -404,10 +479,16 @@ impl HedgedLpStrategy {
         (yes_bid, yes_ask, no_bid, no_ask, depth_yes, depth_no)
     }
 
-    /// Garbage-collect expired condition IDs.
+    /// Garbage-collect expired condition IDs and stale start prices.
     fn gc_active_conditions(&mut self) {
         let cutoff = Utc::now() - chrono::Duration::minutes(10);
         self.active_conditions.retain(|_, ts| *ts > cutoff);
+        // Keep start prices only for markets we still track
+        self.updown_start_prices
+            .retain(|cid, _| self.markets.contains_key(cid));
+        // GC markets older than 10 minutes
+        self.markets.retain(|_, m| m.expiry > cutoff);
+        self.last_eval_log.retain(|cid, _| self.markets.contains_key(cid));
     }
 }
 
@@ -429,8 +510,26 @@ impl Strategy for HedgedLpStrategy {
     fn on_event(&mut self, event: StrategyEvent) -> Vec<TradeSignal> {
         match event {
             StrategyEvent::PriceUpdate(agg) => {
-                self.latest_prices.insert(agg.symbol.clone(), agg);
-                Vec::new()
+                let symbol = agg.symbol.clone();
+                self.latest_prices.insert(symbol.clone(), agg);
+
+                // Re-evaluate all known UpDown markets for this symbol
+                let markets_to_eval: Vec<PolymarketMarket> = self
+                    .markets
+                    .values()
+                    .filter(|m| {
+                        m.underlying_symbol == symbol
+                            && matches!(m.market_type, MarketType::UpDown { .. })
+                            && !self.active_conditions.contains_key(&m.condition_id)
+                    })
+                    .cloned()
+                    .collect();
+
+                let mut signals = Vec::new();
+                for market in &markets_to_eval {
+                    signals.extend(self.evaluate_market(market));
+                }
+                signals
             }
 
             StrategyEvent::PolymarketUpdate(update) => {
@@ -449,6 +548,19 @@ impl Strategy for HedgedLpStrategy {
 
                             self.markets
                                 .insert(market.condition_id.clone(), market.clone());
+
+                            // Record start price on first discovery
+                            if !self.updown_start_prices.contains_key(&market.condition_id) {
+                                if let Some(agg) =
+                                    self.latest_prices.get(&market.underlying_symbol)
+                                {
+                                    let vwap = agg.vwap.to_f64().unwrap_or(0.0);
+                                    if vwap > 0.0 {
+                                        self.updown_start_prices
+                                            .insert(market.condition_id.clone(), vwap);
+                                    }
+                                }
+                            }
 
                             // Evaluate every discovered market
                             let signals = self.evaluate_market(market);
