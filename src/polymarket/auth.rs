@@ -321,6 +321,8 @@ pub struct OrderSignParams {
     pub neg_risk: bool,
     /// 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
     pub signature_type: u8,
+    /// Unix timestamp for order expiration (0 = no expiration)
+    pub expiration: U256,
 }
 
 /// Build and sign an order for the Polymarket CTF Exchange.
@@ -348,7 +350,7 @@ pub async fn sign_order(
         tokenId: params.token_id,
         makerAmount: params.maker_amount,
         takerAmount: params.taker_amount,
-        expiration: U256::ZERO,
+        expiration: params.expiration,
         nonce: U256::ZERO,
         feeRateBps: params.fee_rate_bps,
         side: params.side,
@@ -430,6 +432,7 @@ mod tests {
                 side: 0,
                 neg_risk: true,
                 signature_type: 0,
+                expiration: U256::ZERO,
             },
         )
         .await

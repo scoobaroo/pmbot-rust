@@ -34,6 +34,8 @@ pub struct OrderParams<'a> {
     pub fee_rate_bps: Option<u32>,
     /// Whether to use the neg-risk CTF exchange (default: query CLOB)
     pub neg_risk: Option<bool>,
+    /// Unix timestamp for GTD order expiration (0 = no expiration)
+    pub expiration: Option<i64>,
 }
 
 pub struct PolymarketClient {
@@ -171,6 +173,7 @@ impl PolymarketClient {
                 side: side_u8,
                 neg_risk,
                 signature_type,
+                expiration: U256::from(params.expiration.unwrap_or(0) as u64),
             },
         )
         .await?;
@@ -189,7 +192,7 @@ impl PolymarketClient {
                 "tokenId": params.token_id,
                 "makerAmount": maker_amount.to_string(),
                 "takerAmount": taker_amount.to_string(),
-                "expiration": "0",
+                "expiration": params.expiration.unwrap_or(0).to_string(),
                 "nonce": "0",
                 "feeRateBps": fee_rate_bps.to_string(),
                 "side": side_str,
@@ -263,6 +266,34 @@ impl PolymarketClient {
         }
 
         Ok(())
+    }
+
+    /// Cancel all open orders.
+    pub async fn cancel_all_orders(&self) -> Result<usize, PolymarketError> {
+        let body = serde_json::json!({});
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| PolymarketError::Api(format!("JSON serialize: {e}")))?;
+        let headers = self.l2_headers("DELETE", "/cancel-all", &body_str)?;
+
+        let mut req = self.http.delete(format!("{CLOB_BASE_URL}/cancel-all"));
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        req = req.header("Content-Type", "application/json");
+
+        let resp = req.body(body_str).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(PolymarketError::Api(format!("cancel-all: {text}")));
+        }
+
+        // Response contains cancelled order IDs
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let count = v.as_array().map(|a| a.len()).unwrap_or(0);
+        info!(count = count, "cancelled all open orders");
+        Ok(count)
     }
 
     /// Get current open orders.

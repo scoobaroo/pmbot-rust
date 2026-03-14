@@ -276,9 +276,19 @@ impl ExecutionEngine {
             None
         };
 
+        // For UpDown markets, set order expiration before market resolution
+        let order_expiration: Option<i64> = match &market.market_type {
+            MarketType::UpDown { window_start_ts, window_secs } => {
+                // Expire order 60s before market window ends
+                let window_end = window_start_ts + *window_secs as i64;
+                Some(window_end - 60)
+            }
+            _ => None,
+        };
+
         match self.config.mode {
             RunMode::Live => {
-                self.execute_live(order, exec_tx).await;
+                self.execute_live(order, order_expiration, exec_tx).await;
             }
             RunMode::Paper | RunMode::Backtest => {
                 if is_arb {
@@ -356,7 +366,12 @@ impl ExecutionEngine {
         self.execute_simulated(order, exec_tx).await;
     }
 
-    async fn execute_live(&mut self, mut order: Order, exec_tx: &mpsc::Sender<ExecutionEvent>) {
+    async fn execute_live(
+        &mut self,
+        mut order: Order,
+        expiration: Option<i64>,
+        exec_tx: &mpsc::Sender<ExecutionEvent>,
+    ) {
         let client = match &self.client {
             Some(c) => c,
             None => {
@@ -367,16 +382,18 @@ impl ExecutionEngine {
 
         let post_only = self.maker_mode;
         let fee_rate_bps = Some(self.config.fee_rate_bps);
+        let order_type = if expiration.is_some() { "GTD" } else { "GTC" };
 
         let params = OrderParams {
             token_id: &order.token_id,
             side: order.side,
             price: order.price,
             size: order.size,
-            order_type: "GTC",
+            order_type,
             post_only,
             fee_rate_bps,
-            neg_risk: None, // auto-detect via CLOB API
+            neg_risk: None,
+            expiration,
         };
 
         match client.place_order(&params).await {
@@ -402,10 +419,11 @@ impl ExecutionEngine {
                         side: order.side,
                         price: order.price,
                         size: order.size,
-                        order_type: "GTC",
+                        order_type,
                         post_only: false,
                         fee_rate_bps,
                         neg_risk: None,
+                        expiration,
                     };
                     match client.place_order(&taker_params).await {
                         Ok(order_id) => {
