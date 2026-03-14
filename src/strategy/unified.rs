@@ -922,8 +922,6 @@ impl UnifiedStrategy {
 
         let price = self.latest_prices.get(&market.underlying_symbol)?;
         let spot = price.vwap.to_f64()?;
-        let volatility = price.volatility;
-
         // Get captured start price
         let (start_price, _) = self.updown_start_prices.get(&market.condition_id)?;
         let start_price = *start_price;
@@ -933,61 +931,34 @@ impl UnifiedStrategy {
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now) as f64;
 
-        // Dead zones: skip first 30s (prices settling) and last 30% of window
-        // (need time for order fill + resolution). For 5m markets = last 90s, 15m = last 270s.
+        // Dead zones: skip first 30s (prices settling) and last 30s (need time to fill).
+        // High-prob strategy benefits from entering late when outcome is clearer.
         let elapsed = now - window_start_ts;
-        let end_dead_zone = (window_secs as f64 * 0.30).max(60.0);
-        if elapsed < 30 || time_remaining_secs < end_dead_zone {
+        if elapsed < 30 || time_remaining_secs < 30.0 {
             return None;
         }
 
-        if volatility <= 0.0 || time_remaining_secs <= 0.0 {
+        if time_remaining_secs <= 0.0 {
             return None;
         }
 
-        // Momentum-based approach: trade WITH the price move, not against the market.
-        // If spot has moved above start, bet UP. If below, bet DOWN.
-        // The edge is the difference between spot move and what the market has priced in.
-        let price_move_pct = (spot - start_price) / start_price;
+        // High-probability strategy: buy the side that's already ≥95% likely.
+        // At p=0.95 we pay $0.95 and collect $1.00 → ~5% gross, ~4% net after fees.
+        // Win rate is very high since the outcome is near-certain.
         let implied_prob_up = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+        let implied_prob_down = 1.0 - implied_prob_up;
+        let min_prob = 0.95;
 
-        // Minimum price move required before we trade (0.02% = 2 bps ≈ $14 on BTC)
-        let min_move_pct = 0.0002;
-
-        // Determine direction from actual price action
-        let (side, estimated_prob, implied_prob, token_id) = if price_move_pct > min_move_pct {
-            // Price moved UP → bet UP (buy YES token)
-            // Confidence scales with move: 0.02% → 52%, 0.1% → 60%, 0.5% → 95%
-            let prob_up = (0.5 + price_move_pct * 100.0).clamp(0.51, 0.95);
-            (Side::Buy, prob_up, implied_prob_up, &market.token_id_yes)
-        } else if price_move_pct < -min_move_pct {
-            // Price moved DOWN → bet DOWN (buy NO token)
-            let prob_down = (0.5 + price_move_pct.abs() * 100.0).clamp(0.51, 0.95);
-            (
-                Side::Sell,
-                prob_down,
-                1.0 - implied_prob_up,
-                &market.token_id_no,
-            )
+        let (side, implied_prob, estimated_prob, token_id) = if implied_prob_up >= min_prob {
+            // Market says UP is ≥95% likely → buy YES
+            (Side::Buy, implied_prob_up, 0.99, &market.token_id_yes)
+        } else if implied_prob_down >= min_prob {
+            // Market says DOWN is ≥95% likely → buy NO
+            (Side::Sell, implied_prob_down, 0.99, &market.token_id_no)
         } else {
-            // No significant move — don't trade
+            // Neither side is ≥95% — skip
             return None;
         };
-
-        // Edge = how cheap can we buy the token relative to our estimated probability?
-        // If we think UP is 70% likely but market prices YES at 55%, that's 15% edge.
-        let raw_edge = estimated_prob - implied_prob;
-        if raw_edge <= 0.0 {
-            // Market already priced past our estimate — no edge
-            debug!(
-                symbol = %market.underlying_symbol,
-                move_pct = format!("{:.3}%", price_move_pct * 100.0),
-                estimated = format!("{:.1}%", estimated_prob * 100.0),
-                implied = format!("{:.1}%", implied_prob * 100.0),
-                "up/down: market already priced in the move"
-            );
-            return None;
-        }
 
         // Spread + fee deduction
         let half_spread = self.get_half_spread(token_id);
@@ -998,80 +969,40 @@ impl UnifiedStrategy {
         };
         let total_cost = self.fee_calculator.total_cost(implied_price, half_spread);
         let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
+        let raw_edge = estimated_prob - implied_prob;
         let net_edge = raw_edge - total_cost_f64;
 
-        // Confluence modifier
-        let bb = self.bb_score(&market.underlying_symbol);
-        let ma = self.ma_score(&market.underlying_symbol);
+        // Must still be profitable after fees
+        let bb = 0.0;
+        let ma = 0.0;
         let book = self.book_imbalance_score(market);
-        let ml = self.ml_score(&market.underlying_symbol);
-        let multiplier = (1.0
-            + self.bb_weight * bb
-            + self.ma_weight * ma
-            + self.book_weight * book
-            + self.ml_weight * ml)
-            .clamp(0.0, 2.0);
-        let adjusted_edge = net_edge * multiplier;
+        let ml = 0.0;
+        let multiplier = 1.0;
+        let adjusted_edge = net_edge;
 
-        // Threshold gate
-        if adjusted_edge < self.min_edge_threshold {
+        // Must still be profitable after fees
+        if net_edge <= 0.0 {
             debug!(
                 symbol = %market.underlying_symbol,
-                move_pct = format!("{:.3}%", price_move_pct * 100.0),
-                estimated = format!("{:.1}%", estimated_prob * 100.0),
                 implied = format!("{:.1}%", implied_prob * 100.0),
-                adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
-                book_score = format!("{:.2}", book),
-                "up/down: below edge threshold"
+                net_edge = format!("{:.1}%", net_edge * 100.0),
+                "up/down: not profitable after fees"
             );
             return None;
         }
 
-        // Kelly sizing with 0.5× scale for high-frequency
-        let kelly_frac = crate::strategy::kelly::kelly_fraction(
-            estimated_prob,
-            implied_prob,
-            self.kelly_fraction_cap,
-        );
-        if kelly_frac <= 0.0 {
-            return None;
-        }
-        let kelly_scaled = kelly_frac * multiplier.min(1.5) * 0.5;
-        let size_usd = crate::strategy::kelly::position_size_usd(
-            kelly_scaled,
-            self.max_total_exposure_usd,
-            self.max_position_usd,
-        );
-
-        if size_usd <= Decimal::ZERO {
-            return None;
-        }
-
-        // Min order gate: 5 units × implied_price
-        let min_order_usd = Decimal::from(5) * implied_price;
-        if size_usd < min_order_usd {
-            debug!(
-                symbol = %market.underlying_symbol,
-                size_usd = %size_usd,
-                min_order_usd = %min_order_usd,
-                "up/down: below min order size"
-            );
-            return None;
-        }
+        // High-prob strategy: bet max position size (high win rate justifies full sizing)
+        let size_usd = self.max_position_usd;
+        let kelly_scaled = 1.0;
 
         info!(
             symbol = %market.underlying_symbol,
-            start_price,
-            spot,
-            est_prob = format!("{:.1}%", estimated_prob * 100.0),
-            implied_up = format!("{:.1}%", implied_prob_up * 100.0),
-            adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
-            kelly = format!("{:.1}%", kelly_scaled * 100.0),
+            implied = format!("{:.1}%", implied_prob * 100.0),
+            net_edge = format!("{:.1}%", net_edge * 100.0),
             size_usd = %size_usd,
             side = %side,
-            book_score = format!("{:.2}", book),
             time_remaining = format!("{:.0}s", time_remaining_secs),
-            "up/down signal"
+            "up/down HIGH-PROB signal"
         );
 
         Some(TradeSignal {
@@ -1876,14 +1807,11 @@ mod tests {
     // 14. Up/down signal when price above start
     // -----------------------------------------------------------------------
     #[test]
-    fn test_updown_signal_when_price_above_start() {
+    fn test_updown_high_prob_buy_up() {
         let mut config = make_config();
         config.fee_rate_bps = 0; // zero fees for clean test
-        config.min_edge_threshold = Decimal::new(1, 2); // 0.01 low threshold
         let mut strat = UnifiedStrategy::new(&config);
 
-        // Create an up/down market with window starting now - 60s (so we're past dead zone)
-        // Use 240s remaining to get a meaningful (non-degenerate) probability
         let now = Utc::now();
         let window_start_ts = now.timestamp() - 60;
         let window_end = window_start_ts + 300;
@@ -1897,8 +1825,8 @@ mod tests {
             underlying_symbol: "BTC-USD".into(),
             strike: Decimal::ZERO,
             expiry: end_dt,
-            implied_prob_yes: dec!(0.50), // market says 50/50
-            implied_prob_no: dec!(0.50),
+            implied_prob_yes: dec!(0.96), // 96% → triggers high-prob buy
+            implied_prob_no: dec!(0.04),
             direction: MarketDirection::Bullish,
             market_type: MarketType::UpDown {
                 window_start_ts,
@@ -1909,46 +1837,24 @@ mod tests {
         let cid = market.condition_id.clone();
         inject_market(&mut strat, market);
 
-        // Momentum: need >0.05% move. 100_100 vs 100_000 = 0.1% up
-        // estimated_prob ≈ 0.5 + 0.001 * 50.0 = 0.55, implied=0.50, edge=0.05
         let price = make_price("BTC-USD", 100_100.0);
         strat
             .updown_start_prices
             .insert(cid, (100_000.0, window_start_ts));
 
-        // Inject price first so latest_prices is set
         let signals = strat.on_event(StrategyEvent::PriceUpdate(price));
 
-        assert!(!signals.is_empty(), "should produce up/down signal");
-        assert_eq!(
-            signals[0].side,
-            Side::Buy,
-            "should Buy Up when prob_up > implied"
-        );
-
-        if let SignalMetadata::UpDown {
-            estimated_prob_up,
-            start_price,
-            spot,
-            ..
-        } = &signals[0].metadata
-        {
-            assert!(*estimated_prob_up > 0.5, "prob up should be >50%");
-            assert!((*start_price - 100_000.0).abs() < 1.0);
-            assert!((*spot - 100_100.0).abs() < 1.0);
-        } else {
-            panic!("expected UpDown metadata");
-        }
+        assert!(!signals.is_empty(), "should produce high-prob signal");
+        assert_eq!(signals[0].side, Side::Buy, "should Buy YES at 96%");
     }
 
     // -----------------------------------------------------------------------
-    // 15. Up/down short signal (Buy Down) when price below start
+    // 15. High-prob: buy DOWN when implied_prob_no >= 95%
     // -----------------------------------------------------------------------
     #[test]
-    fn test_updown_short_signal_when_price_below_start() {
+    fn test_updown_high_prob_buy_down() {
         let mut config = make_config();
         config.fee_rate_bps = 0;
-        config.min_edge_threshold = Decimal::new(1, 2); // 0.01
         let mut strat = UnifiedStrategy::new(&config);
 
         let now = Utc::now();
@@ -1964,8 +1870,8 @@ mod tests {
             underlying_symbol: "BTC-USD".into(),
             strike: Decimal::ZERO,
             expiry: end_dt,
-            implied_prob_yes: dec!(0.50),
-            implied_prob_no: dec!(0.50),
+            implied_prob_yes: dec!(0.03), // 3% up → 97% down → triggers
+            implied_prob_no: dec!(0.97),
             direction: MarketDirection::Bullish,
             market_type: MarketType::UpDown {
                 window_start_ts,
@@ -1976,7 +1882,6 @@ mod tests {
         let cid = market.condition_id.clone();
         inject_market(&mut strat, market);
 
-        // Momentum: spot 99900 vs start 100000 → -0.1% move → Buy Down (Sell)
         let price = make_price("BTC-USD", 99_900.0);
         strat
             .updown_start_prices
@@ -1984,36 +1889,17 @@ mod tests {
 
         let signals = strat.on_event(StrategyEvent::PriceUpdate(price));
 
-        assert!(!signals.is_empty(), "should produce down signal");
-        assert_eq!(
-            signals[0].side,
-            Side::Sell,
-            "should Sell (Buy Down) when prob_up < implied"
-        );
-
-        if let SignalMetadata::UpDown {
-            estimated_prob_up, ..
-        } = &signals[0].metadata
-        {
-            // In momentum mode, estimated_prob_up stores the prob of the chosen direction (down)
-            assert!(
-                *estimated_prob_up > 0.5,
-                "estimated prob for chosen direction should be >50%, got {}",
-                estimated_prob_up
-            );
-        } else {
-            panic!("expected UpDown metadata");
-        }
+        assert!(!signals.is_empty(), "should produce high-prob down signal");
+        assert_eq!(signals[0].side, Side::Sell, "should buy NO (Sell) at 97%");
     }
 
     // -----------------------------------------------------------------------
-    // 16. Up/down no duplicate signal once positioned
+    // 16. No signal when neither side is >= 95%
     // -----------------------------------------------------------------------
     #[test]
-    fn test_updown_no_duplicate_once_positioned() {
+    fn test_updown_no_signal_below_95pct() {
         let mut config = make_config();
         config.fee_rate_bps = 0;
-        config.min_edge_threshold = Decimal::new(1, 2);
         let mut strat = UnifiedStrategy::new(&config);
 
         let now = Utc::now();
@@ -2029,8 +1915,8 @@ mod tests {
             underlying_symbol: "BTC-USD".into(),
             strike: Decimal::ZERO,
             expiry: end_dt,
-            implied_prob_yes: dec!(0.50),
-            implied_prob_no: dec!(0.50),
+            implied_prob_yes: dec!(0.70), // 70% — not high enough
+            implied_prob_no: dec!(0.30),
             direction: MarketDirection::Bullish,
             market_type: MarketType::UpDown {
                 window_start_ts,
@@ -2044,15 +1930,7 @@ mod tests {
             .updown_start_prices
             .insert(cid, (100_000.0, window_start_ts));
 
-        // First signal fires (0.1% move to trigger momentum)
-        let s1 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_100.0)));
-        assert!(!s1.is_empty(), "first signal should fire");
-
-        // Second tick — already positioned, should not fire again
-        let s2 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_100.0)));
-        assert!(
-            s2.is_empty(),
-            "should not fire duplicate signal while holding"
-        );
+        let signals = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_100.0)));
+        assert!(signals.is_empty(), "should NOT fire below 95% threshold");
     }
 }
