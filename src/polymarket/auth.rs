@@ -319,6 +319,8 @@ pub struct OrderSignParams {
     pub fee_rate_bps: U256,
     pub side: u8,
     pub neg_risk: bool,
+    /// 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+    pub signature_type: u8,
 }
 
 /// Build and sign an order for the Polymarket CTF Exchange.
@@ -341,7 +343,7 @@ pub async fn sign_order(
     let order = Order {
         salt: params.salt,
         maker: params.maker,
-        signer: params.maker, // signer == maker for EOA
+        signer: signer.address(),
         taker: Address::ZERO,
         tokenId: params.token_id,
         makerAmount: params.maker_amount,
@@ -350,7 +352,7 @@ pub async fn sign_order(
         nonce: U256::ZERO,
         feeRateBps: params.fee_rate_bps,
         side: params.side,
-        signatureType: 0, // EOA
+        signatureType: params.signature_type,
     };
 
     let domain = eip712_domain! {
@@ -427,6 +429,7 @@ mod tests {
                 fee_rate_bps: U256::from(100u64),
                 side: 0,
                 neg_risk: true,
+                signature_type: 0,
             },
         )
         .await

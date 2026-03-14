@@ -40,17 +40,36 @@ pub struct PolymarketClient {
     http: Client,
     credentials: ApiCredentials,
     signer: PrivateKeySigner,
-    wallet_address: Address,
+    /// The signing key address (derived from private key)
+    signer_address: Address,
+    /// The proxy/funder wallet where USDC is held
+    funder_address: Address,
 }
 
 impl PolymarketClient {
     pub fn new(credentials: ApiCredentials, signer: PrivateKeySigner) -> Self {
-        let wallet_address = signer.address();
+        let signer_address = signer.address();
+        // POLY_FUNDER_ADDRESS is the proxy wallet shown on Polymarket UI where USDC lives.
+        // If not set, assume EOA mode (signer == funder).
+        let funder_address: Address = std::env::var("POLY_FUNDER_ADDRESS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(signer_address);
+
+        if funder_address != signer_address {
+            info!(
+                signer = %signer_address,
+                funder = %funder_address,
+                "proxy wallet mode: signer != funder (signatureType=2)"
+            );
+        }
+
         Self {
             http: Client::new(),
             credentials,
             signer,
-            wallet_address,
+            signer_address,
+            funder_address,
         }
     }
 
@@ -136,30 +155,36 @@ impl PolymarketClient {
         debug!(neg_risk = neg_risk, token_id = params.token_id, "signing order");
 
         // Sign the order with EIP-712
+        // Determine if we're using a proxy wallet (funder != signer)
+        let is_proxy = self.funder_address != self.signer_address;
+        let signature_type: u8 = if is_proxy { 2 } else { 0 }; // 2 = GNOSIS_SAFE, 0 = EOA
+
         let signature = auth::sign_order(
             &self.signer,
             &auth::OrderSignParams {
                 salt,
-                maker: self.wallet_address,
+                maker: self.funder_address, // funder/proxy wallet holds the USDC
                 token_id: token_id_u256,
                 maker_amount,
                 taker_amount,
                 fee_rate_bps: U256::from(fee_rate_bps as u64),
                 side: side_u8,
                 neg_risk,
+                signature_type,
             },
         )
         .await?;
 
-        let wallet_hex = format!("{}", self.wallet_address);
+        let funder_hex = format!("{}", self.funder_address);
+        let signer_hex = format!("{}", self.signer_address);
 
         // Build the signed order body
         // salt and signatureType are integers; all other numerics are strings
         let mut order_body = serde_json::json!({
             "order": {
                 "salt": salt_val,
-                "maker": wallet_hex,
-                "signer": wallet_hex,
+                "maker": funder_hex,
+                "signer": signer_hex,
                 "taker": "0x0000000000000000000000000000000000000000",
                 "tokenId": params.token_id,
                 "makerAmount": maker_amount.to_string(),
@@ -168,7 +193,7 @@ impl PolymarketClient {
                 "nonce": "0",
                 "feeRateBps": fee_rate_bps.to_string(),
                 "side": side_str,
-                "signatureType": 0,
+                "signatureType": signature_type,
                 "signature": signature,
             },
             "owner": self.credentials.api_key,
