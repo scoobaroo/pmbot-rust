@@ -945,29 +945,49 @@ impl UnifiedStrategy {
             return None;
         }
 
-        // P(up) = P(end >= start)
-        let prob_up =
-            probability::prob_price_up(spot, start_price, time_remaining_secs, volatility);
+        // Momentum-based approach: trade WITH the price move, not against the market.
+        // If spot has moved above start, bet UP. If below, bet DOWN.
+        // The edge is the difference between spot move and what the market has priced in.
+        let price_move_pct = (spot - start_price) / start_price;
         let implied_prob_up = market.implied_prob_yes.to_f64().unwrap_or(0.5);
 
-        // Pick the side with positive edge
-        let edge_up = prob_up - implied_prob_up;
-        let _edge_down = -edge_up; // symmetric
+        // Minimum price move required before we trade (0.05% = 5 bps)
+        let min_move_pct = 0.0005;
 
-        let (side, estimated_prob, implied_prob, token_id) = if edge_up > 0.0 {
+        // Determine direction from actual price action
+        let (side, estimated_prob, implied_prob, token_id) = if price_move_pct > min_move_pct {
+            // Price moved UP → bet UP (buy YES token)
+            // Our confidence scales with the move magnitude
+            let prob_up = (0.5 + price_move_pct * 50.0).clamp(0.51, 0.95);
             (Side::Buy, prob_up, implied_prob_up, &market.token_id_yes)
-        } else if edge_up < 0.0 {
+        } else if price_move_pct < -min_move_pct {
+            // Price moved DOWN → bet DOWN (buy NO token)
+            let prob_down = (0.5 + price_move_pct.abs() * 50.0).clamp(0.51, 0.95);
             (
-                Side::Sell, // Buy Down
-                1.0 - prob_up,
+                Side::Sell,
+                prob_down,
                 1.0 - implied_prob_up,
                 &market.token_id_no,
             )
         } else {
+            // No significant move — don't trade
             return None;
         };
 
-        let raw_edge = (estimated_prob - implied_prob).abs();
+        // Edge = how cheap can we buy the token relative to our estimated probability?
+        // If we think UP is 70% likely but market prices YES at 55%, that's 15% edge.
+        let raw_edge = estimated_prob - implied_prob;
+        if raw_edge <= 0.0 {
+            // Market already priced past our estimate — no edge
+            debug!(
+                symbol = %market.underlying_symbol,
+                move_pct = format!("{:.3}%", price_move_pct * 100.0),
+                estimated = format!("{:.1}%", estimated_prob * 100.0),
+                implied = format!("{:.1}%", implied_prob * 100.0),
+                "up/down: market already priced in the move"
+            );
+            return None;
+        }
 
         // Spread + fee deduction
         let half_spread = self.get_half_spread(token_id);
@@ -997,8 +1017,9 @@ impl UnifiedStrategy {
         if adjusted_edge < self.min_edge_threshold {
             debug!(
                 symbol = %market.underlying_symbol,
-                prob_up = format!("{:.1}%", prob_up * 100.0),
-                implied_up = format!("{:.1}%", implied_prob_up * 100.0),
+                move_pct = format!("{:.3}%", price_move_pct * 100.0),
+                estimated = format!("{:.1}%", estimated_prob * 100.0),
+                implied = format!("{:.1}%", implied_prob * 100.0),
                 adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
                 book_score = format!("{:.2}", book),
                 "up/down: below edge threshold"
@@ -1042,7 +1063,7 @@ impl UnifiedStrategy {
             symbol = %market.underlying_symbol,
             start_price,
             spot,
-            prob_up = format!("{:.1}%", prob_up * 100.0),
+            est_prob = format!("{:.1}%", estimated_prob * 100.0),
             implied_up = format!("{:.1}%", implied_prob_up * 100.0),
             adjusted_edge = format!("{:.1}%", adjusted_edge * 100.0),
             kelly = format!("{:.1}%", kelly_scaled * 100.0),
@@ -1060,7 +1081,7 @@ impl UnifiedStrategy {
             confidence: adjusted_edge,
             price: implied_price,
             metadata: SignalMetadata::UpDown {
-                estimated_prob_up: prob_up,
+                estimated_prob_up: estimated_prob,
                 implied_prob_up,
                 start_price,
                 spot,
@@ -1888,9 +1909,9 @@ mod tests {
         let cid = market.condition_id.clone();
         inject_market(&mut strat, market);
 
-        // With vol=0.5 and ~240s remaining, sigma*sqrt(T) ≈ 0.00138
-        // A 0.01% move (100010 vs 100000) gives d2 ≈ 0.072 → P(up) ≈ 0.529 → edge ~0.029
-        let price = make_price("BTC-USD", 100_010.0);
+        // Momentum: need >0.05% move. 100_100 vs 100_000 = 0.1% up
+        // estimated_prob ≈ 0.5 + 0.001 * 50.0 = 0.55, implied=0.50, edge=0.05
+        let price = make_price("BTC-USD", 100_100.0);
         strat
             .updown_start_prices
             .insert(cid, (100_000.0, window_start_ts));
@@ -1914,7 +1935,7 @@ mod tests {
         {
             assert!(*estimated_prob_up > 0.5, "prob up should be >50%");
             assert!((*start_price - 100_000.0).abs() < 1.0);
-            assert!((*spot - 100_010.0).abs() < 1.0);
+            assert!((*spot - 100_100.0).abs() < 1.0);
         } else {
             panic!("expected UpDown metadata");
         }
@@ -1955,11 +1976,11 @@ mod tests {
         let cid = market.condition_id.clone();
         inject_market(&mut strat, market);
 
-        // Start=100010, spot=100000 → price BELOW start → P(up) < 50% → Buy Down (Sell)
-        let price = make_price("BTC-USD", 100_000.0);
+        // Momentum: spot 99900 vs start 100000 → -0.1% move → Buy Down (Sell)
+        let price = make_price("BTC-USD", 99_900.0);
         strat
             .updown_start_prices
-            .insert(cid, (100_010.0, window_start_ts));
+            .insert(cid, (100_000.0, window_start_ts));
 
         let signals = strat.on_event(StrategyEvent::PriceUpdate(price));
 
@@ -1974,9 +1995,10 @@ mod tests {
             estimated_prob_up, ..
         } = &signals[0].metadata
         {
+            // In momentum mode, estimated_prob_up stores the prob of the chosen direction (down)
             assert!(
-                *estimated_prob_up < 0.5,
-                "prob up should be <50%, got {}",
+                *estimated_prob_up > 0.5,
+                "estimated prob for chosen direction should be >50%, got {}",
                 estimated_prob_up
             );
         } else {
@@ -2022,12 +2044,12 @@ mod tests {
             .updown_start_prices
             .insert(cid, (100_000.0, window_start_ts));
 
-        // First signal fires
-        let s1 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_010.0)));
+        // First signal fires (0.1% move to trigger momentum)
+        let s1 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_100.0)));
         assert!(!s1.is_empty(), "first signal should fire");
 
         // Second tick — already positioned, should not fire again
-        let s2 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_010.0)));
+        let s2 = strat.on_event(StrategyEvent::PriceUpdate(make_price("BTC-USD", 100_100.0)));
         assert!(
             s2.is_empty(),
             "should not fire duplicate signal while holding"
