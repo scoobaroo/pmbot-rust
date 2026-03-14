@@ -158,6 +158,7 @@ impl PolymarketClient {
             },
             "owner": self.credentials.api_key,
             "orderType": params.order_type,
+            "deferExec": false,
         });
 
         if params.post_only {
