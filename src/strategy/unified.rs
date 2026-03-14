@@ -951,18 +951,18 @@ impl UnifiedStrategy {
         let price_move_pct = (spot - start_price) / start_price;
         let implied_prob_up = market.implied_prob_yes.to_f64().unwrap_or(0.5);
 
-        // Minimum price move required before we trade (0.05% = 5 bps)
-        let min_move_pct = 0.0005;
+        // Minimum price move required before we trade (0.02% = 2 bps ≈ $14 on BTC)
+        let min_move_pct = 0.0002;
 
         // Determine direction from actual price action
         let (side, estimated_prob, implied_prob, token_id) = if price_move_pct > min_move_pct {
             // Price moved UP → bet UP (buy YES token)
-            // Our confidence scales with the move magnitude
-            let prob_up = (0.5 + price_move_pct * 50.0).clamp(0.51, 0.95);
+            // Confidence scales with move: 0.02% → 52%, 0.1% → 60%, 0.5% → 95%
+            let prob_up = (0.5 + price_move_pct * 100.0).clamp(0.51, 0.95);
             (Side::Buy, prob_up, implied_prob_up, &market.token_id_yes)
         } else if price_move_pct < -min_move_pct {
             // Price moved DOWN → bet DOWN (buy NO token)
-            let prob_down = (0.5 + price_move_pct.abs() * 50.0).clamp(0.51, 0.95);
+            let prob_down = (0.5 + price_move_pct.abs() * 100.0).clamp(0.51, 0.95);
             (
                 Side::Sell,
                 prob_down,

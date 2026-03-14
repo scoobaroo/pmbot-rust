@@ -146,11 +146,11 @@ impl Config {
             polymarket_private_key: env_or("POLYMARKET_PRIVATE_KEY", ""),
             polygon_rpc_url: env_or("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
             ethereum_rpc_url: env_or("ETHEREUM_RPC_URL", "https://eth.llamarpc.com"),
-            symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD")
+            symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD,XRP-USD")
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            min_edge_threshold: dec_or("MIN_EDGE_THRESHOLD", "0.05"),
+            min_edge_threshold: dec_or("MIN_EDGE_THRESHOLD", "0.04"),
             kelly_fraction_cap: dec_or("KELLY_FRACTION_CAP", "0.5"),
             volatility_window_hours: u64_or("VOLATILITY_WINDOW_HOURS", 24),
             max_position_usd,
@@ -177,7 +177,7 @@ impl Config {
             min_arb_profit: dec_or("MIN_ARB_PROFIT", "0.03"),
             arb_size_usd: dec_or("ARB_SIZE_USD", "5"),
             updown_enabled: bool_or("UPDOWN_ENABLED", true),
-            updown_only: bool_or("UPDOWN_ONLY", false),
+            updown_only: bool_or("UPDOWN_ONLY", true),
             discount_rate: f64_or("DISCOUNT_RATE", 0.1),
             ml_enabled: bool_or("ML_ENABLED", false),
             ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
