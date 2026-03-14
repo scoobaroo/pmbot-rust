@@ -32,6 +32,8 @@ pub struct OrderParams<'a> {
     pub post_only: bool,
     /// Optional fee rate override in basis points
     pub fee_rate_bps: Option<u32>,
+    /// Whether to use the neg-risk CTF exchange (default: query CLOB)
+    pub neg_risk: Option<bool>,
 }
 
 pub struct PolymarketClient {
@@ -125,6 +127,14 @@ impl PolymarketClient {
         let salt_val: u64 = ((rand::random::<f64>()) * now_ms as f64).round() as u64;
         let salt = U256::from(salt_val);
 
+        // Determine neg_risk: use provided value or query CLOB
+        let neg_risk = match params.neg_risk {
+            Some(nr) => nr,
+            None => self.get_neg_risk(params.token_id).await?,
+        };
+
+        debug!(neg_risk = neg_risk, token_id = params.token_id, "signing order");
+
         // Sign the order with EIP-712
         let signature = auth::sign_order(
             &self.signer,
@@ -136,7 +146,7 @@ impl PolymarketClient {
                 taker_amount,
                 fee_rate_bps: U256::from(fee_rate_bps as u64),
                 side: side_u8,
-                neg_risk: true, // assume neg_risk for all Polymarket markets
+                neg_risk,
             },
         )
         .await?;
@@ -242,6 +252,18 @@ impl PolymarketClient {
         let resp = req.send().await?;
         let orders: Vec<Value> = resp.json().await?;
         Ok(orders)
+    }
+
+    /// Query whether a token uses the neg-risk CTF exchange.
+    pub async fn get_neg_risk(&self, token_id: &str) -> Result<bool, PolymarketError> {
+        let resp = self
+            .http
+            .get(format!("{CLOB_BASE_URL}/neg-risk?token_id={token_id}"))
+            .send()
+            .await?;
+
+        let v: Value = resp.json().await?;
+        Ok(v.get("neg_risk").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
     /// Get the orderbook for a specific token.

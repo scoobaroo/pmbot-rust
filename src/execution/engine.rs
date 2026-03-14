@@ -376,6 +376,7 @@ impl ExecutionEngine {
             order_type: "GTC",
             post_only,
             fee_rate_bps,
+            neg_risk: None, // auto-detect via CLOB API
         };
 
         match client.place_order(&params).await {
@@ -404,6 +405,7 @@ impl ExecutionEngine {
                         order_type: "GTC",
                         post_only: false,
                         fee_rate_bps,
+                        neg_risk: None,
                     };
                     match client.place_order(&taker_params).await {
                         Ok(order_id) => {
