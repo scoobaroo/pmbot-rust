@@ -150,7 +150,7 @@ impl Config {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            min_edge_threshold: dec_or("MIN_EDGE_THRESHOLD", "0.03"),
+            min_edge_threshold: dec_or("MIN_EDGE_THRESHOLD", "0.05"),
             kelly_fraction_cap: dec_or("KELLY_FRACTION_CAP", "0.5"),
             volatility_window_hours: u64_or("VOLATILITY_WINDOW_HOURS", 24),
             max_position_usd,
