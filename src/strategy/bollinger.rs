@@ -280,7 +280,7 @@ mod tests {
     fn make_config() -> Config {
         crate::config::Config {
             mode: crate::config::RunMode::Paper,
-            strategy: crate::config::StrategyName::BollingerBands,
+            strategies: vec![crate::config::StrategyName::BollingerBands],
             backtest_file: String::new(),
             coinbase_api_key: String::new(),
             coinbase_api_secret: String::new(),
@@ -321,6 +321,7 @@ mod tests {
             ml_server_url: String::new(),
             ml_timeout_ms: 50,
             ml_signal_weight: 0.5,
+            discount_rate: 0.1,
             stale_feed_timeout_secs: 30,
         }
     }

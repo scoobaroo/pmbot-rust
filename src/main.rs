@@ -6,11 +6,13 @@ use pmbot_rust::exchanges::okx::OkxFeed;
 use pmbot_rust::exchanges::ExchangeFeed;
 use pmbot_rust::ml::bridge::{MlBridge, MlBridgeConfig};
 use pmbot_rust::polymarket::ws_orderbook;
+use pmbot_rust::strategy::factory::create_strategy;
 use pmbot_rust::types::candle::Timeframe;
 use pmbot_rust::types::events::{
     AggregatorEvent, ExchangeEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal,
 };
-use tokio::sync::mpsc;
+use std::collections::HashSet;
+use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
 #[tokio::main]
@@ -21,7 +23,7 @@ async fn main() {
     pmbot_rust::utils::logging::init(&config.log_level);
     let shutdown = pmbot_rust::utils::shutdown::create_shutdown_token();
 
-    info!(mode = ?config.mode, strategy = ?config.strategy, symbols = ?config.symbols, "pmbot starting");
+    info!(mode = ?config.mode, strategies = ?config.strategies, symbols = ?config.symbols, "pmbot starting");
 
     if config.mode == RunMode::Live {
         tracing::warn!(
@@ -40,62 +42,57 @@ async fn main() {
 
     let symbols = config.symbols.clone();
 
-    // Determine which candle timeframes the strategy needs
-    let candle_timeframes = match config.strategy {
-        StrategyName::MaCrossover => {
-            let tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
-            vec![tf]
-        }
-        StrategyName::BollingerBands => {
-            let tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
-            vec![tf]
-        }
-        StrategyName::BlackScholes => vec![], // no candles needed
-        StrategyName::Unified => {
-            let bb_tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
-            let ma_tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
-            if bb_tf == ma_tf {
-                vec![bb_tf]
-            } else {
-                vec![bb_tf, ma_tf]
-            }
-        }
-        StrategyName::HedgedLp => vec![], // pure microstructure, no candles
-    };
-
     // Create shared BookCache for Polymarket orderbook data
     let book_cache = ws_orderbook::new_book_cache();
 
-    // Create strategy via factory, injecting book cache for Black-Scholes / Unified
-    let strategy: Box<dyn pmbot_rust::strategy::traits::Strategy> = match config.strategy {
-        StrategyName::BlackScholes => {
-            let bs = pmbot_rust::strategy::black_scholes::BlackScholesStrategy::new(&config)
-                .with_book_cache(book_cache.clone());
-            Box::new(bs)
-        }
-        StrategyName::Unified => {
-            let unified = pmbot_rust::strategy::unified::UnifiedStrategy::new(&config)
-                .with_book_cache(book_cache.clone());
-            Box::new(unified)
-        }
-        StrategyName::MaCrossover => {
-            Box::new(pmbot_rust::strategy::ma_crossover::MACrossoverStrategy::new(&config))
-        }
-        StrategyName::BollingerBands => {
-            Box::new(pmbot_rust::strategy::bollinger::BollingerBandsStrategy::new(&config))
-        }
-        StrategyName::HedgedLp => {
-            let hlp = pmbot_rust::strategy::hedged_lp::HedgedLpStrategy::new(&config)
-                .with_book_cache(book_cache.clone());
-            Box::new(hlp)
-        }
-    };
-    let needs_polymarket = strategy.subscriptions().polymarket_updates;
+    // Build all strategy instances and compute union of needs
+    let mut strategies: Vec<Box<dyn pmbot_rust::strategy::traits::Strategy>> = Vec::new();
+    let mut all_timeframes: HashSet<Timeframe> = HashSet::new();
+    let mut needs_polymarket = false;
+
+    for strategy_name in &config.strategies {
+        let strategy = create_strategy(strategy_name, &config, Some(book_cache.clone()));
+        let subs = strategy.subscriptions();
+        needs_polymarket |= subs.polymarket_updates;
+
+        // Collect candle timeframes per strategy
+        let tfs = candle_timeframes_for(strategy_name, &config);
+        all_timeframes.extend(tfs);
+
+        strategies.push(strategy);
+    }
+
+    let candle_timeframes: Vec<Timeframe> = all_timeframes.into_iter().collect();
+
+    // Create broadcast channels for fan-out to multiple strategy runners
+    let (agg_broadcast_tx, _) = broadcast::channel::<AggregatorEvent>(256);
+    let (exec_broadcast_tx, _) = broadcast::channel::<ExecutionEvent>(64);
+    let (poly_broadcast_tx, _) = broadcast::channel::<PolymarketUpdate>(128);
+    let (ml_broadcast_tx, _) = broadcast::channel::<MlPrediction>(64);
+
+    // Spawn strategy runners — each gets its own broadcast receiver
+    for strategy in strategies {
+        let runner = pmbot_rust::strategy::runner::StrategyRunner::new(strategy);
+        let agg_rx = agg_broadcast_tx.subscribe();
+        let exec_rx = exec_broadcast_tx.subscribe();
+        let poly_rx = poly_broadcast_tx.subscribe();
+        let ml_rx = if config.ml_enabled {
+            Some(ml_broadcast_tx.subscribe())
+        } else {
+            None
+        };
+        let sig_tx = signal_tx.clone();
+        let strat_sd = shutdown.clone();
+        tokio::spawn(async move {
+            runner
+                .run(agg_rx, exec_rx, poly_rx, ml_rx, sig_tx, strat_sd)
+                .await;
+        });
+    }
 
     match config.mode {
         RunMode::Backtest => {
             // Backtest mode: replay CSV data through the pipeline
-            // Pass polymarket_tx so the engine can inject UpDown markets inline
             let bt_shutdown = shutdown.clone();
             let bt_exchange_tx = exchange_tx.clone();
             let bt_config = config.clone();
@@ -104,7 +101,6 @@ async fn main() {
             } else {
                 None
             };
-            // Clone shutdown token so we can cancel it after replay + drain
             let bt_done_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 pmbot_rust::backtest::engine::run_backtest(
@@ -121,7 +117,7 @@ async fn main() {
             });
         }
         _ => {
-            // Live/Paper: spawn all 4 exchange feeds
+            // Live/Paper: spawn all exchange feeds
             macro_rules! spawn_feed {
                 ($feed:expr) => {{
                     let tx = exchange_tx.clone();
@@ -136,7 +132,7 @@ async fn main() {
             spawn_feed!(BinanceFeed);
             spawn_feed!(OkxFeed);
 
-            // Spawn Chainlink oracle feed (polling, not WebSocket)
+            // Spawn Chainlink oracle feed
             {
                 let chainlink_feed = pmbot_rust::exchanges::chainlink::ChainlinkFeed::new(
                     &config.polygon_rpc_url,
@@ -152,9 +148,8 @@ async fn main() {
                 });
             }
 
-            // Spawn Polymarket market scanner only if strategy needs it
+            // Spawn Polymarket market scanner only if any strategy needs it
             if needs_polymarket {
-                // Channel for scanner → orderbook stream token ID discovery
                 let (token_tx, token_rx) = mpsc::channel::<Vec<String>>(16);
 
                 let scanner = pmbot_rust::polymarket::market_scanner::MarketScanner::new(
@@ -169,7 +164,6 @@ async fn main() {
                 });
 
                 // Spawn Polymarket WebSocket orderbook stream
-                // Waits for token IDs from the scanner before connecting
                 let ws_book_cache = book_cache.clone();
                 let ws_sd = shutdown.clone();
                 tokio::spawn(async move {
@@ -184,7 +178,7 @@ async fn main() {
     drop(exchange_tx);
 
     // Conditionally create ML channels and bridge
-    let (ml_candle_tx, ml_prediction_rx) = if config.ml_enabled {
+    let ml_candle_tx = if config.ml_enabled {
         let (candle_tx, candle_rx) = mpsc::channel::<AggregatorEvent>(256);
         let (prediction_tx, prediction_rx) = mpsc::channel::<MlPrediction>(64);
 
@@ -194,7 +188,11 @@ async fn main() {
                 timeout_ms: config.ml_timeout_ms,
                 active_yes_token_id: std::env::var("ML_POLY_YES_TOKEN").ok(),
             },
-            if needs_polymarket { Some(book_cache.clone()) } else { None },
+            if needs_polymarket {
+                Some(book_cache.clone())
+            } else {
+                None
+            },
         );
         let ml_sd = shutdown.clone();
         tokio::spawn(async move {
@@ -202,9 +200,18 @@ async fn main() {
         });
         info!(server_url = %config.ml_server_url, "ML bridge spawned");
 
-        (Some(candle_tx), Some(prediction_rx))
+        // Forward ML predictions to broadcast
+        let ml_bcast = ml_broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = prediction_rx;
+            while let Some(pred) = rx.recv().await {
+                let _ = ml_bcast.send(pred);
+            }
+        });
+
+        Some(candle_tx)
     } else {
-        (None, None)
+        None
     };
 
     // Spawn aggregator
@@ -221,25 +228,41 @@ async fn main() {
             .await;
     });
 
-    // Spawn strategy runner
-    let runner = pmbot_rust::strategy::runner::StrategyRunner::new(strategy);
-    let strat_sd = shutdown.clone();
-    tokio::spawn(async move {
-        runner
-            .run(
-                aggregator_rx,
-                execution_rx,
-                polymarket_rx,
-                ml_prediction_rx,
-                signal_tx,
-                strat_sd,
-            )
-            .await;
-    });
+    // Forward aggregator events to broadcast channel for strategy fan-out
+    {
+        let agg_bcast = agg_broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = aggregator_rx;
+            while let Some(event) = rx.recv().await {
+                let _ = agg_bcast.send(event);
+            }
+        });
+    }
+
+    // Forward execution events to broadcast channel
+    {
+        let exec_bcast = exec_broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = execution_rx;
+            while let Some(event) = rx.recv().await {
+                let _ = exec_bcast.send(event);
+            }
+        });
+    }
+
+    // Forward polymarket updates to broadcast channel
+    {
+        let poly_bcast = poly_broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = polymarket_rx;
+            while let Some(event) = rx.recv().await {
+                let _ = poly_bcast.send(event);
+            }
+        });
+    }
 
     // Spawn execution engine
     let poly_client = if config.mode == RunMode::Live {
-        // In live mode, derive API credentials and create client
         match pmbot_rust::polymarket::auth::derive_api_credentials(&config.polymarket_private_key)
             .await
         {
@@ -265,4 +288,28 @@ async fn main() {
     // Wait for shutdown
     shutdown.cancelled().await;
     info!("pmbot shutdown complete");
+}
+
+/// Determine which candle timeframes a given strategy needs.
+fn candle_timeframes_for(name: &StrategyName, config: &Config) -> Vec<Timeframe> {
+    match name {
+        StrategyName::MaCrossover => {
+            let tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
+            vec![tf]
+        }
+        StrategyName::BollingerBands => {
+            let tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
+            vec![tf]
+        }
+        StrategyName::BlackScholes | StrategyName::HedgedLp | StrategyName::Discount => vec![],
+        StrategyName::Unified => {
+            let bb_tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
+            let ma_tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);
+            if bb_tf == ma_tf {
+                vec![bb_tf]
+            } else {
+                vec![bb_tf, ma_tf]
+            }
+        }
+    }
 }

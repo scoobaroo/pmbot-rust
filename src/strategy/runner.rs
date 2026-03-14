@@ -2,7 +2,7 @@ use crate::strategy::traits::{Strategy, StrategyEvent};
 use crate::types::events::{
     AggregatorEvent, ExecutionEvent, MlPrediction, PolymarketUpdate, TradeSignal,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -67,10 +67,10 @@ impl StrategyRunner {
 
     pub async fn run(
         mut self,
-        mut agg_rx: mpsc::Receiver<AggregatorEvent>,
-        mut exec_rx: mpsc::Receiver<ExecutionEvent>,
-        mut poly_rx: mpsc::Receiver<PolymarketUpdate>,
-        mut ml_rx: Option<mpsc::Receiver<MlPrediction>>,
+        mut agg_rx: broadcast::Receiver<AggregatorEvent>,
+        mut exec_rx: broadcast::Receiver<ExecutionEvent>,
+        mut poly_rx: broadcast::Receiver<PolymarketUpdate>,
+        mut ml_rx: Option<broadcast::Receiver<MlPrediction>>,
         signal_tx: mpsc::Sender<TradeSignal>,
         shutdown: CancellationToken,
     ) {
@@ -86,7 +86,15 @@ impl StrategyRunner {
                     info!(strategy = %name, "strategy runner shutting down");
                     return;
                 }
-                Some(event) = agg_rx.recv() => {
+                result = agg_rx.recv() => {
+                    let event = match result {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(strategy = %name, skipped = n, "aggregator broadcast lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
                     match event {
                         AggregatorEvent::PriceUpdate(price) if subs.price_updates => {
                             stats.price_updates += 1;
@@ -106,12 +114,28 @@ impl StrategyRunner {
                         _ => {} // subscription not active for this event type
                     }
                 }
-                Some(event) = poly_rx.recv(), if subs.polymarket_updates => {
+                result = poly_rx.recv(), if subs.polymarket_updates => {
+                    let event = match result {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(strategy = %name, skipped = n, "polymarket broadcast lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
                     let signals = self.strategy.on_event(StrategyEvent::PolymarketUpdate(event));
                     stats.signals_emitted += signals.len() as u64;
                     self.send_signals(&signals, &signal_tx).await;
                 }
-                Some(event) = exec_rx.recv(), if subs.execution_feedback => {
+                result = exec_rx.recv(), if subs.execution_feedback => {
+                    let event = match result {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(strategy = %name, skipped = n, "execution broadcast lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
                     match &event {
                         ExecutionEvent::OrderFilled(_) => stats.fills += 1,
                         ExecutionEvent::OrderFailed { .. } => stats.rejections += 1,
@@ -121,12 +145,20 @@ impl StrategyRunner {
                     stats.signals_emitted += signals.len() as u64;
                     self.send_signals(&signals, &signal_tx).await;
                 }
-                Some(prediction) = async {
+                result = async {
                     match ml_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 }, if subs.ml_predictions => {
+                    let prediction = match result {
+                        Ok(p) => p,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(strategy = %name, skipped = n, "ML broadcast lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
                     stats.ml_predictions += 1;
                     let signals = self.strategy.on_event(StrategyEvent::MlUpdate(prediction));
                     stats.signals_emitted += signals.len() as u64;

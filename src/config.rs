@@ -12,6 +12,7 @@ pub enum RunMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StrategyName {
     BlackScholes,
+    Discount,
     MaCrossover,
     BollingerBands,
     Unified,
@@ -24,8 +25,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "paper")]
     pub mode: RunMode,
 
-    #[arg(long, value_enum, default_value = "unified")]
-    pub strategy: StrategyName,
+    #[arg(long, value_enum, default_value = "unified", num_args = 1..)]
+    pub strategy: Vec<StrategyName>,
 
     #[arg(long, default_value = "data/backtest.csv")]
     pub backtest_file: String,
@@ -42,7 +43,7 @@ pub struct Cli {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: RunMode,
-    pub strategy: StrategyName,
+    pub strategies: Vec<StrategyName>,
     pub backtest_file: String,
 
     // API keys
@@ -95,6 +96,9 @@ pub struct Config {
     pub updown_enabled: bool,
     pub updown_only: bool,
 
+    // Discount strategy
+    pub discount_rate: f64,
+
     // ML prediction service
     pub ml_enabled: bool,
     pub ml_server_url: String,
@@ -128,7 +132,7 @@ impl Config {
 
         Self {
             mode: cli.mode,
-            strategy: cli.strategy,
+            strategies: cli.strategy.clone(),
             backtest_file: cli.backtest_file.clone(),
             coinbase_api_key: env_or("COINBASE_API_KEY", ""),
             coinbase_api_secret: env_or("COINBASE_API_SECRET", ""),
@@ -167,6 +171,7 @@ impl Config {
             arb_size_usd: dec_or("ARB_SIZE_USD", "5"),
             updown_enabled: bool_or("UPDOWN_ENABLED", true),
             updown_only: bool_or("UPDOWN_ONLY", false),
+            discount_rate: f64_or("DISCOUNT_RATE", 0.1),
             ml_enabled: bool_or("ML_ENABLED", false),
             ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
             ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
