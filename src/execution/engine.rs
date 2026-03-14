@@ -392,7 +392,7 @@ impl ExecutionEngine {
                 let err_msg = e.to_string();
 
                 // If post-only order was rejected (would cross spread), retry as taker
-                if post_only && err_msg.contains("would cross") {
+                if post_only && (err_msg.contains("would cross") || err_msg.contains("crosses book")) {
                     warn!(
                         order_id = %order.id,
                         "post-only order rejected (would cross spread), retrying as taker"
