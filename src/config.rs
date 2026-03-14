@@ -144,7 +144,7 @@ impl Config {
             coinbase_api_key: env_or("COINBASE_API_KEY", ""),
             coinbase_api_secret: env_or("COINBASE_API_SECRET", ""),
             polymarket_private_key: env_or("POLYMARKET_PRIVATE_KEY", ""),
-            polygon_rpc_url: env_or("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+            polygon_rpc_url: env_or("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
             ethereum_rpc_url: env_or("ETHEREUM_RPC_URL", "https://eth.llamarpc.com"),
             symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD")
                 .split(',')
