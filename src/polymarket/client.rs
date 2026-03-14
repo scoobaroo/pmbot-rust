@@ -60,7 +60,7 @@ impl PolymarketClient {
             info!(
                 signer = %signer_address,
                 funder = %funder_address,
-                "proxy wallet mode: signer != funder (signatureType=2)"
+                "proxy wallet mode: signer != funder (signatureType=1 POLY_PROXY)"
             );
         }
 
@@ -157,7 +157,7 @@ impl PolymarketClient {
         // Sign the order with EIP-712
         // Determine if we're using a proxy wallet (funder != signer)
         let is_proxy = self.funder_address != self.signer_address;
-        let signature_type: u8 = if is_proxy { 2 } else { 0 }; // 2 = GNOSIS_SAFE, 0 = EOA
+        let signature_type: u8 = if is_proxy { 1 } else { 0 }; // 1 = POLY_PROXY, 0 = EOA
 
         let signature = auth::sign_order(
             &self.signer,
