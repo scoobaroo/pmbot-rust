@@ -933,9 +933,11 @@ impl UnifiedStrategy {
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now) as f64;
 
-        // Dead zones: skip first 30s and last 30s
+        // Dead zones: skip first 30s (prices settling) and last 30% of window
+        // (need time for order fill + resolution). For 5m markets = last 90s, 15m = last 270s.
         let elapsed = now - window_start_ts;
-        if elapsed < 30 || time_remaining_secs < 30.0 {
+        let end_dead_zone = (window_secs as f64 * 0.30).max(60.0);
+        if elapsed < 30 || time_remaining_secs < end_dead_zone {
             return None;
         }
 
