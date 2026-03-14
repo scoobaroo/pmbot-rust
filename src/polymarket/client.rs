@@ -116,8 +116,13 @@ impl PolymarketClient {
             .parse::<U256>()
             .map_err(|e| PolymarketError::Api(format!("invalid token ID: {e}")))?;
 
-        // Generate random salt (u64 so it serializes as a JSON integer in the body)
-        let salt_val: u64 = rand::random();
+        // Generate salt matching official SDK pattern: Math.round(Math.random() * Date.now())
+        // Must stay within JS Number.MAX_SAFE_INTEGER (2^53) for CLOB server compatibility
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let salt_val: u64 = ((rand::random::<f64>()) * now_ms as f64).round() as u64;
         let salt = U256::from(salt_val);
 
         // Sign the order with EIP-712
