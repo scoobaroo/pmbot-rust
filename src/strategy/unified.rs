@@ -118,10 +118,8 @@ pub struct UnifiedStrategy {
     // Up/down: captured VWAP at window start, keyed by condition_id → (start_price, window_start_ts)
     updown_start_prices: HashMap<String, (f64, i64)>,
 
-    // Arb fallback state
+    // YES+NO < $1 arb state
     active_arbs: HashSet<String>,
-    arb_threshold: Decimal,
-    min_arb_profit: Decimal,
     arb_size_usd: Decimal,
 }
 
@@ -171,8 +169,6 @@ impl UnifiedStrategy {
             updown_start_prices: HashMap::new(),
 
             active_arbs: HashSet::new(),
-            arb_threshold: config.arb_threshold,
-            min_arb_profit: config.min_arb_profit,
             arb_size_usd: config.arb_size_usd,
         }
     }
@@ -607,15 +603,33 @@ impl UnifiedStrategy {
         let no_ask = no_snap.best_ask;
         let total = yes_ask + no_ask;
 
-        if total >= self.arb_threshold {
+        // Fee-aware arb: compute net profit after Polymarket fees on both legs
+        let yes_fee = self.fee_calculator.taker_fee(yes_ask);
+        let no_fee = self.fee_calculator.taker_fee(no_ask);
+        let total_with_fees = total + yes_fee + no_fee;
+
+        // Net profit per $1 of resolution payout
+        let net_profit = Decimal::ONE - total_with_fees;
+
+        // Log near-misses for monitoring (within 1% of profitable)
+        if net_profit > dec!(-0.01) && net_profit <= Decimal::ZERO {
+            debug!(
+                condition_id = %market.condition_id,
+                yes_ask = %yes_ask,
+                no_ask = %no_ask,
+                total = %total,
+                fees = format!("{:.4}", (yes_fee + no_fee)),
+                net_profit = format!("{:.4}", net_profit),
+                "arb near-miss (fees eat the edge)"
+            );
             return None;
         }
 
-        let profit_pct = (Decimal::ONE - total) / total;
-        if profit_pct < self.min_arb_profit {
+        if net_profit <= Decimal::ZERO {
             return None;
         }
 
+        let profit_pct = net_profit / total_with_fees;
         let confidence = profit_pct.to_f64().unwrap_or(0.0);
         let size_per_side = self.arb_size_usd;
 
@@ -624,15 +638,18 @@ impl UnifiedStrategy {
             yes_ask = %yes_ask,
             no_ask = %no_ask,
             total = %total,
+            yes_fee = format!("{:.4}", yes_fee),
+            no_fee = format!("{:.4}", no_fee),
+            net_profit = format!("{:.4}", net_profit),
             profit_pct = format!("{:.2}%", confidence * 100.0),
             size_per_side = %size_per_side,
-            "arb opportunity detected"
+            "ARB OPPORTUNITY — YES+NO < $1 after fees"
         );
 
         let meta = SignalMetadata::Arbitrage {
             yes_ask,
             no_ask,
-            total_cost: total,
+            total_cost: total_with_fees,
             profit_pct,
         };
 
@@ -649,14 +666,14 @@ impl UnifiedStrategy {
         };
         let no_signal = TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
-            side: Side::Sell, // Buy NO token
+            side: Side::Sell, // Buy NO token (engine maps Sell → no token)
             size_usd: size_per_side,
             price: no_ask,
             confidence,
             metadata: SignalMetadata::Arbitrage {
                 yes_ask,
                 no_ask,
-                total_cost: total,
+                total_cost: total_with_fees,
                 profit_pct,
             },
             timestamp: now,
@@ -673,17 +690,19 @@ impl UnifiedStrategy {
     fn evaluate_all_markets(&self) -> Vec<TradeSignal> {
         let mut signals = Vec::new();
         for market in self.markets.values() {
+            // Always check YES+NO < $1 arb first (fee-aware, independent of direction)
+            if let Some(arb_signals) = self.check_arb_opportunity(market) {
+                signals.extend(arb_signals);
+                continue; // Don't also take a directional bet on the same market
+            }
+
+            // No arb — try directional signal
             let signal = match market.market_type {
                 MarketType::StrikeAbove => self.evaluate_market(market),
                 MarketType::UpDown { .. } => self.evaluate_updown_market(market),
             };
             if let Some(s) = signal {
                 signals.push(s);
-            } else {
-                // Directional says NO — check arb fallback
-                if let Some(arb_signals) = self.check_arb_opportunity(market) {
-                    signals.extend(arb_signals);
-                }
             }
         }
         signals
