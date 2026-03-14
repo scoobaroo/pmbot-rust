@@ -154,7 +154,7 @@ impl PolymarketClient {
                 "signatureType": 0,
                 "signature": signature,
             },
-            "owner": wallet_hex,
+            "owner": self.credentials.api_key,
             "orderType": params.order_type,
         });
 

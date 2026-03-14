@@ -7,6 +7,7 @@ use crate::types::events::{ExecutionEvent, SignalMetadata, TradeSignal, TradeTar
 use crate::types::market::{MarketDirection, MarketType};
 use crate::types::order::{Fill, Order, OrderStatus, OrderType, Side};
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -198,10 +199,12 @@ impl ExecutionEngine {
             Side::Buy
         };
 
-        let price = signal.price;
+        // Round price to 2 decimal places (standard Polymarket tick size)
+        let price = signal.price.round_dp(2);
 
         let token_size = if price > Decimal::ZERO {
-            signal.size_usd / price
+            // Truncate token size to 2 decimal places to avoid CLOB precision errors
+            (signal.size_usd / price).round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
         } else {
             return;
         };
@@ -245,6 +248,24 @@ impl ExecutionEngine {
                     signal.side,
                 ))
             }
+            (
+                MarketType::UpDown {
+                    window_start_ts,
+                    window_secs,
+                },
+                SignalMetadata::HedgedLp { .. },
+            ) => {
+                let window_end_ts = window_start_ts + *window_secs as i64;
+                // Use strike (start price) from market — HedgedLP tracks this separately
+                let start_price = market.strike.to_f64().unwrap_or(0.0);
+                Some((
+                    market.condition_id.clone(),
+                    window_end_ts,
+                    market.underlying_symbol.clone(),
+                    start_price,
+                    signal.side,
+                ))
+            }
             _ => None,
         };
 
@@ -270,7 +291,17 @@ impl ExecutionEngine {
         }
 
         // Attach UpDown resolution metadata to the paper position
-        if let Some((condition_id, window_end_ts, symbol, start_price, signal_side)) = updown_meta {
+        if let Some((condition_id, window_end_ts, symbol, start_price, signal_side)) =
+            updown_meta
+        {
+            info!(
+                condition_id = %condition_id,
+                window_end_ts = window_end_ts,
+                symbol = %symbol,
+                start_price = start_price,
+                signal_side = ?signal_side,
+                "setting updown meta on position"
+            );
             self.paper_tracker.set_updown_meta(
                 &condition_id,
                 window_end_ts,
@@ -278,6 +309,8 @@ impl ExecutionEngine {
                 start_price,
                 signal_side,
             );
+        } else {
+            info!("no updown_meta extracted for this signal");
         }
 
         // Record arb fill in paper tracker
@@ -515,13 +548,22 @@ impl ExecutionEngine {
     /// Poll Gamma API for expired UpDown market resolutions.
     async fn resolve_expired_via_api(&mut self) {
         let now_ts = Utc::now().timestamp();
+        let open_count = self.paper_tracker.open_position_count();
         let expired_ids = self.paper_tracker.expired_updown_condition_ids(now_ts);
         if expired_ids.is_empty() {
+            if open_count > 0 {
+                info!(
+                    open_positions = open_count,
+                    now_ts = now_ts,
+                    "resolve tick: no expired positions yet"
+                );
+            }
             return;
         }
 
-        debug!(
+        info!(
             count = expired_ids.len(),
+            ids = ?expired_ids,
             "checking expired markets for resolution"
         );
 
