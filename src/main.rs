@@ -219,6 +219,8 @@ async fn main() {
         config.stale_feed_timeout_secs,
         config.volatility_window_hours,
         candle_timeframes,
+        config.binance_weight_multiplier,
+        config.chainlink_blend_weight,
     );
     let agg_sd = shutdown.clone();
     let vol_window = config.volatility_window_hours;

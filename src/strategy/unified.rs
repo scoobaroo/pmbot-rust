@@ -1331,6 +1331,8 @@ mod tests {
             ml_timeout_ms: 50,
             ml_signal_weight: 0.5,
             discount_rate: 0.1,
+            binance_weight_multiplier: 5.0,
+            chainlink_blend_weight: 0.1,
         }
     }
 

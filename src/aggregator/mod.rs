@@ -21,6 +21,10 @@ pub struct Aggregator {
     volatility_trackers: HashMap<String, VolatilityTracker>,
     candle_builder: CandleBuilder,
     stale_timeout_secs: u64,
+    /// Multiplier on Binance volume in VWAP (e.g. 5.0 = 5× weight)
+    binance_weight_multiplier: Decimal,
+    /// Weight of Chainlink oracle in final blend (0.0–1.0)
+    chainlink_blend_weight: Decimal,
 }
 
 impl Aggregator {
@@ -28,6 +32,8 @@ impl Aggregator {
         stale_timeout_secs: u64,
         volatility_window_hours: u64,
         candle_timeframes: Vec<Timeframe>,
+        binance_weight_multiplier: f64,
+        chainlink_blend_weight: f64,
     ) -> Self {
         let _ = volatility_window_hours; // stored per-tracker on creation
         Self {
@@ -35,6 +41,10 @@ impl Aggregator {
             volatility_trackers: HashMap::new(),
             candle_builder: CandleBuilder::new(candle_timeframes),
             stale_timeout_secs,
+            binance_weight_multiplier: Decimal::from_f64_retain(binance_weight_multiplier)
+                .unwrap_or(Decimal::from(5)),
+            chainlink_blend_weight: Decimal::from_f64_retain(chainlink_blend_weight)
+                .unwrap_or(Decimal::new(1, 1)), // 0.1
         }
     }
 
@@ -129,15 +139,25 @@ impl Aggregator {
         let oracle_price = chainlink_tick.map(|t| t.mid());
 
         // Exchange VWAP (excluding Chainlink — it has zero volume)
+        // Binance volume is multiplied by binance_weight_multiplier so its price
+        // dominates the aggregate. This lets the bot see BTC moves 20-40s before
+        // Polymarket reprices, opening a structural latency window.
         let exchange_vwap = if exchange_ticks.is_empty() {
             // Only Chainlink available — use its price
             oracle_price.unwrap_or(Decimal::ZERO)
         } else {
-            let total_volume: Decimal = exchange_ticks.iter().map(|t| t.volume_24h).sum();
+            let weighted_volume = |t: &MarketTick| -> Decimal {
+                if t.exchange == Exchange::Binance {
+                    t.volume_24h * self.binance_weight_multiplier
+                } else {
+                    t.volume_24h
+                }
+            };
+            let total_volume: Decimal = exchange_ticks.iter().map(|t| weighted_volume(t)).sum();
             if total_volume > Decimal::ZERO {
                 exchange_ticks
                     .iter()
-                    .map(|t| t.mid() * t.volume_24h)
+                    .map(|t| t.mid() * weighted_volume(t))
                     .sum::<Decimal>()
                     / total_volume
             } else {
@@ -146,9 +166,14 @@ impl Aggregator {
             }
         };
 
-        // Final VWAP: equal-weight Chainlink with exchange VWAP if available
+        // Final VWAP: blend Chainlink oracle with configurable weight.
+        // Default 0.1 = 10% oracle, 90% exchange VWAP. Keeps the bot responsive
+        // to fast exchange price moves rather than lagging behind on-chain oracle.
         let vwap = match oracle_price {
-            Some(op) if !exchange_ticks.is_empty() => (exchange_vwap + op) / Decimal::TWO,
+            Some(op) if !exchange_ticks.is_empty() => {
+                let cw = self.chainlink_blend_weight;
+                exchange_vwap * (Decimal::ONE - cw) + op * cw
+            }
             _ => exchange_vwap,
         };
 

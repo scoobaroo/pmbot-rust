@@ -105,6 +105,13 @@ pub struct Config {
     pub ml_timeout_ms: u64,
     pub ml_signal_weight: f64,
 
+    // Aggregator price weighting
+    /// Multiplier on Binance volume in VWAP calc (e.g. 5.0 = 5× Binance weight).
+    /// Higher values make the bot track Binance price moves faster.
+    pub binance_weight_multiplier: f64,
+    /// Weight of Chainlink oracle in final VWAP blend (0.0 = ignore, 0.5 = equal weight).
+    pub chainlink_blend_weight: f64,
+
     // System
     pub log_level: String,
     pub stale_feed_timeout_secs: u64,
@@ -176,6 +183,8 @@ impl Config {
             ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
             ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
             ml_signal_weight: f64_or("ML_SIGNAL_WEIGHT", 0.5),
+            binance_weight_multiplier: f64_or("BINANCE_WEIGHT_MULTIPLIER", 5.0),
+            chainlink_blend_weight: f64_or("CHAINLINK_BLEND_WEIGHT", 0.1),
             log_level: env_or("LOG_LEVEL", "info"),
             stale_feed_timeout_secs: u64_or("STALE_FEED_TIMEOUT_SECS", 30),
         }
