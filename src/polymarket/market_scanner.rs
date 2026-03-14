@@ -147,38 +147,47 @@ impl MarketScanner {
     }
 
     async fn scan_updown_markets(&self) -> Result<Vec<PolymarketMarket>, reqwest::Error> {
-        let window_start = current_5m_window_start();
         let mut all_markets = Vec::new();
 
-        for &(slug_prefix, symbol) in UPDOWN_ASSETS {
-            if !self.symbols.iter().any(|s| s == symbol) {
-                continue;
-            }
+        // Scan both 5-minute and 15-minute UpDown windows
+        let windows: &[(u64, &str)] = &[(300, "5m"), (900, "15m")];
 
-            let slug = format!("{}-updown-5m-{}", slug_prefix, window_start);
-            let resp = self
-                .http
-                .get(format!("{}/events", GAMMA_API_URL))
-                .query(&[("slug", slug.as_str())])
-                .send()
-                .await?;
+        for &(window_secs, label) in windows {
+            let window_start = current_window_start(window_secs);
 
-            let events: Vec<serde_json::Value> = resp.json().await?;
-            for event in &events {
-                let nested = match event.get("markets").and_then(|m| m.as_array()) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                for m in nested {
-                    if let Some(market) = parse_updown_market(m, symbol, window_start) {
-                        info!(
-                            question = %market.question,
-                            symbol = %market.underlying_symbol,
-                            token_up = %market.token_id_yes,
-                            implied_up = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
-                            "discovered up/down market"
-                        );
-                        all_markets.push(market);
+            for &(slug_prefix, symbol) in UPDOWN_ASSETS {
+                if !self.symbols.iter().any(|s| s == symbol) {
+                    continue;
+                }
+
+                let slug = format!("{}-updown-{}-{}", slug_prefix, label, window_start);
+                let resp = self
+                    .http
+                    .get(format!("{}/events", GAMMA_API_URL))
+                    .query(&[("slug", slug.as_str())])
+                    .send()
+                    .await?;
+
+                let events: Vec<serde_json::Value> = resp.json().await?;
+                for event in &events {
+                    let nested = match event.get("markets").and_then(|m| m.as_array()) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    for m in nested {
+                        if let Some(market) =
+                            parse_updown_market(m, symbol, window_start, window_secs)
+                        {
+                            info!(
+                                question = %market.question,
+                                symbol = %market.underlying_symbol,
+                                window = label,
+                                token_up = %market.token_id_yes,
+                                implied_up = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
+                                "discovered up/down market"
+                            );
+                            all_markets.push(market);
+                        }
                     }
                 }
             }
@@ -188,10 +197,10 @@ impl MarketScanner {
     }
 }
 
-/// Returns the Unix timestamp of the current 5-minute window start.
-fn current_5m_window_start() -> i64 {
+/// Returns the Unix timestamp of the current window start for the given interval.
+fn current_window_start(window_secs: u64) -> i64 {
     let now = Utc::now().timestamp();
-    now - (now % 300)
+    now - (now % window_secs as i64)
 }
 
 /// Map full crypto names in questions to ticker symbols.
@@ -313,11 +322,12 @@ fn parse_clob_token_ids(v: &serde_json::Value) -> Option<(String, String)> {
     Some((tokens[0].clone(), tokens[1].clone()))
 }
 
-/// Parse a 5-minute up/down market from the Gamma API response.
+/// Parse an up/down market from the Gamma API response.
 fn parse_updown_market(
     v: &serde_json::Value,
     symbol: &str,
     window_start_ts: i64,
+    window_secs: u64,
 ) -> Option<PolymarketMarket> {
     let condition_id = v.get("conditionId")?.as_str()?.to_string();
     let question = v
@@ -337,7 +347,8 @@ fn parse_updown_market(
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|| {
-            DateTime::from_timestamp(window_start_ts + 300, 0).unwrap_or_else(Utc::now)
+            DateTime::from_timestamp(window_start_ts + window_secs as i64, 0)
+                .unwrap_or_else(Utc::now)
         });
 
     let up_price = parse_outcome_price(v, 0).unwrap_or(Decimal::new(50, 2));
@@ -356,7 +367,7 @@ fn parse_updown_market(
         direction: MarketDirection::Bullish, // Up = bullish
         market_type: MarketType::UpDown {
             window_start_ts,
-            window_secs: 300,
+            window_secs,
         },
     })
 }
@@ -392,7 +403,14 @@ pub async fn check_resolutions(
             .get("closed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let end_date = market.get("endDate").and_then(|v| v.as_str()).unwrap_or("unknown");
         if !closed {
+            tracing::info!(
+                condition_id = %cid,
+                closed = closed,
+                end_date = end_date,
+                "market not yet closed in Gamma API"
+            );
             continue;
         }
 
@@ -555,7 +573,7 @@ mod tests {
             "endDate": "2026-02-28T12:05:00Z"
         });
 
-        let market = parse_updown_market(&market_json, "BTC-USD", 1772280000).unwrap();
+        let market = parse_updown_market(&market_json, "BTC-USD", 1772280000, 300).unwrap();
         assert_eq!(market.condition_id, "0xup1");
         assert_eq!(market.underlying_symbol, "BTC-USD");
         assert_eq!(market.token_id_yes, "up_token_123");
@@ -573,10 +591,19 @@ mod tests {
 
     #[test]
     fn test_current_5m_window_start() {
-        let ts = current_5m_window_start();
+        let ts = current_window_start(300);
         assert_eq!(ts % 300, 0, "window start must be aligned to 5 minutes");
         let now = Utc::now().timestamp();
         assert!(now - ts < 300, "window start must be within current window");
+        assert!(ts <= now, "window start must be <= now");
+    }
+
+    #[test]
+    fn test_current_15m_window_start() {
+        let ts = current_window_start(900);
+        assert_eq!(ts % 900, 0, "window start must be aligned to 15 minutes");
+        let now = Utc::now().timestamp();
+        assert!(now - ts < 900, "window start must be within current window");
         assert!(ts <= now, "window start must be <= now");
     }
 
