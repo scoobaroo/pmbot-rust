@@ -101,6 +101,15 @@ pub enum SignalMetadata {
         ml_score: f64,
         kelly_fraction: f64,
     },
+    Discount {
+        estimated_prob: f64,
+        fair_value: f64,
+        implied_prob: f64,
+        discount_rate: f64,
+        time_to_resolution_secs: f64,
+        edge: f64,
+        kelly_fraction: f64,
+    },
     Arbitrage {
         yes_ask: Decimal,
         no_ask: Decimal,

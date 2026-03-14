@@ -116,8 +116,9 @@ impl PolymarketClient {
             .parse::<U256>()
             .map_err(|e| PolymarketError::Api(format!("invalid token ID: {e}")))?;
 
-        // Generate random salt
-        let salt = U256::from(rand::random::<u128>());
+        // Generate random salt (u64 so it serializes as a JSON integer in the body)
+        let salt_val: u64 = rand::random();
+        let salt = U256::from(salt_val);
 
         // Sign the order with EIP-712
         let signature = auth::sign_order(
@@ -138,9 +139,10 @@ impl PolymarketClient {
         let wallet_hex = format!("{}", self.wallet_address);
 
         // Build the signed order body
+        // salt and signatureType are integers; all other numerics are strings
         let mut order_body = serde_json::json!({
             "order": {
-                "salt": salt.to_string(),
+                "salt": salt_val,
                 "maker": wallet_hex,
                 "signer": wallet_hex,
                 "taker": "0x0000000000000000000000000000000000000000",
@@ -164,6 +166,8 @@ impl PolymarketClient {
 
         let body_str = serde_json::to_string(&order_body)
             .map_err(|e| PolymarketError::Api(format!("JSON serialize: {e}")))?;
+
+        debug!(body = %body_str, "CLOB order payload");
 
         // Build L2 auth headers
         let headers = self.l2_headers("POST", "/order", &body_str)?;

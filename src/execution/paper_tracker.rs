@@ -312,6 +312,17 @@ impl PaperTracker {
     ) {
         if let Some(pos) = self.positions.get_mut(condition_id) {
             pos.updown_meta = Some((window_end_ts, symbol.to_string(), start_price, signal_side));
+            tracing::info!(
+                condition_id = condition_id,
+                window_end_ts = window_end_ts,
+                "updown_meta attached to position"
+            );
+        } else {
+            tracing::warn!(
+                condition_id = condition_id,
+                position_keys = ?self.positions.keys().collect::<Vec<_>>(),
+                "set_updown_meta: position not found"
+            );
         }
     }
 

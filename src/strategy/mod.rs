@@ -1,5 +1,6 @@
 pub mod black_scholes;
 pub mod bollinger;
+pub mod discount;
 pub mod factory;
 pub mod hedged_lp;
 pub mod kelly;
