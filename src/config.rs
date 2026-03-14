@@ -166,7 +166,7 @@ impl Config {
             bb_timeframe: env_or("BB_TIMEFRAME", "5m"),
             bb_size_usd: dec_or("BB_SIZE_USD", "500"),
             bb_cooldown_candles: usize_or("BB_COOLDOWN_CANDLES", 3),
-            fee_rate_bps: u32_or("FEE_RATE_BPS", 0),
+            fee_rate_bps: u32_or("FEE_RATE_BPS", 1000),
             maker_mode: cli.maker_mode,
             heartbeat_interval_secs: u64_or("HEARTBEAT_INTERVAL_SECS", 10),
             ws_book_max_stale_secs: u64_or("WS_BOOK_MAX_STALE_SECS", 30),
