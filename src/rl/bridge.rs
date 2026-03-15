@@ -157,7 +157,7 @@ impl RlBridge {
         let mut last_act_time = std::time::Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(std::time::Instant::now);
-        let act_interval = Duration::from_secs(5);
+        let act_interval = Duration::from_secs(1);
 
         // Last state for transition logging
         let mut last_state: Option<Vec<f64>> = None;
