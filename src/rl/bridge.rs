@@ -220,7 +220,7 @@ impl RlBridge {
                                     continue; // throttle — too soon since last action query
                                 }
                                 if let Some(state) = state_builder.build(&price.symbol) {
-                                    // Log transition from previous step
+                                    // Log transition from previous step (independent of RL server)
                                     if let (Some(ref prev_state), Some(prev_action), Some(ref prev_market_id)) =
                                         (&last_state, last_action, &last_market_id)
                                     {
@@ -240,14 +240,13 @@ impl RlBridge {
                                         }
                                     }
 
-                                    // Query RL server for action
-                                    match self.request_action(&state, &market.condition_id).await {
-                                        Ok((action, confidence, latency_ms)) => {
-                                            last_act_time = now_inst;
-                                            last_state = Some(state);
-                                            last_action = Some(action);
-                                            last_market_id = Some(market.condition_id.clone());
+                                    // Always record state for transition logging
+                                    last_act_time = now_inst;
+                                    let market_id = market.condition_id.clone();
 
+                                    // Query RL server for action; default to hold (3) if unavailable
+                                    let action = match self.request_action(&state, &market_id).await {
+                                        Ok((action, confidence, latency_ms)) => {
                                             // Map action to trade signal
                                             if let Some(signal) = self.action_to_signal(
                                                 action,
@@ -265,11 +264,17 @@ impl RlBridge {
                                                 );
                                                 let _ = signal_tx.send(signal).await;
                                             }
+                                            action
                                         }
                                         Err(e) => {
-                                            debug!(error = %e, "RL action request failed");
+                                            debug!(error = %e, "RL action request failed, logging hold");
+                                            3 // hold
                                         }
-                                    }
+                                    };
+
+                                    last_state = Some(state);
+                                    last_action = Some(action);
+                                    last_market_id = Some(market_id);
                                 }
                             }
                         }
