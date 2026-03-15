@@ -1,3 +1,4 @@
+use crate::polymarket::trade_poller::TradeActivityCache;
 use crate::polymarket::ws_orderbook::BookCache;
 use crate::rl::state::{StateBuilder, STATE_DIM};
 use crate::types::candle::Timeframe;
@@ -100,10 +101,15 @@ pub struct RlBridge {
     config: RlBridgeConfig,
     client: reqwest::Client,
     book_cache: Option<BookCache>,
+    trade_activity_cache: Option<TradeActivityCache>,
 }
 
 impl RlBridge {
-    pub fn new(config: RlBridgeConfig, book_cache: Option<BookCache>) -> Self {
+    pub fn new(
+        config: RlBridgeConfig,
+        book_cache: Option<BookCache>,
+        trade_activity_cache: Option<TradeActivityCache>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
@@ -113,6 +119,7 @@ impl RlBridge {
             config,
             client,
             book_cache,
+            trade_activity_cache,
         }
     }
 
@@ -200,9 +207,10 @@ impl RlBridge {
                                 state_builder.active_market = Some(m.clone());
                             }
 
-                            // Update Polymarket book cache data (after setting active market)
+                            // Update Polymarket book cache + trade activity (after setting active market)
                             if let Some(token_id) = state_builder.active_market.as_ref().map(|m| m.token_id_yes.clone()) {
                                 self.update_book_state(&mut state_builder, &token_id).await;
+                                self.update_trade_activity(&mut state_builder, &token_id).await;
                             }
 
                             // Only act if we have an active market and throttle interval elapsed
@@ -384,6 +392,17 @@ impl RlBridge {
                 state.poly_best_ask = dec_to_f64(snap.best_ask);
                 state.poly_depth_bid = dec_to_f64(snap.depth_bid);
                 state.poly_depth_ask = dec_to_f64(snap.depth_ask);
+            }
+        }
+    }
+
+    /// Update Polymarket trade activity from TradeActivityCache.
+    async fn update_trade_activity(&self, state: &mut StateBuilder, token_id: &str) {
+        if let Some(ref cache) = self.trade_activity_cache {
+            let activity = cache.read().await;
+            if let Some(a) = activity.get(token_id) {
+                state.poly_trade_count_5m = a.trade_count_5m as f64;
+                state.poly_volume_5m = a.volume_5m;
             }
         }
     }

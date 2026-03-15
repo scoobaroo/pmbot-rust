@@ -58,6 +58,16 @@ pub struct AggregatedPrice {
     pub timestamp: DateTime<Utc>,
     /// Chainlink oracle price, if available. Used for UpDown market resolution alignment.
     pub oracle_price: Option<Decimal>,
+    /// Trade flow imbalance from Binance @aggTrade: (buy_vol - sell_vol) / total, range [-1, 1].
+    pub trade_flow_imbalance: f64,
+    /// Rolling 5-min buy-side volume from Binance aggregate trades.
+    pub recent_buy_volume: f64,
+    /// Rolling 5-min sell-side volume from Binance aggregate trades.
+    pub recent_sell_volume: f64,
+    /// Current funding rate from Binance Futures @markPrice (updated every 1s).
+    pub funding_rate: Option<f64>,
+    /// Binance Futures mark price.
+    pub mark_price: Option<Decimal>,
 }
 
 /// Whether a market is bullish ("reach $X") or bearish ("dip to $X").
@@ -76,6 +86,10 @@ pub enum MarketType {
     UpDown {
         window_start_ts: i64,
         window_secs: u64,
+    },
+    /// General binary market (sports, politics, weather, etc.) — penny-picking at 95%+.
+    General {
+        end_date_ts: i64,
     },
 }
 

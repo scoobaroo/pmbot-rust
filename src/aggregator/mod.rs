@@ -12,13 +12,69 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::strategy::volatility::VolatilityTracker;
+use std::collections::VecDeque;
 
 /// Key: (exchange, symbol)
 type FeedKey = (Exchange, String);
 
+/// Rolling 5-minute window of trades for buy/sell flow tracking.
+const TRADE_FLOW_WINDOW_SECS: i64 = 300;
+
+struct TradeFlowTracker {
+    /// (timestamp, quantity, is_buy)
+    trades: VecDeque<(DateTime<Utc>, f64, bool)>,
+}
+
+impl TradeFlowTracker {
+    fn new() -> Self {
+        Self {
+            trades: VecDeque::new(),
+        }
+    }
+
+    fn add_trade(&mut self, timestamp: DateTime<Utc>, quantity: f64, is_buy: bool) {
+        self.trades.push_back((timestamp, quantity, is_buy));
+        self.prune(timestamp);
+    }
+
+    fn prune(&mut self, now: DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::seconds(TRADE_FLOW_WINDOW_SECS);
+        while let Some((ts, _, _)) = self.trades.front() {
+            if *ts < cutoff {
+                self.trades.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Returns (buy_volume, sell_volume, imbalance) where imbalance ∈ [-1, 1].
+    fn flow(&self) -> (f64, f64, f64) {
+        let mut buy_vol = 0.0;
+        let mut sell_vol = 0.0;
+        for &(_, qty, is_buy) in &self.trades {
+            if is_buy {
+                buy_vol += qty;
+            } else {
+                sell_vol += qty;
+            }
+        }
+        let total = buy_vol + sell_vol;
+        let imbalance = if total > 0.0 {
+            (buy_vol - sell_vol) / total
+        } else {
+            0.0
+        };
+        (buy_vol, sell_vol, imbalance)
+    }
+}
+
 pub struct Aggregator {
     latest_ticks: HashMap<FeedKey, MarketTick>,
     volatility_trackers: HashMap<String, VolatilityTracker>,
+    trade_flow_trackers: HashMap<String, TradeFlowTracker>,
+    /// Latest funding rate per symbol: (rate_f64, timestamp)
+    funding_rates: HashMap<String, (f64, Decimal, DateTime<Utc>)>,
     candle_builder: CandleBuilder,
     stale_timeout_secs: u64,
     /// Multiplier on Binance volume in VWAP (e.g. 5.0 = 5× weight)
@@ -39,6 +95,8 @@ impl Aggregator {
         Self {
             latest_ticks: HashMap::new(),
             volatility_trackers: HashMap::new(),
+            trade_flow_trackers: HashMap::new(),
+            funding_rates: HashMap::new(),
             candle_builder: CandleBuilder::new(candle_timeframes),
             stale_timeout_secs,
             binance_weight_multiplier: Decimal::from_f64_retain(binance_weight_multiplier)
@@ -61,6 +119,7 @@ impl Aggregator {
         let mut stale_check_interval = tokio::time::interval(std::time::Duration::from_secs(
             self.stale_timeout_secs.max(5),
         ));
+        let mut price_log_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {
             tokio::select! {
@@ -103,6 +162,17 @@ impl Aggregator {
                                 let _ = tx.send(event).await;
                             }
                         }
+                        ExchangeEvent::AggTrade { symbol, quantity, is_buy, timestamp, .. } => {
+                            let qty = quantity.to_string().parse::<f64>().unwrap_or(0.0);
+                            let tracker = self.trade_flow_trackers
+                                .entry(symbol.clone())
+                                .or_insert_with(TradeFlowTracker::new);
+                            tracker.add_trade(timestamp, qty, is_buy);
+                        }
+                        ExchangeEvent::FundingRate { symbol, rate, mark_price, timestamp, .. } => {
+                            let rate_f64 = rate.to_string().parse::<f64>().unwrap_or(0.0);
+                            self.funding_rates.insert(symbol, (rate_f64, mark_price, timestamp));
+                        }
                         ExchangeEvent::Connected(ex) => {
                             info!(exchange = %ex, "feed connected");
                         }
@@ -113,6 +183,25 @@ impl Aggregator {
                 }
                 _ = stale_check_interval.tick() => {
                     self.check_stale_feeds(&tx).await;
+                }
+                _ = price_log_interval.tick() => {
+                    // Log current prices for all symbols every 30s
+                    let mut symbols: Vec<String> = self.latest_ticks.values()
+                        .map(|t| t.symbol.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    symbols.sort();
+                    for symbol in &symbols {
+                        if let Some(agg) = self.aggregate(symbol) {
+                            info!(
+                                symbol = %agg.symbol,
+                                vwap = %agg.vwap,
+                                spread = %agg.spread,
+                                "live price"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -194,6 +283,20 @@ impl Aggregator {
             .max()
             .unwrap_or_else(Utc::now);
 
+        // Trade flow imbalance from Binance @aggTrade
+        let (buy_vol, sell_vol, imbalance) = self
+            .trade_flow_trackers
+            .get(symbol)
+            .map(|t| t.flow())
+            .unwrap_or((0.0, 0.0, 0.0));
+
+        // Funding rate from Binance Futures
+        let (funding_rate, mark_price) = self
+            .funding_rates
+            .get(symbol)
+            .map(|(r, mp, _)| (Some(*r), Some(*mp)))
+            .unwrap_or((None, None));
+
         Some(AggregatedPrice {
             symbol: symbol.to_string(),
             vwap,
@@ -206,6 +309,11 @@ impl Aggregator {
             num_feeds: ticks.len(),
             timestamp,
             oracle_price,
+            trade_flow_imbalance: imbalance,
+            recent_buy_volume: buy_vol,
+            recent_sell_volume: sell_vol,
+            funding_rate,
+            mark_price,
         })
     }
 

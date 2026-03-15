@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::collections::{HashMap, VecDeque};
 
 /// Number of features in the state vector.
-pub const STATE_DIM: usize = 47;
+pub const STATE_DIM: usize = 53;
 
 /// Rolling price history length for return calculations.
 const PRICE_HISTORY_LEN: usize = 60; // 60 ticks ≈ 1 minute at ~1 tick/sec
@@ -21,6 +21,10 @@ pub struct StateBuilder {
     pub poly_best_ask: f64,
     pub poly_depth_bid: f64,
     pub poly_depth_ask: f64,
+
+    // Polymarket trade activity (from TradeActivityCache reads done by bridge)
+    pub poly_trade_count_5m: f64,
+    pub poly_volume_5m: f64,
 
     // Active markets
     pub active_market: Option<PolymarketMarket>,
@@ -64,6 +68,8 @@ impl StateBuilder {
             poly_best_ask: 0.0,
             poly_depth_bid: 0.0,
             poly_depth_ask: 0.0,
+            poly_trade_count_5m: 0.0,
+            poly_volume_5m: 0.0,
             active_market: None,
             bb_window: VecDeque::with_capacity(bb_period + 1),
             ema_fast: 0.0,
@@ -268,6 +274,14 @@ impl StateBuilder {
         state.push(minutes_to_end);                              // 44: minutes_to_window_end
         state.push(is_weekend);                                  // 45: is_weekend
         state.push(secs_since_last);                             // 46: secs_since_last_trade
+
+        // === New high-signal features (6) ===
+        state.push(price.trade_flow_imbalance);                  // 47: trade_flow_imbalance
+        state.push(price.recent_buy_volume);                     // 48: recent_buy_volume
+        state.push(price.recent_sell_volume);                    // 49: recent_sell_volume
+        state.push(price.funding_rate.unwrap_or(0.0));           // 50: funding_rate
+        state.push(self.poly_trade_count_5m);                    // 51: poly_trade_count_5m
+        state.push(self.poly_volume_5m);                         // 52: poly_volume_5m
 
         debug_assert_eq!(state.len(), STATE_DIM);
         Some(state)

@@ -1426,6 +1426,11 @@ mod tests {
             timestamp: Utc::now(),
             volatility: 0.5, // 50% annualized vol
             oracle_price: None,
+            trade_flow_imbalance: 0.0,
+            recent_buy_volume: 0.0,
+            recent_sell_volume: 0.0,
+            funding_rate: None,
+            mark_price: None,
         }
     }
 

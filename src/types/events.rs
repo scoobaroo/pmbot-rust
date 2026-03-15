@@ -8,6 +8,22 @@ use rust_decimal::Decimal;
 #[derive(Debug, Clone)]
 pub enum ExchangeEvent {
     Tick(MarketTick),
+    /// Aggregate trade from Binance — includes buy/sell classification.
+    AggTrade {
+        symbol: String,
+        price: Decimal,
+        quantity: Decimal,
+        is_buy: bool,
+        timestamp: DateTime<Utc>,
+    },
+    /// Real-time funding rate from Binance Futures @markPrice stream.
+    FundingRate {
+        symbol: String,
+        rate: Decimal,
+        mark_price: Decimal,
+        next_funding_time: DateTime<Utc>,
+        timestamp: DateTime<Utc>,
+    },
     Connected(Exchange),
     Disconnected(Exchange),
 }

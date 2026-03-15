@@ -45,6 +45,9 @@ async fn main() {
     // Create shared BookCache for Polymarket orderbook data
     let book_cache = ws_orderbook::new_book_cache();
 
+    // Create Polymarket trade activity cache (shared with RL bridge + trade poller)
+    let trade_activity_cache = pmbot_rust::polymarket::trade_poller::new_trade_activity_cache();
+
     // Build all strategy instances and compute union of needs
     let mut strategies: Vec<Box<dyn pmbot_rust::strategy::traits::Strategy>> = Vec::new();
     let mut all_timeframes: HashSet<Timeframe> = HashSet::new();
@@ -138,6 +141,17 @@ async fn main() {
             spawn_feed!(BinanceFeed);
             spawn_feed!(OkxFeed);
 
+            // Spawn Binance Futures feed for real-time funding rate
+            {
+                let futures_feed = pmbot_rust::exchanges::binance_futures::BinanceFuturesFeed;
+                let futures_tx = exchange_tx.clone();
+                let futures_syms = symbols.clone();
+                let futures_sd = shutdown.clone();
+                tokio::spawn(async move {
+                    futures_feed.run(futures_syms, futures_tx, futures_sd).await;
+                });
+            }
+
             // Spawn Chainlink oracle feed
             {
                 let chainlink_feed = pmbot_rust::exchanges::chainlink::ChainlinkFeed::new(
@@ -179,6 +193,33 @@ async fn main() {
                     let stream = ws_orderbook::OrderbookStream::new(token_rx, ws_book_cache);
                     stream.run(ws_sd).await;
                 });
+
+                // Spawn Polymarket trade activity poller (for RL state features)
+                if config.rl_enabled {
+                    let (trade_token_tx, trade_token_rx) = mpsc::channel::<Vec<String>>(16);
+                    let poller = pmbot_rust::polymarket::trade_poller::TradePoller::new(
+                        trade_activity_cache.clone(),
+                    );
+                    let poller_sd = shutdown.clone();
+                    tokio::spawn(async move {
+                        poller.run(trade_token_rx, poller_sd).await;
+                    });
+
+                    // Forward discovered token IDs to trade poller via polymarket broadcast
+                    let poly_bcast_for_tokens = poly_broadcast_tx.subscribe();
+                    let _token_fwd_sd = shutdown.clone();
+                    tokio::spawn(async move {
+                        let mut rx = poly_bcast_for_tokens;
+                        while let Ok(event) = rx.recv().await {
+                            if let pmbot_rust::types::events::PolymarketUpdate::MarketsDiscovered(markets) = event {
+                                let tokens: Vec<String> = markets.iter().map(|m| m.token_id_yes.clone()).collect();
+                                if !tokens.is_empty() {
+                                    let _ = trade_token_tx.send(tokens).await;
+                                }
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -199,6 +240,11 @@ async fn main() {
             },
             if needs_polymarket {
                 Some(book_cache.clone())
+            } else {
+                None
+            },
+            if needs_polymarket {
+                Some(trade_activity_cache.clone())
             } else {
                 None
             },
