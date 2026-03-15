@@ -321,10 +321,19 @@ mod tests {
             ml_server_url: String::new(),
             ml_timeout_ms: 50,
             ml_signal_weight: 0.5,
+            general_markets_enabled: true,
+            general_poll_interval_secs: 30,
+            general_min_liquidity: 5000,
             discount_rate: 0.1,
             binance_weight_multiplier: 5.0,
             chainlink_blend_weight: 0.1,
             stale_feed_timeout_secs: 30,
+            rl_enabled: false,
+            rl_server_url: String::new(),
+            rl_timeout_ms: 100,
+            rl_capital_usd: 1000.0,
+            rl_log_transitions: false,
+            rl_transition_log_path: String::new(),
         }
     }
 

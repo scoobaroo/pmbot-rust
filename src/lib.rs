@@ -5,6 +5,7 @@ pub mod exchanges;
 pub mod execution;
 pub mod ml;
 pub mod polymarket;
+pub mod rl;
 pub mod strategy;
 pub mod types;
 pub mod utils;

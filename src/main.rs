@@ -157,6 +157,9 @@ async fn main() {
                     token_tx,
                     config.updown_enabled,
                     config.updown_only,
+                    config.general_markets_enabled,
+                    config.general_poll_interval_secs,
+                    config.general_min_liquidity,
                 );
                 let poly_sd = shutdown.clone();
                 tokio::spawn(async move {
@@ -176,6 +179,37 @@ async fn main() {
 
     // Drop the original sender so channels close when all producers finish
     drop(exchange_tx);
+
+    // Conditionally spawn RL bridge (standalone task, not a Strategy)
+    if config.rl_enabled {
+        use pmbot_rust::rl::bridge::{RlBridge, RlBridgeConfig};
+        let rl_bridge = RlBridge::new(
+            RlBridgeConfig {
+                server_url: config.rl_server_url.clone(),
+                timeout_ms: config.rl_timeout_ms,
+                capital_usd: config.rl_capital_usd,
+                log_transitions: config.rl_log_transitions,
+                transition_log_path: config.rl_transition_log_path.clone(),
+            },
+            if needs_polymarket {
+                Some(book_cache.clone())
+            } else {
+                None
+            },
+        );
+        let rl_sig_tx = signal_tx.clone();
+        let rl_agg_rx = agg_broadcast_tx.subscribe();
+        let rl_exec_rx = exec_broadcast_tx.subscribe();
+        let rl_poly_rx = poly_broadcast_tx.subscribe();
+        let rl_ml_rx = ml_broadcast_tx.subscribe();
+        let rl_sd = shutdown.clone();
+        tokio::spawn(async move {
+            rl_bridge
+                .run(rl_agg_rx, rl_exec_rx, rl_poly_rx, rl_ml_rx, rl_sig_tx, rl_sd)
+                .await;
+        });
+        info!(server_url = %config.rl_server_url, "RL bridge spawned");
+    }
 
     // Conditionally create ML channels and bridge
     let ml_candle_tx = if config.ml_enabled {

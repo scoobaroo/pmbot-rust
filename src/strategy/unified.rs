@@ -455,8 +455,8 @@ impl UnifiedStrategy {
                 Some(m) => m,
                 None => continue,
             };
-            // Up/down binary markets: hold until resolution, no early exit
-            if matches!(market.market_type, MarketType::UpDown { .. }) {
+            // Binary markets (UpDown/General): hold until resolution, no early exit
+            if matches!(market.market_type, MarketType::UpDown { .. } | MarketType::General { .. }) {
                 continue;
             }
             if let Some(signal) = self.check_exit(market, pos) {
@@ -700,6 +700,7 @@ impl UnifiedStrategy {
             let signal = match market.market_type {
                 MarketType::StrikeAbove => self.evaluate_market(market),
                 MarketType::UpDown { .. } => self.evaluate_updown_market(market),
+                MarketType::General { .. } => self.evaluate_general_market(market),
             };
             if let Some(s) = signal {
                 signals.push(s);
@@ -920,21 +921,22 @@ impl UnifiedStrategy {
             return None;
         }
 
-        let price = self.latest_prices.get(&market.underlying_symbol)?;
-        let spot = price.vwap.to_f64()?;
-        // Get captured start price
-        let (start_price, _) = self.updown_start_prices.get(&market.condition_id)?;
-        let start_price = *start_price;
+        let spot = self.latest_prices.get(&market.underlying_symbol)
+            .and_then(|p| p.vwap.to_f64())
+            .unwrap_or(0.0);
+        let start_price = self.updown_start_prices.get(&market.condition_id)
+            .map(|(sp, _)| *sp)
+            .unwrap_or(0.0);
 
         // Time remaining (use tick-derived time for backtest correctness)
         let now = self.current_time().timestamp();
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now) as f64;
 
-        // Dead zones: skip first 30s (prices settling) and last 30s (need time to fill).
+        // Dead zones: skip first 30s (prices settling) and last 10s.
         // High-prob strategy benefits from entering late when outcome is clearer.
         let elapsed = now - window_start_ts;
-        if elapsed < 30 || time_remaining_secs < 30.0 {
+        if elapsed < 30 || time_remaining_secs < 10.0 {
             return None;
         }
 
@@ -1025,6 +1027,82 @@ impl UnifiedStrategy {
                 book_score: book,
                 ml_score: ml,
                 kelly_fraction: kelly_scaled,
+            },
+            timestamp: self.current_time(),
+            is_exit: false,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // General binary market evaluation (penny-picking at 95%+)
+    // -------------------------------------------------------------------
+
+    fn evaluate_general_market(&self, market: &PolymarketMarket) -> Option<TradeSignal> {
+        // Already positioned — hold until resolution
+        if self.open_positions.contains_key(&market.condition_id) {
+            return None;
+        }
+
+        let implied_prob_yes = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+        let implied_prob_no = market.implied_prob_no.to_f64().unwrap_or(0.5);
+        let min_prob = 0.95;
+
+        // Pick the side that's >= 95%
+        let (side, implied_prob, estimated_prob, token_id) = if implied_prob_yes >= min_prob {
+            (Side::Buy, implied_prob_yes, 0.99, &market.token_id_yes)
+        } else if implied_prob_no >= min_prob {
+            (Side::Sell, implied_prob_no, 0.99, &market.token_id_no)
+        } else {
+            return None;
+        };
+
+        // Spread + fee deduction
+        let half_spread = self.get_half_spread(token_id);
+        let implied_price = if side == Side::Buy {
+            market.implied_prob_yes
+        } else {
+            market.implied_prob_no
+        };
+        let total_cost = self.fee_calculator.total_cost(implied_price, half_spread);
+        let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
+        let raw_edge = estimated_prob - implied_prob;
+        let net_edge = raw_edge - total_cost_f64;
+
+        if net_edge <= 0.0 {
+            debug!(
+                question = %market.question,
+                implied = format!("{:.1}%", implied_prob * 100.0),
+                net_edge = format!("{:.1}%", net_edge * 100.0),
+                "general market: not profitable after fees"
+            );
+            return None;
+        }
+
+        let size_usd = self.max_position_usd;
+
+        info!(
+            question = %market.question,
+            implied = format!("{:.1}%", implied_prob * 100.0),
+            net_edge = format!("{:.1}%", net_edge * 100.0),
+            size_usd = %size_usd,
+            side = %side,
+            "general market HIGH-PROB signal"
+        );
+
+        Some(TradeSignal {
+            target: TradeTarget::Polymarket(market.clone()),
+            side,
+            size_usd,
+            confidence: net_edge,
+            price: implied_price,
+            metadata: SignalMetadata::Discount {
+                estimated_prob,
+                fair_value: estimated_prob,
+                implied_prob,
+                discount_rate: 0.0,
+                time_to_resolution_secs: 0.0,
+                edge: net_edge,
+                kelly_fraction: 1.0,
             },
             timestamp: self.current_time(),
             is_exit: false,
@@ -1128,10 +1206,10 @@ impl Strategy for UnifiedStrategy {
                             continue;
                         }
 
-                        // UpDown markets: hold until resolution, don't set symbol-level
-                        // position/cooldown since each window is independent
-                        let is_updown = matches!(m.market_type, MarketType::UpDown { .. });
-                        if !is_updown {
+                        // UpDown/General markets: hold until resolution, don't set symbol-level
+                        // position/cooldown since each market is independent
+                        let is_independent = matches!(m.market_type, MarketType::UpDown { .. } | MarketType::General { .. });
+                        if !is_independent {
                             let ss = self
                                 .symbol_states
                                 .entry(m.underlying_symbol.clone())
@@ -1303,9 +1381,18 @@ mod tests {
             ml_server_url: String::new(),
             ml_timeout_ms: 50,
             ml_signal_weight: 0.5,
+            general_markets_enabled: true,
+            general_poll_interval_secs: 30,
+            general_min_liquidity: 5000,
             discount_rate: 0.1,
             binance_weight_multiplier: 5.0,
             chainlink_blend_weight: 0.1,
+            rl_enabled: false,
+            rl_server_url: String::new(),
+            rl_timeout_ms: 100,
+            rl_capital_usd: 1000.0,
+            rl_log_transitions: false,
+            rl_transition_log_path: String::new(),
         }
     }
 

@@ -126,6 +126,13 @@ pub enum SignalMetadata {
         no_ask: f64,
         is_hedge: bool,
     },
+    Rl {
+        action: u8,
+        action_name: String,
+        confidence: f64,
+        state_dim: usize,
+        rl_latency_ms: f64,
+    },
 }
 
 /// Trading signals from the strategy engine.

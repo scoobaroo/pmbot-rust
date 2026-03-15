@@ -96,6 +96,11 @@ pub struct Config {
     pub updown_enabled: bool,
     pub updown_only: bool,
 
+    // General market scanner
+    pub general_markets_enabled: bool,
+    pub general_poll_interval_secs: u64,
+    pub general_min_liquidity: u64,
+
     // Discount strategy
     pub discount_rate: f64,
 
@@ -104,6 +109,14 @@ pub struct Config {
     pub ml_server_url: String,
     pub ml_timeout_ms: u64,
     pub ml_signal_weight: f64,
+
+    // RL (PPO) agent
+    pub rl_enabled: bool,
+    pub rl_server_url: String,
+    pub rl_timeout_ms: u64,
+    pub rl_capital_usd: f64,
+    pub rl_log_transitions: bool,
+    pub rl_transition_log_path: String,
 
     // Aggregator price weighting
     /// Multiplier on Binance volume in VWAP calc (e.g. 5.0 = 5× Binance weight).
@@ -146,7 +159,7 @@ impl Config {
             polymarket_private_key: env_or("POLYMARKET_PRIVATE_KEY", ""),
             polygon_rpc_url: env_or("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
             ethereum_rpc_url: env_or("ETHEREUM_RPC_URL", "https://eth.llamarpc.com"),
-            symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD,XRP-USD")
+            symbols: env_or("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,BNB-USD,HYPE-USD")
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
@@ -178,11 +191,20 @@ impl Config {
             arb_size_usd: dec_or("ARB_SIZE_USD", "5"),
             updown_enabled: bool_or("UPDOWN_ENABLED", true),
             updown_only: bool_or("UPDOWN_ONLY", true),
+            general_markets_enabled: bool_or("GENERAL_MARKETS_ENABLED", true),
+            general_poll_interval_secs: u64_or("GENERAL_POLL_INTERVAL_SECS", 30),
+            general_min_liquidity: u64_or("GENERAL_MIN_LIQUIDITY", 5000),
             discount_rate: f64_or("DISCOUNT_RATE", 0.1),
             ml_enabled: bool_or("ML_ENABLED", false),
             ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
             ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
             ml_signal_weight: f64_or("ML_SIGNAL_WEIGHT", 0.5),
+            rl_enabled: bool_or("RL_ENABLED", false),
+            rl_server_url: env_or("RL_SERVER_URL", "http://localhost:8090"),
+            rl_timeout_ms: u64_or("RL_TIMEOUT_MS", 100),
+            rl_capital_usd: f64_or("RL_CAPITAL_USD", 1000.0),
+            rl_log_transitions: bool_or("RL_LOG_TRANSITIONS", true),
+            rl_transition_log_path: env_or("RL_TRANSITION_LOG", "data/rl_transitions.jsonl"),
             binance_weight_multiplier: f64_or("BINANCE_WEIGHT_MULTIPLIER", 5.0),
             chainlink_blend_weight: f64_or("CHAINLINK_BLEND_WEIGHT", 0.1),
             log_level: env_or("LOG_LEVEL", "info"),
