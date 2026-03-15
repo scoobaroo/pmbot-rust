@@ -266,6 +266,25 @@ impl ExecutionEngine {
                     signal.side,
                 ))
             }
+            (
+                MarketType::UpDown {
+                    window_start_ts,
+                    window_secs,
+                },
+                SignalMetadata::Rl { .. },
+            ) => {
+                let window_end_ts = window_start_ts + *window_secs as i64;
+                let start_price = market.strike.to_f64().unwrap_or(0.0);
+                self.last_underlying_prices
+                    .insert(market.underlying_symbol.clone(), start_price);
+                Some((
+                    market.condition_id.clone(),
+                    window_end_ts,
+                    market.underlying_symbol.clone(),
+                    start_price,
+                    signal.side,
+                ))
+            }
             _ => None,
         };
 
@@ -276,12 +295,19 @@ impl ExecutionEngine {
             None
         };
 
-        // For UpDown markets, set order expiration before market resolution
+        // For UpDown/General markets, set order expiration before market resolution
+        // CLOB requires expiration >= now + 60s, so use max of that and end - buffer
         let order_expiration: Option<i64> = match &market.market_type {
             MarketType::UpDown { window_start_ts, window_secs } => {
-                // Expire order 60s before market window ends
                 let window_end = window_start_ts + *window_secs as i64;
-                Some(window_end - 60)
+                let now = Utc::now().timestamp();
+                let min_expiration = now + 90; // CLOB needs 60s minimum, use 90s for safety
+                Some(std::cmp::max(window_end - 60, min_expiration))
+            }
+            MarketType::General { end_date_ts } => {
+                let now = Utc::now().timestamp();
+                let min_expiration = now + 90;
+                Some(std::cmp::max(end_date_ts - 3600, min_expiration))
             }
             _ => None,
         };

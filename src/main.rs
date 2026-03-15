@@ -62,6 +62,12 @@ async fn main() {
         strategies.push(strategy);
     }
 
+    // RL bridge needs Polymarket markets and M5 candles for state features
+    if config.rl_enabled {
+        needs_polymarket = true;
+        all_timeframes.insert(Timeframe::M5);
+    }
+
     let candle_timeframes: Vec<Timeframe> = all_timeframes.into_iter().collect();
 
     // Create broadcast channels for fan-out to multiple strategy runners

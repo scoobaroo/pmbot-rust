@@ -146,6 +146,12 @@ impl RlBridge {
         // Active UpDown markets keyed by underlying_symbol
         let mut active_markets: HashMap<String, PolymarketMarket> = HashMap::new();
 
+        // Throttle: only query RL server every N seconds (not every tick)
+        let mut last_act_time = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now);
+        let act_interval = Duration::from_secs(5);
+
         // Last state for transition logging
         let mut last_state: Option<Vec<f64>> = None;
         let mut last_action: Option<u8> = None;
@@ -199,8 +205,12 @@ impl RlBridge {
                                 state_builder.active_market = Some(m.clone());
                             }
 
-                            // Only act if we have an active market
+                            // Only act if we have an active market and throttle interval elapsed
+                            let now_inst = std::time::Instant::now();
                             if let Some(ref market) = market {
+                                if now_inst.duration_since(last_act_time) < act_interval {
+                                    continue; // throttle — too soon since last action query
+                                }
                                 if let Some(state) = state_builder.build(&price.symbol) {
                                     // Log transition from previous step
                                     if let (Some(ref prev_state), Some(prev_action), Some(ref prev_market_id)) =
@@ -225,6 +235,7 @@ impl RlBridge {
                                     // Query RL server for action
                                     match self.request_action(&state, &market.condition_id).await {
                                         Ok((action, confidence, latency_ms)) => {
+                                            last_act_time = now_inst;
                                             last_state = Some(state);
                                             last_action = Some(action);
                                             last_market_id = Some(market.condition_id.clone());
