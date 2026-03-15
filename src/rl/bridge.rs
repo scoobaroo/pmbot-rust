@@ -194,15 +194,15 @@ impl RlBridge {
                         AggregatorEvent::PriceUpdate(ref price) => {
                             state_builder.on_price_update(price);
 
-                            // Update book cache data
-                            if let Some(token_id) = state_builder.active_market.as_ref().map(|m| m.token_id_yes.clone()) {
-                                self.update_book_state(&mut state_builder, &token_id).await;
-                            }
-
                             // Find best active UpDown market for this symbol
                             let market = active_markets.get(&price.symbol).cloned();
                             if let Some(ref m) = market {
                                 state_builder.active_market = Some(m.clone());
+                            }
+
+                            // Update Polymarket book cache data (after setting active market)
+                            if let Some(token_id) = state_builder.active_market.as_ref().map(|m| m.token_id_yes.clone()) {
+                                self.update_book_state(&mut state_builder, &token_id).await;
                             }
 
                             // Only act if we have an active market and throttle interval elapsed

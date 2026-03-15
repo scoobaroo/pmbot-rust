@@ -276,10 +276,15 @@ impl StateBuilder {
     // --- Helper methods ---
 
     fn implied_prob(&self) -> f64 {
-        self.active_market
-            .as_ref()
-            .map(|m| dec_to_f64(m.implied_prob_yes))
-            .unwrap_or(0.5)
+        // Prefer live book midpoint over stale discovery-time implied prob
+        if self.poly_best_bid > 0.0 && self.poly_best_ask > 0.0 {
+            (self.poly_best_bid + self.poly_best_ask) / 2.0
+        } else {
+            self.active_market
+                .as_ref()
+                .map(|m| dec_to_f64(m.implied_prob_yes))
+                .unwrap_or(0.5)
+        }
     }
 
     fn poly_spread(&self) -> f64 {
