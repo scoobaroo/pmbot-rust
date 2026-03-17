@@ -173,6 +173,12 @@ pub enum ExecutionEvent {
     OrderCancelled { order_id: String, reason: String },
     OrderFailed { order_id: String, error: String },
     PositionUpdate(Position),
+    /// A binary market resolved — carries settlement PnL for RL reward.
+    MarketResolved {
+        condition_id: String,
+        pnl: f64,
+        won: bool,
+    },
 }
 
 /// Updates from Polymarket market scanner.

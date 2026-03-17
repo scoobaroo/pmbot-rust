@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Market metadata stored per condition_id for backtest resolution.
 struct BacktestMarketMeta {
@@ -91,9 +91,9 @@ impl ExecutionEngine {
                     if self.config.mode == RunMode::Backtest {
                         // Backtest: resolve all positions using last known prices
                         // (Gamma API unavailable for synthetic condition IDs)
-                        self.resolve_backtest_positions();
+                        self.resolve_backtest_positions(&exec_tx).await;
                     } else {
-                        self.resolve_expired_via_api().await;
+                        self.resolve_expired_via_api(&exec_tx).await;
                     }
                     info!(
                         starting_capital = %self.paper_tracker.starting_capital(),
@@ -111,12 +111,12 @@ impl ExecutionEngine {
                     self.handle_signal(signal, &exec_tx).await;
                     // In backtest mode, resolve expired positions after every signal
                     if self.config.mode == RunMode::Backtest {
-                        self.resolve_backtest_expired();
+                        self.resolve_backtest_expired(&exec_tx).await;
                     }
                 }
                 _ = resolve_interval.tick() => {
                     if self.config.mode != RunMode::Backtest {
-                        self.resolve_expired_via_api().await;
+                        self.resolve_expired_via_api(&exec_tx).await;
                     }
                 }
             }
@@ -543,10 +543,20 @@ impl ExecutionEngine {
     /// Resolve all open positions at backtest shutdown using last known prices.
     /// For StrikeAbove: Bullish ("reach $X") wins if spot > strike; Bearish ("drop to $X") wins if spot < strike.
     /// For UpDown: up_won if spot > start_price.
-    fn resolve_backtest_positions(&mut self) {
+    async fn resolve_backtest_positions(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
         // First try UpDown resolution via last_underlying_prices
-        self.paper_tracker
+        let resolved = self
+            .paper_tracker
             .resolve_all_by_last_price(&self.last_underlying_prices);
+        for (condition_id, pnl, won) in resolved {
+            let _ = exec_tx
+                .send(ExecutionEvent::MarketResolved {
+                    condition_id,
+                    pnl,
+                    won,
+                })
+                .await;
+        }
 
         // Then resolve StrikeAbove positions using market metadata
         let open_ids: Vec<String> = self.paper_tracker.open_condition_ids();
@@ -555,17 +565,25 @@ impl ExecutionEngine {
                 if let Some(&spot) = self.last_underlying_prices.get(&meta.underlying_symbol) {
                     let spot_dec = Decimal::from_f64_retain(spot).unwrap_or(Decimal::ZERO);
                     let won = match meta.direction {
-                        MarketDirection::Bullish => spot_dec > meta.strike, // "Will BTC reach $X?"
-                        MarketDirection::Bearish => spot_dec < meta.strike, // "Will BTC drop to $X?"
+                        MarketDirection::Bullish => spot_dec > meta.strike,
+                        MarketDirection::Bearish => spot_dec < meta.strike,
                     };
-                    self.paper_tracker.resolve_market(&cid, won);
+                    if let Some(pnl) = self.paper_tracker.resolve_market(&cid, won) {
+                        let _ = exec_tx
+                            .send(ExecutionEvent::MarketResolved {
+                                condition_id: cid,
+                                pnl,
+                                won,
+                            })
+                            .await;
+                    }
                 }
             }
         }
     }
 
     /// Resolve expired UpDown positions during backtest replay using last known prices.
-    fn resolve_backtest_expired(&mut self) {
+    async fn resolve_backtest_expired(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
         let now_ts = match self.backtest_time {
             Some(t) => t.timestamp(),
             None => return,
@@ -583,7 +601,15 @@ impl ExecutionEngine {
             if let Some((symbol, start_price)) = self.paper_tracker.get_updown_meta(cid) {
                 if let Some(&latest_price) = self.last_underlying_prices.get(&symbol) {
                     let up_won = latest_price >= start_price;
-                    self.paper_tracker.resolve_by_outcome(cid, up_won);
+                    if let Some((pnl, won)) = self.paper_tracker.resolve_by_outcome(cid, up_won) {
+                        let _ = exec_tx
+                            .send(ExecutionEvent::MarketResolved {
+                                condition_id: cid.clone(),
+                                pnl,
+                                won,
+                            })
+                            .await;
+                    }
                 }
             }
         }
@@ -592,7 +618,7 @@ impl ExecutionEngine {
     }
 
     /// Poll Gamma API for expired UpDown market resolutions.
-    async fn resolve_expired_via_api(&mut self) {
+    async fn resolve_expired_via_api(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
         let now_ts = Utc::now().timestamp();
         let open_count = self.paper_tracker.open_position_count();
         let expired_ids = self.paper_tracker.expired_updown_condition_ids(now_ts);
@@ -615,7 +641,15 @@ impl ExecutionEngine {
 
         let resolved = check_resolutions(&self.http, &expired_ids).await;
         for (condition_id, up_won) in resolved {
-            self.paper_tracker.resolve_by_outcome(&condition_id, up_won);
+            if let Some((pnl, won)) = self.paper_tracker.resolve_by_outcome(&condition_id, up_won) {
+                let _ = exec_tx
+                    .send(ExecutionEvent::MarketResolved {
+                        condition_id,
+                        pnl,
+                        won,
+                    })
+                    .await;
+            }
         }
 
         self.paper_tracker.maybe_report();

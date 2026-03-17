@@ -273,7 +273,7 @@ impl PaperTracker {
     ///
     /// For Up/Down markets: the token resolves to $1 if it won, $0 if it lost.
     /// `won` = true means the token we bought pays $1.
-    pub fn resolve_market(&mut self, condition_id: &str, won: bool) {
+    pub fn resolve_market(&mut self, condition_id: &str, won: bool) -> Option<f64> {
         if let Some(pos) = self.positions.remove(condition_id) {
             let resolve_price = if won { Decimal::ONE } else { Decimal::ZERO };
             let pnl = match pos.side {
@@ -297,6 +297,9 @@ impl PaperTracker {
                 return_pct = %format!("{:.2}%", self.return_pct()),
                 "market resolved"
             );
+            Some(pnl.to_string().parse::<f64>().unwrap_or(0.0))
+        } else {
+            None
         }
     }
 
@@ -353,11 +356,9 @@ impl PaperTracker {
     /// Uses the stored signal_side to determine if our token won:
     ///   signal_side == Buy (hold Up) → won = up_won
     ///   signal_side == Sell (hold Down) → won = !up_won
-    pub fn resolve_by_outcome(&mut self, condition_id: &str, up_won: bool) {
-        let pos = match self.positions.remove(condition_id) {
-            Some(p) => p,
-            None => return,
-        };
+    /// Returns `Some((pnl_f64, won))` if position existed, `None` otherwise.
+    pub fn resolve_by_outcome(&mut self, condition_id: &str, up_won: bool) -> Option<(f64, bool)> {
+        let pos = self.positions.remove(condition_id)?;
 
         let signal_side = pos
             .updown_meta
@@ -390,13 +391,20 @@ impl PaperTracker {
             return_pct = %format!("{:.2}%", self.return_pct()),
             "updown market resolved via Polymarket oracle"
         );
+
+        Some((pnl.to_string().parse::<f64>().unwrap_or(0.0), won))
     }
 
     /// Resolve ALL open UpDown positions using the latest known underlying prices.
     /// Used in backtest mode where the Gamma API is unavailable.
     /// Determines up_won by comparing start_price to latest_price for each symbol.
-    pub fn resolve_all_by_last_price(&mut self, latest_prices: &HashMap<String, f64>) {
+    /// Returns `Vec<(condition_id, pnl, won)>` for all resolved positions.
+    pub fn resolve_all_by_last_price(
+        &mut self,
+        latest_prices: &HashMap<String, f64>,
+    ) -> Vec<(String, f64, bool)> {
         let condition_ids: Vec<String> = self.positions.keys().cloned().collect();
+        let mut results = Vec::new();
 
         // Resolve arb pairs first
         self.resolve_arb_pairs(&condition_ids);
@@ -415,8 +423,12 @@ impl PaperTracker {
         }
 
         for (cid, up_won) in to_resolve {
-            self.resolve_by_outcome(&cid, up_won);
+            if let Some((pnl, won)) = self.resolve_by_outcome(&cid, up_won) {
+                results.push((cid, pnl, won));
+            }
         }
+
+        results
     }
 
     pub fn realized_pnl(&self) -> Decimal {

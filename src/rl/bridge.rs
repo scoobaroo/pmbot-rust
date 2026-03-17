@@ -164,6 +164,9 @@ impl RlBridge {
         let mut last_action: Option<u8> = None;
         let mut last_market_id: Option<String> = None;
 
+        // Track last (state, action) per market_id for terminal reward assignment
+        let mut market_states: HashMap<String, (Vec<f64>, u8)> = HashMap::new();
+
         // Open transition log file
         let mut log_file = if self.config.log_transitions {
             match std::fs::OpenOptions::new()
@@ -272,6 +275,9 @@ impl RlBridge {
                                         }
                                     };
 
+                                    // Track per-market state for terminal reward
+                                    market_states.insert(market_id.clone(), (state.clone(), action));
+
                                     last_state = Some(state);
                                     last_action = Some(action);
                                     last_market_id = Some(market_id);
@@ -312,20 +318,63 @@ impl RlBridge {
 
                     state_builder.on_execution_event(&event);
 
-                    // Send feedback to RL server for reward computation
-                    if let ExecutionEvent::OrderFilled(ref fill) = event {
-                        let market_id = last_market_id.clone().unwrap_or_default();
-                        let action = last_action.unwrap_or(3);
-                        let _ = self
-                            .send_feedback(
-                                &market_id,
-                                action,
-                                dec_to_f64(fill.price),
-                                dec_to_f64(fill.size),
-                                dec_to_f64(fill.fee),
-                                0.0, // P&L computed server-side
-                            )
-                            .await;
+                    match event {
+                        ExecutionEvent::OrderFilled(ref fill) => {
+                            // Send feedback to RL server for reward computation
+                            let market_id = last_market_id.clone().unwrap_or_default();
+                            let action = last_action.unwrap_or(3);
+                            let _ = self
+                                .send_feedback(
+                                    &market_id,
+                                    action,
+                                    dec_to_f64(fill.price),
+                                    dec_to_f64(fill.size),
+                                    dec_to_f64(fill.fee),
+                                    0.0, // P&L computed at resolution
+                                )
+                                .await;
+                        }
+                        ExecutionEvent::MarketResolved {
+                            ref condition_id,
+                            pnl,
+                            won,
+                        } => {
+                            // Log terminal transition with settlement reward
+                            let reward = pnl / self.config.capital_usd;
+                            info!(
+                                condition_id = %condition_id,
+                                pnl = pnl,
+                                won = won,
+                                reward = format!("{:.4}", reward),
+                                "RL: market resolved, logging terminal transition"
+                            );
+
+                            if let Some(ref mut f) = log_file {
+                                // Use per-market state if available, else fall back to last global state
+                                let (term_state, term_action) = market_states
+                                    .remove(condition_id)
+                                    .or_else(|| {
+                                        last_state.as_ref().map(|s| (s.clone(), last_action.unwrap_or(3)))
+                                    })
+                                    .unwrap_or_default();
+
+                                if !term_state.is_empty() {
+                                    let t = Transition {
+                                        state: term_state.clone(),
+                                        action: term_action,
+                                        reward,
+                                        next_state: term_state, // terminal state
+                                        done: true,
+                                        market_id: condition_id.clone(),
+                                        timestamp: Utc::now().timestamp(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&t) {
+                                        let _ = writeln!(f, "{}", json);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 result = ml_rx.recv() => {
