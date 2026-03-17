@@ -149,6 +149,16 @@ pub enum SignalMetadata {
         state_dim: usize,
         rl_latency_ms: f64,
     },
+    Orb {
+        btc_move: f64,
+        accuracy_tier: f64,
+        implied_prob: f64,
+        edge: f64,
+        start_price: f64,
+        spot: f64,
+        elapsed_secs: f64,
+        time_remaining_secs: f64,
+    },
 }
 
 /// Trading signals from the strategy engine.

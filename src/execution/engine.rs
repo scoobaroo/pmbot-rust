@@ -285,6 +285,24 @@ impl ExecutionEngine {
                     signal.side,
                 ))
             }
+            (
+                MarketType::UpDown {
+                    window_start_ts,
+                    window_secs,
+                },
+                SignalMetadata::Orb { start_price, .. },
+            ) => {
+                let window_end_ts = window_start_ts + *window_secs as i64;
+                self.last_underlying_prices
+                    .insert(market.underlying_symbol.clone(), *start_price);
+                Some((
+                    market.condition_id.clone(),
+                    window_end_ts,
+                    market.underlying_symbol.clone(),
+                    *start_price,
+                    signal.side,
+                ))
+            }
             _ => None,
         };
 

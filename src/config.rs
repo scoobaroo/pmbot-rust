@@ -17,6 +17,7 @@ pub enum StrategyName {
     BollingerBands,
     Unified,
     HedgedLp,
+    Orb,
 }
 
 #[derive(Parser, Debug)]
