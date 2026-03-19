@@ -237,7 +237,7 @@ impl CopyTradeBridge {
                 size: token_size,
                 order_type: "GTC",
                 post_only: false,
-                fee_rate_bps: None,
+                fee_rate_bps: Some(1000),
                 neg_risk: None,
                 expiration: None, // GTC — let it fill or expire naturally
             };
