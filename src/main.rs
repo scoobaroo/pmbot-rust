@@ -232,9 +232,40 @@ async fn main() {
     // Drop the original sender so channels close when all producers finish
     drop(exchange_tx);
 
-    // Conditionally spawn copy-trade bridge
+    // Conditionally spawn copy-trade bridge (uses separate Polymarket account)
     let _copy_trader_cache = if config.copy_trade_enabled {
         let cache = pmbot_rust::copy_trade::types::new_copy_trader_cache();
+
+        // Derive credentials for the copy-trade account (separate wallet)
+        let ct_poly_client = if !config.copy_trade_private_key.is_empty()
+            && config.mode == RunMode::Live
+        {
+            match pmbot_rust::polymarket::auth::derive_api_credentials(
+                &config.copy_trade_private_key,
+            )
+            .await
+            {
+                Ok((creds, signer)) => {
+                    info!(
+                        wallet = %creds.wallet_address,
+                        "copy-trade: Polymarket credentials derived for separate account"
+                    );
+                    Some(pmbot_rust::polymarket::client::PolymarketClient::new(
+                        creds, signer,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "copy-trade: failed to derive Polymarket credentials");
+                    None
+                }
+            }
+        } else {
+            if config.copy_trade_private_key.is_empty() {
+                info!("copy-trade: no POLYMARKET_COPYTRADE_PRIVATE_KEY set, running in paper mode");
+            }
+            None
+        };
+
         let bridge = pmbot_rust::copy_trade::bridge::CopyTradeBridge::new(
             pmbot_rust::copy_trade::types::CopyTradeConfig {
                 enabled: config.copy_trade_enabled,
@@ -243,14 +274,14 @@ async fn main() {
                 size_ratio: config.copy_trade_size_ratio,
                 max_position_usd: config.copy_trade_max_position_usd,
             },
+            ct_poly_client,
             cache.clone(),
             None, // RL state sharing wired below if RL enabled
         );
-        let ct_sig_tx = signal_tx.clone();
         let ct_poly_rx = poly_broadcast_tx.subscribe();
         let ct_sd = shutdown.clone();
         tokio::spawn(async move {
-            bridge.run(ct_poly_rx, ct_sig_tx, ct_sd).await;
+            bridge.run(ct_poly_rx, ct_sd).await;
         });
         info!(targets = ?config.copy_trade_targets, "copy-trade bridge spawned");
         Some(cache)

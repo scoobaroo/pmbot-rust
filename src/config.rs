@@ -119,8 +119,10 @@ pub struct Config {
     pub rl_log_transitions: bool,
     pub rl_transition_log_path: String,
 
-    // Copy-trade bridge
+    // Copy-trade bridge (uses separate Polymarket account)
     pub copy_trade_enabled: bool,
+    pub copy_trade_private_key: String,
+    pub copy_trade_funder_address: String,
     pub copy_trade_targets: Vec<String>,
     pub copy_trade_poll_interval_secs: u64,
     pub copy_trade_size_ratio: f64,
@@ -212,6 +214,8 @@ impl Config {
             ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
             ml_signal_weight: f64_or("ML_SIGNAL_WEIGHT", 0.5),
             copy_trade_enabled: bool_or("COPY_TRADE_ENABLED", false),
+            copy_trade_private_key: env_or("POLYMARKET_COPYTRADE_PRIVATE_KEY", ""),
+            copy_trade_funder_address: env_or("COPYTRADE_FUNDER_ADDRESS", ""),
             copy_trade_targets: env_or("COPY_TRADE_TARGETS", "")
                 .split(',')
                 .filter(|s| !s.trim().is_empty())

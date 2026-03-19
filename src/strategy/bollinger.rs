@@ -335,6 +335,8 @@ mod tests {
             rl_log_transitions: false,
             rl_transition_log_path: String::new(),
             copy_trade_enabled: false,
+            copy_trade_private_key: String::new(),
+            copy_trade_funder_address: String::new(),
             copy_trade_targets: vec![],
             copy_trade_poll_interval_secs: 5,
             copy_trade_size_ratio: 0.1,
