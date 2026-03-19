@@ -125,6 +125,21 @@ impl CopyTradeBridge {
                         match self.fetch_activity(target).await {
                             Ok(trades) => {
                                 let last_ts = last_seen.get(target).copied().unwrap_or(0);
+
+                                // First poll: set baseline timestamp, don't mirror historical trades
+                                if last_ts == 0 {
+                                    if let Some(max_ts) = trades.iter().map(|t| t.timestamp).max() {
+                                        last_seen.insert(target.clone(), max_ts);
+                                        info!(
+                                            target = target,
+                                            baseline_ts = max_ts,
+                                            recent_trades = trades.len(),
+                                            "copy-trade: set baseline timestamp (skipping historical)"
+                                        );
+                                    }
+                                    continue;
+                                }
+
                                 let new_trades: Vec<&TraderTrade> = trades
                                     .iter()
                                     .filter(|t| t.timestamp > last_ts)
@@ -145,16 +160,6 @@ impl CopyTradeBridge {
                                     }
 
                                     self.update_cache_from_trades(&new_trades).await;
-                                } else if last_ts == 0 && !trades.is_empty() {
-                                    // First poll — record baseline, don't mirror old trades
-                                    if let Some(max_ts) = trades.iter().map(|t| t.timestamp).max() {
-                                        last_seen.insert(target.clone(), max_ts);
-                                        info!(
-                                            target = target,
-                                            baseline_ts = max_ts,
-                                            "copy-trade: set baseline timestamp"
-                                        );
-                                    }
                                 }
                             }
                             Err(e) => {
