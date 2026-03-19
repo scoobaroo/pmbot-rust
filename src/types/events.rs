@@ -166,6 +166,14 @@ pub enum SignalMetadata {
         mirrored_size_usd: f64,
         latency_ms: f64,
     },
+    ResolutionSniper {
+        spot: f64,
+        strike: f64,
+        distance_pct: f64,
+        entry_price: f64,
+        edge: f64,
+        time_remaining_secs: f64,
+    },
 }
 
 /// Trading signals from the strategy engine.

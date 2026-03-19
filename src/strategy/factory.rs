@@ -6,6 +6,7 @@ use crate::strategy::discount::DiscountStrategy;
 use crate::strategy::hedged_lp::HedgedLpStrategy;
 use crate::strategy::ma_crossover::MACrossoverStrategy;
 use crate::strategy::orb::OrbStrategy;
+use crate::strategy::resolution_sniper::ResolutionSniperStrategy;
 use crate::strategy::traits::Strategy;
 use crate::strategy::unified::UnifiedStrategy;
 
@@ -47,6 +48,13 @@ pub fn create_strategy(
         StrategyName::BollingerBands => Box::new(BollingerBandsStrategy::new(config)),
         StrategyName::Orb => {
             let mut s = OrbStrategy::new(config);
+            if let Some(bc) = book_cache {
+                s = s.with_book_cache(bc);
+            }
+            Box::new(s)
+        }
+        StrategyName::Sniper => {
+            let mut s = ResolutionSniperStrategy::new(config);
             if let Some(bc) = book_cache {
                 s = s.with_book_cache(bc);
             }

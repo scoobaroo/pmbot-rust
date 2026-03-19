@@ -494,7 +494,7 @@ fn candle_timeframes_for(name: &StrategyName, config: &Config) -> Vec<Timeframe>
             let tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
             vec![tf]
         }
-        StrategyName::BlackScholes | StrategyName::HedgedLp | StrategyName::Discount | StrategyName::Orb => vec![],
+        StrategyName::BlackScholes | StrategyName::HedgedLp | StrategyName::Discount | StrategyName::Orb | StrategyName::Sniper => vec![],
         StrategyName::Unified => {
             let bb_tf = Timeframe::from_str_loose(&config.bb_timeframe).unwrap_or(Timeframe::M5);
             let ma_tf = Timeframe::from_str_loose(&config.ma_timeframe).unwrap_or(Timeframe::M5);

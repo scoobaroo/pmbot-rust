@@ -18,6 +18,7 @@ pub enum StrategyName {
     Unified,
     HedgedLp,
     Orb,
+    Sniper,
 }
 
 #[derive(Parser, Debug)]

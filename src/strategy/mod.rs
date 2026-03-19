@@ -6,6 +6,7 @@ pub mod hedged_lp;
 pub mod kelly;
 pub mod ma_crossover;
 pub mod orb;
+pub mod resolution_sniper;
 pub mod probability;
 pub mod runner;
 pub mod traits;
