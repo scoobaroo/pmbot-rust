@@ -210,10 +210,15 @@ impl CopyTradeBridge {
         let latency_secs = (Utc::now().timestamp() - trade.timestamp).abs();
 
         let size_dec = Decimal::from_f64(size_usd).unwrap_or(Decimal::ZERO);
-        let token_size = (size_dec / price).round_dp_with_strategy(
+        let min_tokens = Decimal::from(5); // Polymarket minimum order size
+        let mut token_size = (size_dec / price).round_dp_with_strategy(
             2,
             rust_decimal::RoundingStrategy::ToZero,
         );
+        // Enforce Polymarket minimum of 5 tokens
+        if token_size < min_tokens {
+            token_size = min_tokens;
+        }
 
         info!(
             target = target,
