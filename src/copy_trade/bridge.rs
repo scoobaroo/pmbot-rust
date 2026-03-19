@@ -1,7 +1,6 @@
 use crate::copy_trade::types::*;
 use crate::polymarket::client::{OrderParams, PolymarketClient};
 use crate::types::events::PolymarketUpdate;
-use crate::types::market::{MarketType, PolymarketMarket};
 use crate::types::order::Side;
 use chrono::Utc;
 use rust_decimal::prelude::*;
@@ -13,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 const DATA_API_BASE: &str = "https://data-api.polymarket.com";
 
@@ -80,9 +79,6 @@ impl CopyTradeBridge {
             "copy-trade bridge starting (isolated account)"
         );
 
-        // condition_id → PolymarketMarket for order execution
-        let mut market_map: HashMap<String, PolymarketMarket> = HashMap::new();
-
         // Track last-seen trade timestamp per wallet to detect new trades
         let mut last_seen: HashMap<String, i64> = HashMap::new();
 
@@ -113,18 +109,11 @@ impl CopyTradeBridge {
                     info!("copy-trade bridge shutting down");
                     return;
                 }
+                // Drain polymarket broadcast to prevent lag warnings
                 result = poly_rx.recv() => {
                     match result {
-                        Ok(PolymarketUpdate::MarketsDiscovered(markets)) => {
-                            for m in markets {
-                                market_map.insert(m.condition_id.clone(), m);
-                            }
-                            debug!(markets = market_map.len(), "copy-trade: market map updated");
-                        }
                         Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "copy-trade: polymarket broadcast lagged");
-                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => return,
                     }
                 }
@@ -150,7 +139,6 @@ impl CopyTradeBridge {
                                         self.process_trade(
                                             target,
                                             trade,
-                                            &market_map,
                                             &mut expert_log,
                                         )
                                         .await;
@@ -190,20 +178,15 @@ impl CopyTradeBridge {
         &self,
         target: &str,
         trade: &TraderTrade,
-        market_map: &HashMap<String, PolymarketMarket>,
         expert_log: &mut Option<std::fs::File>,
     ) {
-        let market = match market_map.get(&trade.condition_id) {
-            Some(m) => m,
-            None => {
-                debug!(
-                    condition_id = %trade.condition_id,
-                    title = %trade.title,
-                    "copy-trade: skipping trade in unknown market"
-                );
-                return;
-            }
-        };
+        // Use the token_id directly from the trade data — no market map lookup needed.
+        // The activity API returns the exact `asset` (token_id) the trader bought/sold.
+        let token_id = &trade.asset;
+        if token_id.is_empty() {
+            warn!("copy-trade: skipping trade with empty asset/token_id");
+            return;
+        }
 
         // Compute mirrored size
         let raw_size = trade.usdc_size * self.config.size_ratio;
@@ -226,13 +209,6 @@ impl CopyTradeBridge {
 
         let latency_secs = (Utc::now().timestamp() - trade.timestamp).abs();
 
-        // Token selection: BUY → YES token (outcome 0), SELL → NO token (outcome 1)
-        let token_id = if trade.outcome_index == 0 {
-            &market.token_id_yes
-        } else {
-            &market.token_id_no
-        };
-
         let size_dec = Decimal::from_f64(size_usd).unwrap_or(Decimal::ZERO);
         let token_size = (size_dec / price).round_dp_with_strategy(
             2,
@@ -248,27 +224,12 @@ impl CopyTradeBridge {
             price = %price,
             token_size = %token_size,
             latency_secs = latency_secs,
+            token_id = %token_id,
             "copy-trade: mirroring trade"
         );
 
         // Execute directly on copy-trade Polymarket account
         if let Some(ref poly_client) = self.poly_client {
-            // Set order expiration for UpDown markets
-            let expiration = match &market.market_type {
-                MarketType::UpDown { window_start_ts, window_secs } => {
-                    let window_end = window_start_ts + *window_secs as i64;
-                    let now = Utc::now().timestamp();
-                    let min_exp = now + 90;
-                    Some(std::cmp::max(window_end - 60, min_exp))
-                }
-                MarketType::General { end_date_ts } => {
-                    let now = Utc::now().timestamp();
-                    let min_exp = now + 90;
-                    Some(std::cmp::max(end_date_ts - 3600, min_exp))
-                }
-                _ => None,
-            };
-
             let params = OrderParams {
                 token_id,
                 side,
@@ -278,7 +239,7 @@ impl CopyTradeBridge {
                 post_only: false,
                 fee_rate_bps: None,
                 neg_risk: None,
-                expiration,
+                expiration: None, // GTC — let it fill or expire naturally
             };
 
             match poly_client.place_order(&params).await {
