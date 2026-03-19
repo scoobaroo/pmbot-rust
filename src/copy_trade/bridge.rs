@@ -6,7 +6,7 @@ use chrono::Utc;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,9 +82,10 @@ impl CopyTradeBridge {
         // Track last-seen trade timestamp per wallet to detect new trades
         let mut last_seen: HashMap<String, i64> = HashMap::new();
 
-        // Track markets we've already mirrored into — one entry per (wallet, condition_id)
-        // to avoid placing multiple orders on the same market from the same trader
-        let mut mirrored_markets: HashSet<(String, String)> = HashSet::new();
+        // Track markets we've already mirrored into — keyed by condition_id.
+        // Stores the side we took so we can detect conflicts from other wallets.
+        // Only one position per market across ALL tracked wallets.
+        let mut mirrored_markets: HashMap<String, String> = HashMap::new();
 
         // Positions refresh counter
         let mut poll_count: u64 = 0;
@@ -188,21 +189,24 @@ impl CopyTradeBridge {
         &self,
         target: &str,
         trade: &TraderTrade,
-        mirrored_markets: &mut HashSet<(String, String)>,
+        mirrored_markets: &mut HashMap<String, String>,
         expert_log: &mut Option<std::fs::File>,
     ) {
-        // Only mirror one trade per (wallet, market) — the target trader often
-        // places many small orders on the same market in quick succession
-        let key = (target.to_string(), trade.condition_id.clone());
-        if mirrored_markets.contains(&key) {
-            info!(
-                target = target,
-                market = %trade.title,
-                "copy-trade: already mirrored this market, skipping duplicate"
-            );
-            return;
+        // Only one position per market across all wallets.
+        // If another wallet already took the opposite side, skip to avoid conflict.
+        if let Some(existing_side) = mirrored_markets.get(&trade.condition_id) {
+            if existing_side != &trade.side {
+                info!(
+                    target = target,
+                    market = %trade.title,
+                    existing_side = %existing_side,
+                    new_side = %trade.side,
+                    "copy-trade: CONFLICT — another wallet took opposite side, skipping"
+                );
+            }
+            return; // skip duplicates and conflicts alike
         }
-        mirrored_markets.insert(key);
+        mirrored_markets.insert(trade.condition_id.clone(), trade.side.clone());
 
         // Use the token_id directly from the trade data — no market map lookup needed.
         // The activity API returns the exact `asset` (token_id) the trader bought/sold.
