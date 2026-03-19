@@ -10,6 +10,12 @@ pub struct CopyTradeConfig {
     pub poll_interval_secs: u64,
     pub size_ratio: f64,
     pub max_position_usd: f64,
+    /// Maximum seconds of latency before we skip a trade (stale signal).
+    pub max_latency_secs: i64,
+    /// Price premium to add on top of their entry to ensure fill (e.g., 0.05 = 5%).
+    pub price_premium_pct: f64,
+    /// Maximum slippage from their entry before we skip (e.g., 0.15 = 15%).
+    pub max_slippage_pct: f64,
 }
 
 /// Single trade from GET /activity?type=TRADE.

@@ -128,6 +128,9 @@ pub struct Config {
     pub copy_trade_poll_interval_secs: u64,
     pub copy_trade_size_ratio: f64,
     pub copy_trade_max_position_usd: f64,
+    pub copy_trade_max_latency_secs: i64,
+    pub copy_trade_price_premium_pct: f64,
+    pub copy_trade_max_slippage_pct: f64,
 
     // Web dashboard
     pub web_enabled: bool,
@@ -225,6 +228,9 @@ impl Config {
             copy_trade_poll_interval_secs: u64_or("COPY_TRADE_POLL_INTERVAL_SECS", 5),
             copy_trade_size_ratio: f64_or("COPY_TRADE_SIZE_RATIO", 0.1),
             copy_trade_max_position_usd: f64_or("COPY_TRADE_MAX_POSITION_USD", 50.0),
+            copy_trade_max_latency_secs: u64_or("COPY_TRADE_MAX_LATENCY_SECS", 30) as i64,
+            copy_trade_price_premium_pct: f64_or("COPY_TRADE_PRICE_PREMIUM_PCT", 0.05),
+            copy_trade_max_slippage_pct: f64_or("COPY_TRADE_MAX_SLIPPAGE_PCT", 0.15),
             web_enabled: bool_or("WEB_ENABLED", false),
             web_port: u64_or("WEB_PORT", 3000) as u16,
             rl_enabled: bool_or("RL_ENABLED", false),

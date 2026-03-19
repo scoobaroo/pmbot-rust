@@ -1400,6 +1400,9 @@ mod tests {
             copy_trade_poll_interval_secs: 5,
             copy_trade_size_ratio: 0.1,
             copy_trade_max_position_usd: 50.0,
+            copy_trade_max_latency_secs: 30,
+            copy_trade_price_premium_pct: 0.05,
+            copy_trade_max_slippage_pct: 0.15,
             web_enabled: false,
             web_port: 3000,
         }

@@ -229,21 +229,56 @@ impl CopyTradeBridge {
             }
         };
 
-        let price = Decimal::from_f64(trade.price).unwrap_or(Decimal::ZERO);
-        if price <= Decimal::ZERO {
+        let their_price = Decimal::from_f64(trade.price).unwrap_or(Decimal::ZERO);
+        if their_price <= Decimal::ZERO {
             warn!("copy-trade: skipping trade with zero price");
             return;
         }
 
         let latency_secs = (Utc::now().timestamp() - trade.timestamp).abs();
 
+        // Skip stale trades — if too old, the market has moved on
+        if latency_secs > self.config.max_latency_secs {
+            info!(
+                target = target,
+                market = %trade.title,
+                latency_secs = latency_secs,
+                max = self.config.max_latency_secs,
+                "copy-trade: skipping stale trade (too old)"
+            );
+            return;
+        }
+
+        // Add price premium to their entry to ensure fill despite latency.
+        // BoneReader buys at $0.47, by the time we see it the ask is ~$0.50-0.52.
+        // We bid higher to get filled immediately.
+        let premium = Decimal::from_f64(self.config.price_premium_pct).unwrap_or(Decimal::ZERO);
+        let our_price = (their_price * (Decimal::ONE + premium)).round_dp(2);
+
+        // Sanity: cap at 0.99 (above that there's no edge)
+        let our_price = our_price.min(Decimal::new(99, 2));
+
+        // Check max slippage — if our price is way above theirs, edge is gone
+        let slippage = (our_price - their_price) / their_price;
+        let max_slippage = Decimal::from_f64(self.config.max_slippage_pct).unwrap_or(Decimal::new(15, 2));
+        if slippage > max_slippage {
+            info!(
+                target = target,
+                market = %trade.title,
+                their_price = %their_price,
+                our_price = %our_price,
+                slippage = format!("{:.1}%", slippage.to_f64().unwrap_or(0.0) * 100.0),
+                "copy-trade: skipping — slippage too high"
+            );
+            return;
+        }
+
         let size_dec = Decimal::from_f64(size_usd).unwrap_or(Decimal::ZERO);
         let min_tokens = Decimal::from(5); // Polymarket minimum order size
-        let mut token_size = (size_dec / price).round_dp_with_strategy(
+        let mut token_size = (size_dec / our_price).round_dp_with_strategy(
             2,
             rust_decimal::RoundingStrategy::ToZero,
         );
-        // Enforce Polymarket minimum of 5 tokens
         if token_size < min_tokens {
             token_size = min_tokens;
         }
@@ -254,25 +289,28 @@ impl CopyTradeBridge {
             side = %trade.side,
             source_size = format!("${:.2}", trade.usdc_size),
             mirror_size = format!("${:.2}", size_usd),
-            price = %price,
+            their_price = %their_price,
+            our_price = %our_price,
+            premium = format!("+{:.0}%", self.config.price_premium_pct * 100.0),
             token_size = %token_size,
             latency_secs = latency_secs,
-            token_id = %token_id,
             "copy-trade: mirroring trade"
         );
 
         // Execute directly on copy-trade Polymarket account
+        // Use FOK (Fill or Kill) — either fill immediately at our price or cancel.
+        // No stale GTC orders sitting on the book.
         if let Some(ref poly_client) = self.poly_client {
             let params = OrderParams {
                 token_id,
                 side,
-                price: price.round_dp(2),
+                price: our_price,
                 size: token_size,
                 order_type: "GTC",
                 post_only: false,
                 fee_rate_bps: Some(1000),
                 neg_risk: None,
-                expiration: None, // GTC — let it fill or expire naturally
+                expiration: None,
             };
 
             match poly_client.place_order(&params).await {
