@@ -6,7 +6,7 @@ use chrono::Utc;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,10 @@ impl CopyTradeBridge {
         // Track last-seen trade timestamp per wallet to detect new trades
         let mut last_seen: HashMap<String, i64> = HashMap::new();
 
+        // Track markets we've already mirrored into — one entry per (wallet, condition_id)
+        // to avoid placing multiple orders on the same market from the same trader
+        let mut mirrored_markets: HashSet<(String, String)> = HashSet::new();
+
         // Positions refresh counter
         let mut poll_count: u64 = 0;
         let positions_every = 12; // refresh positions every 12 polls (~60s at 5s interval)
@@ -154,6 +158,7 @@ impl CopyTradeBridge {
                                         self.process_trade(
                                             target,
                                             trade,
+                                            &mut mirrored_markets,
                                             &mut expert_log,
                                         )
                                         .await;
@@ -183,8 +188,22 @@ impl CopyTradeBridge {
         &self,
         target: &str,
         trade: &TraderTrade,
+        mirrored_markets: &mut HashSet<(String, String)>,
         expert_log: &mut Option<std::fs::File>,
     ) {
+        // Only mirror one trade per (wallet, market) — the target trader often
+        // places many small orders on the same market in quick succession
+        let key = (target.to_string(), trade.condition_id.clone());
+        if mirrored_markets.contains(&key) {
+            info!(
+                target = target,
+                market = %trade.title,
+                "copy-trade: already mirrored this market, skipping duplicate"
+            );
+            return;
+        }
+        mirrored_markets.insert(key);
+
         // Use the token_id directly from the trade data — no market map lookup needed.
         // The activity API returns the exact `asset` (token_id) the trader bought/sold.
         let token_id = &trade.asset;
