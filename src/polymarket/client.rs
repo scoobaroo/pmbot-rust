@@ -75,6 +75,34 @@ impl PolymarketClient {
         }
     }
 
+    /// Create a client with an explicit funder/proxy address (for separate accounts).
+    pub fn new_with_funder(
+        credentials: ApiCredentials,
+        signer: PrivateKeySigner,
+        funder_override: Option<String>,
+    ) -> Self {
+        let signer_address = signer.address();
+        let funder_address: Address = funder_override
+            .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
+            .unwrap_or(signer_address);
+
+        if funder_address != signer_address {
+            info!(
+                signer = %signer_address,
+                funder = %funder_address,
+                "proxy wallet mode: signer != funder (signatureType=1 POLY_PROXY)"
+            );
+        }
+
+        Self {
+            http: Client::new(),
+            credentials,
+            signer,
+            signer_address,
+            funder_address,
+        }
+    }
+
     /// Build L2 authentication headers for an API request.
     fn l2_headers(
         &self,

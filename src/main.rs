@@ -250,8 +250,13 @@ async fn main() {
                         wallet = %creds.wallet_address,
                         "copy-trade: Polymarket credentials derived for separate account"
                     );
-                    Some(pmbot_rust::polymarket::client::PolymarketClient::new(
-                        creds, signer,
+                    let funder = if config.copy_trade_funder_address.is_empty() {
+                        None
+                    } else {
+                        Some(config.copy_trade_funder_address.clone())
+                    };
+                    Some(pmbot_rust::polymarket::client::PolymarketClient::new_with_funder(
+                        creds, signer, funder,
                     ))
                 }
                 Err(e) => {
