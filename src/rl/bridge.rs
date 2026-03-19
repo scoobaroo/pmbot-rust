@@ -1,3 +1,4 @@
+use crate::copy_trade::types::CopyTraderCache;
 use crate::polymarket::trade_poller::TradeActivityCache;
 use crate::polymarket::ws_orderbook::BookCache;
 use crate::rl::state::{StateBuilder, STATE_DIM};
@@ -102,6 +103,7 @@ pub struct RlBridge {
     client: reqwest::Client,
     book_cache: Option<BookCache>,
     trade_activity_cache: Option<TradeActivityCache>,
+    copy_trader_cache: Option<CopyTraderCache>,
 }
 
 impl RlBridge {
@@ -109,6 +111,7 @@ impl RlBridge {
         config: RlBridgeConfig,
         book_cache: Option<BookCache>,
         trade_activity_cache: Option<TradeActivityCache>,
+        copy_trader_cache: Option<CopyTraderCache>,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -120,6 +123,7 @@ impl RlBridge {
             client,
             book_cache,
             trade_activity_cache,
+            copy_trader_cache,
         }
     }
 
@@ -215,6 +219,9 @@ impl RlBridge {
                                 self.update_book_state(&mut state_builder, &token_id).await;
                                 self.update_trade_activity(&mut state_builder, &token_id).await;
                             }
+
+                            // Update copy-trader state features
+                            self.update_copy_trader_state(&mut state_builder).await;
 
                             // Only act if we have an active market and throttle interval elapsed
                             let now_inst = std::time::Instant::now();
@@ -458,6 +465,17 @@ impl RlBridge {
                 state.poly_trade_count_5m = a.trade_count_5m as f64;
                 state.poly_volume_5m = a.volume_5m;
             }
+        }
+    }
+
+    /// Update copy-trader state features from shared cache.
+    async fn update_copy_trader_state(&self, state: &mut StateBuilder) {
+        if let Some(ref cache) = self.copy_trader_cache {
+            let ct = cache.read().await;
+            state.copy_trader_action = ct.last_action;
+            state.copy_trader_size_normalized = ct.last_size_normalized;
+            state.copy_trader_position_direction = ct.position_direction;
+            state.copy_trader_recent_win_rate = ct.recent_win_rate;
         }
     }
 

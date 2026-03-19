@@ -119,6 +119,17 @@ pub struct Config {
     pub rl_log_transitions: bool,
     pub rl_transition_log_path: String,
 
+    // Copy-trade bridge
+    pub copy_trade_enabled: bool,
+    pub copy_trade_targets: Vec<String>,
+    pub copy_trade_poll_interval_secs: u64,
+    pub copy_trade_size_ratio: f64,
+    pub copy_trade_max_position_usd: f64,
+
+    // Web dashboard
+    pub web_enabled: bool,
+    pub web_port: u16,
+
     // Aggregator price weighting
     /// Multiplier on Binance volume in VWAP calc (e.g. 5.0 = 5× Binance weight).
     /// Higher values make the bot track Binance price moves faster.
@@ -200,6 +211,17 @@ impl Config {
             ml_server_url: env_or("ML_SERVER_URL", "http://localhost:8089"),
             ml_timeout_ms: u64_or("ML_TIMEOUT_MS", 50),
             ml_signal_weight: f64_or("ML_SIGNAL_WEIGHT", 0.5),
+            copy_trade_enabled: bool_or("COPY_TRADE_ENABLED", false),
+            copy_trade_targets: env_or("COPY_TRADE_TARGETS", "")
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_lowercase())
+                .collect(),
+            copy_trade_poll_interval_secs: u64_or("COPY_TRADE_POLL_INTERVAL_SECS", 5),
+            copy_trade_size_ratio: f64_or("COPY_TRADE_SIZE_RATIO", 0.1),
+            copy_trade_max_position_usd: f64_or("COPY_TRADE_MAX_POSITION_USD", 50.0),
+            web_enabled: bool_or("WEB_ENABLED", false),
+            web_port: u64_or("WEB_PORT", 3000) as u16,
             rl_enabled: bool_or("RL_ENABLED", false),
             rl_server_url: env_or("RL_SERVER_URL", "http://localhost:8090"),
             rl_timeout_ms: u64_or("RL_TIMEOUT_MS", 100),

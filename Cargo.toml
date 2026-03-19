@@ -33,6 +33,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive"] }
 
+# Web server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
 # Utilities
 tokio-util = "0.7"
 futures-util = { version = "0.3", features = ["sink"] }

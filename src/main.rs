@@ -71,6 +71,11 @@ async fn main() {
         all_timeframes.insert(Timeframe::M5);
     }
 
+    // Copy-trade bridge needs Polymarket market discovery
+    if config.copy_trade_enabled {
+        needs_polymarket = true;
+    }
+
     let candle_timeframes: Vec<Timeframe> = all_timeframes.into_iter().collect();
 
     // Create broadcast channels for fan-out to multiple strategy runners
@@ -227,6 +232,74 @@ async fn main() {
     // Drop the original sender so channels close when all producers finish
     drop(exchange_tx);
 
+    // Conditionally spawn copy-trade bridge
+    let _copy_trader_cache = if config.copy_trade_enabled {
+        let cache = pmbot_rust::copy_trade::types::new_copy_trader_cache();
+        let bridge = pmbot_rust::copy_trade::bridge::CopyTradeBridge::new(
+            pmbot_rust::copy_trade::types::CopyTradeConfig {
+                enabled: config.copy_trade_enabled,
+                targets: config.copy_trade_targets.clone(),
+                poll_interval_secs: config.copy_trade_poll_interval_secs,
+                size_ratio: config.copy_trade_size_ratio,
+                max_position_usd: config.copy_trade_max_position_usd,
+            },
+            cache.clone(),
+            None, // RL state sharing wired below if RL enabled
+        );
+        let ct_sig_tx = signal_tx.clone();
+        let ct_poly_rx = poly_broadcast_tx.subscribe();
+        let ct_sd = shutdown.clone();
+        tokio::spawn(async move {
+            bridge.run(ct_poly_rx, ct_sig_tx, ct_sd).await;
+        });
+        info!(targets = ?config.copy_trade_targets, "copy-trade bridge spawned");
+        Some(cache)
+    } else {
+        None
+    };
+
+    // Conditionally spawn web dashboard
+    if config.web_enabled {
+        let web_state = pmbot_rust::web::state::new_web_state();
+
+        // Pre-populate with copy-trade targets
+        {
+            let mut wallets = web_state.wallets.write().await;
+            for addr in &config.copy_trade_targets {
+                wallets.insert(
+                    addr.clone(),
+                    pmbot_rust::web::state::WalletData {
+                        address: addr.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // Initial data fetch
+        {
+            let mut wallets = web_state.wallets.write().await;
+            for data in wallets.values_mut() {
+                pmbot_rust::web::handlers::refresh_wallet(&web_state.client, data).await;
+            }
+        }
+
+        let ws = web_state.clone();
+        let web_port = config.web_port;
+        let web_sd = shutdown.clone();
+        tokio::spawn(async move {
+            pmbot_rust::web::server::run(ws, web_port, web_sd).await;
+        });
+
+        let ws2 = web_state.clone();
+        let refresh_sd = shutdown.clone();
+        tokio::spawn(async move {
+            pmbot_rust::web::server::background_refresh(ws2, refresh_sd).await;
+        });
+
+        info!(port = config.web_port, "web dashboard spawned");
+    }
+
     // Conditionally spawn RL bridge (standalone task, not a Strategy)
     if config.rl_enabled {
         use pmbot_rust::rl::bridge::{RlBridge, RlBridgeConfig};
@@ -248,6 +321,7 @@ async fn main() {
             } else {
                 None
             },
+            _copy_trader_cache.clone(),
         );
         let rl_sig_tx = signal_tx.clone();
         let rl_agg_rx = agg_broadcast_tx.subscribe();

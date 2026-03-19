@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod backtest;
 pub mod config;
+pub mod copy_trade;
 pub mod exchanges;
 pub mod execution;
 pub mod ml;
@@ -9,3 +10,4 @@ pub mod rl;
 pub mod strategy;
 pub mod types;
 pub mod utils;
+pub mod web;

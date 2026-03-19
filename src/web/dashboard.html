@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PMBot — Wallet Tracker</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --green: #3fb950; --red: #f85149; --blue: #58a6ff; --muted: #8b949e; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { color: var(--blue); margin-bottom: 20px; font-size: 1.4em; }
+  h2 { color: var(--text); margin-bottom: 12px; font-size: 1.1em; }
+  .controls { display: flex; gap: 10px; margin-bottom: 20px; }
+  .controls input { flex: 1; background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 0.9em; }
+  .controls button { background: var(--blue); color: var(--bg); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+  .controls button:hover { opacity: 0.9; }
+  .wallets { display: flex; flex-direction: column; gap: 20px; }
+  .wallet-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .wallet-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .wallet-header .name { font-weight: bold; color: var(--blue); }
+  .wallet-header .address { font-size: 0.8em; color: var(--muted); font-family: monospace; }
+  .wallet-header .remove { background: none; border: 1px solid var(--red); color: var(--red); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
+  .stats-row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .stat { background: var(--bg); padding: 8px 12px; border-radius: 6px; min-width: 120px; }
+  .stat .label { font-size: 0.75em; color: var(--muted); text-transform: uppercase; }
+  .stat .value { font-size: 1.1em; font-weight: bold; margin-top: 2px; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  th { text-align: left; padding: 6px 8px; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: normal; text-transform: uppercase; font-size: 0.75em; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tab { background: var(--bg); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+  .tab.active { color: var(--blue); border-color: var(--blue); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .loading { color: var(--muted); text-align: center; padding: 20px; }
+  .refresh-time { font-size: 0.75em; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>PMBot Wallet Tracker</h1>
+
+<div class="controls">
+  <input type="text" id="wallet-input" placeholder="Enter wallet address (0x...)">
+  <button onclick="addWallet()">Track Wallet</button>
+</div>
+
+<div id="wallets" class="wallets">
+  <div class="loading">Loading wallets...</div>
+</div>
+
+<script>
+const API = '';
+
+async function loadWallets() {
+  try {
+    const resp = await fetch(`${API}/api/wallets`);
+    const wallets = await resp.json();
+    renderWallets(wallets);
+  } catch (e) {
+    document.getElementById('wallets').innerHTML = '<div class="loading">Failed to load wallets</div>';
+  }
+}
+
+function renderWallets(wallets) {
+  const container = document.getElementById('wallets');
+  if (!wallets || wallets.length === 0) {
+    container.innerHTML = '<div class="loading">No wallets tracked. Add one above.</div>';
+    return;
+  }
+  container.innerHTML = wallets.map(w => renderWalletCard(w)).join('');
+}
+
+function renderWalletCard(w) {
+  const name = w.profile?.pseudonym || w.profile?.name || 'Unknown';
+  const addr = w.address;
+  const s = w.stats;
+  const pnlClass = s.total_pnl >= 0 ? 'positive' : 'negative';
+  const pnlSign = s.total_pnl >= 0 ? '+' : '';
+  const refreshTime = w.last_refresh_ts ? new Date(w.last_refresh_ts * 1000).toLocaleTimeString() : 'never';
+
+  const positionsHtml = (w.positions || []).slice(0, 15).map(p => {
+    const pnl = p.cashPnl || 0;
+    const cls = pnl >= 0 ? 'positive' : 'negative';
+    const pctPnl = p.percentPnl || 0;
+    return `<tr>
+      <td>${p.title || p.conditionId?.slice(0,10) || '?'}</td>
+      <td>${p.outcome || '?'}</td>
+      <td>${(p.size || 0).toFixed(1)}</td>
+      <td>${(p.avgPrice || 0).toFixed(3)}</td>
+      <td>${(p.curPrice || 0).toFixed(3)}</td>
+      <td class="${cls}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="${cls}">${pctPnl >= 0 ? '+' : ''}${pctPnl.toFixed(1)}%</td>
+    </tr>`;
+  }).join('');
+
+  const activityHtml = (w.activity || []).slice(0, 15).map(a => {
+    const ts = new Date(a.timestamp * 1000).toLocaleString();
+    const sideClass = a.side === 'BUY' ? 'positive' : 'negative';
+    return `<tr>
+      <td>${ts}</td>
+      <td>${a.title || a.conditionId?.slice(0,10) || '?'}</td>
+      <td class="${sideClass}">${a.side || '?'}</td>
+      <td>$${(a.usdcSize || 0).toFixed(2)}</td>
+      <td>${(a.price || 0).toFixed(3)}</td>
+      <td>${a.outcome || ''}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+  <div class="wallet-card" id="wallet-${addr}">
+    <div class="wallet-header">
+      <div>
+        <span class="name">${name}</span>
+        <span class="address">${addr.slice(0,6)}...${addr.slice(-4)}</span>
+        <span class="refresh-time">Updated ${refreshTime}</span>
+      </div>
+      <button class="remove" onclick="removeWallet('${addr}')">Remove</button>
+    </div>
+    <div class="stats-row">
+      <div class="stat"><div class="label">Total PnL</div><div class="value ${pnlClass}">${pnlSign}$${s.total_pnl.toFixed(2)}</div></div>
+      <div class="stat"><div class="label">Win Rate</div><div class="value">${(s.win_rate * 100).toFixed(1)}%</div></div>
+      <div class="stat"><div class="label">Avg Trade</div><div class="value">$${s.avg_trade_size.toFixed(2)}</div></div>
+      <div class="stat"><div class="label">Trades</div><div class="value">${s.trade_count}</div></div>
+      <div class="stat"><div class="label">Open Positions</div><div class="value">${s.open_positions}</div></div>
+      <div class="stat"><div class="label">Position Value</div><div class="value">$${s.total_value.toFixed(2)}</div></div>
+    </div>
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab(this, '${addr}', 'positions')">Positions</div>
+      <div class="tab" onclick="switchTab(this, '${addr}', 'activity')">Recent Trades</div>
+    </div>
+    <div class="tab-content active" id="${addr}-positions">
+      <table>
+        <thead><tr><th>Market</th><th>Outcome</th><th>Size</th><th>Avg Price</th><th>Current</th><th>PnL</th><th>PnL %</th></tr></thead>
+        <tbody>${positionsHtml || '<tr><td colspan="7" style="color:var(--muted)">No positions</td></tr>'}</tbody>
+      </table>
+    </div>
+    <div class="tab-content" id="${addr}-activity">
+      <table>
+        <thead><tr><th>Time</th><th>Market</th><th>Side</th><th>Size</th><th>Price</th><th>Outcome</th></tr></thead>
+        <tbody>${activityHtml || '<tr><td colspan="6" style="color:var(--muted)">No activity</td></tr>'}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function switchTab(el, addr, tab) {
+  const card = document.getElementById(`wallet-${addr}`);
+  card.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  card.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById(`${addr}-${tab}`).classList.add('active');
+}
+
+async function addWallet() {
+  const input = document.getElementById('wallet-input');
+  const addr = input.value.trim().toLowerCase();
+  if (!addr.startsWith('0x') || addr.length !== 42) {
+    alert('Invalid wallet address');
+    return;
+  }
+  await fetch(`${API}/api/wallet/${addr}`, { method: 'POST' });
+  input.value = '';
+  // Wait a moment for first refresh then reload
+  setTimeout(loadWallets, 1000);
+}
+
+async function removeWallet(addr) {
+  await fetch(`${API}/api/wallet/${addr}`, { method: 'DELETE' });
+  loadWallets();
+}
+
+// Initial load + auto-refresh
+loadWallets();
+setInterval(loadWallets, 30000);
+</script>
+</body>
+</html>

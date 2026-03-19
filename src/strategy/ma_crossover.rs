@@ -222,6 +222,13 @@ mod tests {
             rl_capital_usd: 1000.0,
             rl_log_transitions: false,
             rl_transition_log_path: String::new(),
+            copy_trade_enabled: false,
+            copy_trade_targets: vec![],
+            copy_trade_poll_interval_secs: 5,
+            copy_trade_size_ratio: 0.1,
+            copy_trade_max_position_usd: 50.0,
+            web_enabled: false,
+            web_port: 3000,
         }
     }
 

@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::collections::{HashMap, VecDeque};
 
 /// Number of features in the state vector.
-pub const STATE_DIM: usize = 53;
+pub const STATE_DIM: usize = 57;
 
 /// Rolling price history length for return calculations.
 const PRICE_HISTORY_LEN: usize = 60; // 60 ticks ≈ 1 minute at ~1 tick/sec
@@ -52,6 +52,12 @@ pub struct StateBuilder {
     pub last_trade_pnl: f64,
     pub last_trade_time: Option<DateTime<Utc>>,
 
+    // Copy-trader state (populated by RL bridge from CopyTraderCache)
+    pub copy_trader_action: f64,
+    pub copy_trader_size_normalized: f64,
+    pub copy_trader_position_direction: f64,
+    pub copy_trader_recent_win_rate: f64,
+
     // Config
     bb_period: usize,
     bb_num_std: f64,
@@ -88,6 +94,10 @@ impl StateBuilder {
             total_trade_pnl: 0.0,
             last_trade_pnl: 0.0,
             last_trade_time: None,
+            copy_trader_action: 0.0,
+            copy_trader_size_normalized: 0.0,
+            copy_trader_position_direction: 0.0,
+            copy_trader_recent_win_rate: 0.0,
             bb_period,
             bb_num_std: 2.0,
             ma_fast_period,
@@ -282,6 +292,12 @@ impl StateBuilder {
         state.push(price.funding_rate.unwrap_or(0.0));           // 50: funding_rate
         state.push(self.poly_trade_count_5m);                    // 51: poly_trade_count_5m
         state.push(self.poly_volume_5m);                         // 52: poly_volume_5m
+
+        // === Copy-trader features (4) ===
+        state.push(self.copy_trader_action);                     // 53: copy_trader_action
+        state.push(self.copy_trader_size_normalized);            // 54: copy_trader_size_normalized
+        state.push(self.copy_trader_position_direction);         // 55: copy_trader_position_direction
+        state.push(self.copy_trader_recent_win_rate);            // 56: copy_trader_recent_win_rate
 
         debug_assert_eq!(state.len(), STATE_DIM);
         Some(state)

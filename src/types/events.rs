@@ -159,6 +159,13 @@ pub enum SignalMetadata {
         elapsed_secs: f64,
         time_remaining_secs: f64,
     },
+    CopyTrade {
+        source_wallet: String,
+        source_side: String,
+        source_size_usd: f64,
+        mirrored_size_usd: f64,
+        latency_ms: f64,
+    },
 }
 
 /// Trading signals from the strategy engine.
