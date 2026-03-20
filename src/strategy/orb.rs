@@ -136,10 +136,30 @@ impl OrbStrategy {
 
     /// Empirical accuracy from backtested ORB tiers (4,389 trades).
     /// Returns None if the move is too small or hasn't had enough confirmation time.
-    /// Bigger moves need less wait — $100+ moves are clear by 60s, small moves need 90s+.
+    ///
+    /// Two entry windows based on backtest data (72 windows, 4,320 ticks):
+    ///
+    /// Early window (0-120s) — opening range breakout:
+    ///   $40+ at 60s  → 76% accuracy
+    ///   $50+ at 45s  → 77% accuracy
+    ///   $100+ at 30s → 100% accuracy (small sample)
+    ///
+    /// Mid window (150-240s) — sustained momentum, much higher accuracy:
+    ///   $40+ at 150s → 88% accuracy
+    ///   $50+ at 150s → 87% accuracy
+    ///   $40+ at 180s → 91% accuracy
+    ///   $100+ at 180s → 94% accuracy
     fn empirical_accuracy(btc_move_abs: f64, elapsed_secs: i64) -> Option<f64> {
-        // Only trade large, high-conviction moves ($50+)
-        // $10-$25 moves are too noisy (57-68% accuracy) and don't justify the fees
+        // === Mid-window momentum (150s+) — highest accuracy entries ===
+        if elapsed_secs >= 180 {
+            if btc_move_abs >= 100.0 { return Some(0.94); }
+            if btc_move_abs >= 40.0 { return Some(0.91); }
+        } else if elapsed_secs >= 150 {
+            if btc_move_abs >= 100.0 { return Some(0.92); }
+            if btc_move_abs >= 40.0 { return Some(0.88); }
+        }
+
+        // === Early window — opening range breakout ===
         if btc_move_abs >= 100.0 && elapsed_secs >= 30 {
             Some(0.99)
         } else if btc_move_abs >= 50.0 && elapsed_secs >= 45 {
@@ -151,17 +171,21 @@ impl OrbStrategy {
         }
     }
 
-    /// Tiered position sizing: bigger move → bigger bet.
-    ///   $40+  → 33% of max
-    ///   $50+  → 50% of max
-    ///   $100+ → 100% of max
-    fn tiered_size(&self, btc_move_abs: f64) -> Decimal {
-        let fraction = if btc_move_abs >= 100.0 {
-            1.0
-        } else if btc_move_abs >= 50.0 {
-            0.5
+    /// Tiered position sizing: bigger move → bigger bet, mid-window gets full size.
+    ///   $40+ early   → 33% of max
+    ///   $50+ early   → 50% of max
+    ///   $100+ early  → 100% of max
+    ///   $40+ mid     → 75% of max (higher accuracy justifies bigger bet)
+    ///   $100+ mid    → 100% of max
+    fn tiered_size(&self, btc_move_abs: f64, elapsed_secs: i64) -> Decimal {
+        let fraction = if elapsed_secs >= 150 {
+            // Mid-window: higher accuracy, bet bigger
+            if btc_move_abs >= 100.0 { 1.0 } else { 0.75 }
         } else {
-            0.33
+            // Early window
+            if btc_move_abs >= 100.0 { 1.0 }
+            else if btc_move_abs >= 50.0 { 0.5 }
+            else { 0.33 }
         };
         let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
         Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
@@ -299,7 +323,7 @@ impl OrbStrategy {
             return None;
         }
 
-        let size_usd = self.tiered_size(btc_move_abs);
+        let size_usd = self.tiered_size(btc_move_abs, elapsed);
         let atr_multiple = atr_val.map(|a| if a > 0.0 { btc_move_abs / a } else { 0.0 });
 
         info!(
