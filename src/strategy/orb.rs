@@ -191,6 +191,11 @@ impl OrbStrategy {
             return None;
         }
 
+        // BTC only — accuracy tiers are calibrated for BTC moves
+        if market.underlying_symbol != "BTC-USD" {
+            return None;
+        }
+
         // One entry per market
         if self.entered_markets.contains(&market.condition_id) {
             return None;
