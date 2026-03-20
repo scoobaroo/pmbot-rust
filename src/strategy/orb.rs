@@ -144,6 +144,8 @@ impl OrbStrategy {
             Some(0.99)
         } else if btc_move_abs >= 50.0 && elapsed_secs >= 45 {
             Some(0.76)
+        } else if btc_move_abs >= 40.0 && elapsed_secs >= 60 {
+            Some(0.72)
         } else {
             None
         }
@@ -555,7 +557,10 @@ mod tests {
         assert_eq!(OrbStrategy::empirical_accuracy(5.0, 120), None);
         assert_eq!(OrbStrategy::empirical_accuracy(10.0, 120), None);
         assert_eq!(OrbStrategy::empirical_accuracy(25.0, 90), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(49.0, 120), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(39.0, 120), None);
+        // $40+ needs 60s
+        assert_eq!(OrbStrategy::empirical_accuracy(40.0, 59), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(40.0, 60), Some(0.72));
         // $50+ needs 45s
         assert_eq!(OrbStrategy::empirical_accuracy(50.0, 44), None);
         assert_eq!(OrbStrategy::empirical_accuracy(50.0, 45), Some(0.76));
