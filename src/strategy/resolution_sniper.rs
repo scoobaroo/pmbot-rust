@@ -116,30 +116,48 @@ impl ResolutionSniperStrategy {
                 continue;
             }
 
-            // Determine winning side from implied probability.
-            // Near resolution, the market prices reflect the likely outcome.
-            // If Yes is trading at 80%+, Up is winning. If No is 80%+, Down is winning.
-            let yes_prob = market.implied_prob_yes.to_f64().unwrap_or(0.5);
-            let no_prob = market.implied_prob_no.to_f64().unwrap_or(0.5);
+            let spot = price.vwap.to_f64().unwrap_or(0.0);
 
-            let (winning_side, winning_prob) = if yes_prob > no_prob {
-                (Side::Buy, yes_prob)  // Up winning → buy YES
-            } else {
-                (Side::Sell, no_prob)   // Down winning → buy NO
+            // Get LIVE orderbook prices for both tokens to determine winning side.
+            // The discovery-time implied_prob is stale (set 4+ min ago at ~50/50).
+            // We need the current book prices to know which side is winning.
+            let yes_bid = self.get_book_bid(&market.token_id_yes);
+            let no_bid = self.get_book_bid(&market.token_id_no);
+
+            let (winning_side, winning_prob) = match (yes_bid, no_bid) {
+                (Some(yb), Some(nb)) => {
+                    let yf = yb.to_f64().unwrap_or(0.5);
+                    let nf = nb.to_f64().unwrap_or(0.5);
+                    if yf > nf {
+                        (Side::Buy, yf)
+                    } else {
+                        (Side::Sell, nf)
+                    }
+                }
+                (Some(yb), None) => (Side::Buy, yb.to_f64().unwrap_or(0.5)),
+                (None, Some(nb)) => (Side::Sell, nb.to_f64().unwrap_or(0.5)),
+                (None, None) => {
+                    // Fallback to discovery-time implied prob (less reliable)
+                    let yf = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+                    let nf = market.implied_prob_no.to_f64().unwrap_or(0.5);
+                    if yf > nf { (Side::Buy, yf) } else { (Side::Sell, nf) }
+                }
             };
 
-            // Only enter if one side is clearly winning (>80% implied)
-            if winning_prob < 0.80 {
+            // Only enter if one side is clearly winning (>85% implied from live book)
+            if winning_prob < 0.85 {
                 continue;
             }
 
-            let spot = price.vwap.to_f64().unwrap_or(0.0);
-            let strike = 0.0; // not used for signal generation, just metadata
-            let price_distance_pct = winning_prob - 0.5; // how far from 50/50
+            let strike = 0.0;
+            let price_distance_pct = winning_prob - 0.5;
 
-            // Aggressive pricing: bid at 0.95 to sweep the book.
-            // At 96-98% win rate, paying 0.95 for a $1.00 payout = 5% edge per trade.
-            let entry_price = dec!(0.95);
+            // Aggressive pricing: bid at winning_prob + 2c to sweep the book.
+            // If winning side bids at 0.90, we offer 0.92 to guarantee fill.
+            // Capped at 0.95 — above that the edge is too thin.
+            let entry_price = (Decimal::from_f64(winning_prob).unwrap_or(dec!(0.95))
+                + dec!(0.02))
+                .min(dec!(0.95));
 
             // Verify fee is negligible at this price
             let fee = self.fee_calculator.taker_fee(entry_price);
@@ -237,6 +255,23 @@ impl ResolutionSniperStrategy {
 
         if snap.best_ask > Decimal::ZERO {
             Some(snap.best_ask)
+        } else {
+            None
+        }
+    }
+
+    fn get_book_bid(&self, token_id: &str) -> Option<Decimal> {
+        let cache = self.book_cache.as_ref()?;
+        let books = cache.try_read().ok()?;
+        let snap = books.get(token_id)?;
+
+        let age_secs = (Utc::now() - snap.timestamp).num_seconds();
+        if age_secs > self.ws_book_max_stale_secs as i64 {
+            return None;
+        }
+
+        if snap.best_bid > Decimal::ZERO {
+            Some(snap.best_bid)
         } else {
             None
         }
