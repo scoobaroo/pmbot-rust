@@ -186,8 +186,8 @@ impl OrbStrategy {
             _ => return None,
         };
 
-        // Only trade 5-minute windows — accuracy tiers were backtested on this horizon
-        if window_secs != 300 {
+        // Trade 5-minute and 15-minute windows
+        if window_secs != 300 && window_secs != 900 {
             return None;
         }
 
