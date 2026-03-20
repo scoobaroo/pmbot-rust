@@ -137,54 +137,56 @@ impl OrbStrategy {
     /// Empirical accuracy from backtested ORB tiers (4,389 trades).
     /// Returns None if the move is too small or hasn't had enough confirmation time.
     ///
-    /// Two entry windows based on backtest data (72 windows, 4,320 ticks):
+    /// Uses percentage-based thresholds so it works across BTC and ETH:
+    ///   BTC $87K: 0.05% = ~$44, 0.10% = ~$87, 0.15% = ~$131
+    ///   ETH $2K:  0.05% = ~$1,  0.10% = ~$2,  0.15% = ~$3
     ///
-    /// Early window (0-120s) — opening range breakout:
-    ///   $40+ at 60s  → 76% accuracy
-    ///   $50+ at 45s  → 77% accuracy
-    ///   $100+ at 30s → 100% accuracy (small sample)
+    /// Two entry windows based on backtest data (72 windows per coin):
     ///
-    /// Mid window (150-240s) — sustained momentum, much higher accuracy:
-    ///   $40+ at 150s → 88% accuracy
-    ///   $50+ at 150s → 87% accuracy
-    ///   $40+ at 180s → 91% accuracy
-    ///   $100+ at 180s → 94% accuracy
-    fn empirical_accuracy(btc_move_abs: f64, elapsed_secs: i64) -> Option<f64> {
+    /// Early window (0-120s):
+    ///   0.05% at 60s  → BTC 76%, ETH 71%
+    ///   0.07% at 45s  → BTC 83%, ETH 76%
+    ///   0.15% at 30s  → BTC 92%, ETH 79%
+    ///
+    /// Mid window (150-240s):
+    ///   0.05% at 150s → BTC 87%, ETH 83%
+    ///   0.10% at 180s → BTC 90%, ETH 91%
+    ///   0.20% at 180s → BTC 100%, ETH 94%
+    fn empirical_accuracy(move_pct: f64, elapsed_secs: i64) -> Option<f64> {
         // === Mid-window momentum (150s+) — highest accuracy entries ===
         if elapsed_secs >= 180 {
-            if btc_move_abs >= 100.0 { return Some(0.94); }
-            if btc_move_abs >= 40.0 { return Some(0.91); }
+            if move_pct >= 0.20 { return Some(0.94); }
+            if move_pct >= 0.10 { return Some(0.91); }
+            if move_pct >= 0.05 { return Some(0.90); }
         } else if elapsed_secs >= 150 {
-            if btc_move_abs >= 100.0 { return Some(0.92); }
-            if btc_move_abs >= 40.0 { return Some(0.88); }
+            if move_pct >= 0.15 { return Some(0.92); }
+            if move_pct >= 0.05 { return Some(0.87); }
         }
 
         // === Early window — opening range breakout ===
-        if btc_move_abs >= 100.0 && elapsed_secs >= 30 {
-            Some(0.99)
-        } else if btc_move_abs >= 50.0 && elapsed_secs >= 45 {
+        if move_pct >= 0.15 && elapsed_secs >= 30 {
+            Some(0.92)
+        } else if move_pct >= 0.07 && elapsed_secs >= 45 {
             Some(0.76)
-        } else if btc_move_abs >= 40.0 && elapsed_secs >= 60 {
+        } else if move_pct >= 0.05 && elapsed_secs >= 60 {
             Some(0.72)
         } else {
             None
         }
     }
 
-    /// Tiered position sizing: bigger move → bigger bet, mid-window gets full size.
-    ///   $40+ early   → 33% of max
-    ///   $50+ early   → 50% of max
-    ///   $100+ early  → 100% of max
-    ///   $40+ mid     → 75% of max (higher accuracy justifies bigger bet)
-    ///   $100+ mid    → 100% of max
-    fn tiered_size(&self, btc_move_abs: f64, elapsed_secs: i64) -> Decimal {
+    /// Tiered position sizing: bigger move → bigger bet.
+    ///   0.05% early  → 33% of max
+    ///   0.07% early  → 50% of max
+    ///   0.15%+ early → 100% of max
+    ///   0.05%+ mid   → 75% of max
+    ///   0.15%+ mid   → 100% of max
+    fn tiered_size(&self, move_pct: f64, elapsed_secs: i64) -> Decimal {
         let fraction = if elapsed_secs >= 150 {
-            // Mid-window: higher accuracy, bet bigger
-            if btc_move_abs >= 100.0 { 1.0 } else { 0.75 }
+            if move_pct >= 0.15 { 1.0 } else { 0.75 }
         } else {
-            // Early window
-            if btc_move_abs >= 100.0 { 1.0 }
-            else if btc_move_abs >= 50.0 { 0.5 }
+            if move_pct >= 0.15 { 1.0 }
+            else if move_pct >= 0.07 { 0.5 }
             else { 0.33 }
         };
         let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
@@ -215,8 +217,8 @@ impl OrbStrategy {
             return None;
         }
 
-        // BTC only — accuracy tiers are calibrated for BTC moves
-        if market.underlying_symbol != "BTC-USD" {
+        // BTC and ETH only — accuracy tiers validated on backtest data
+        if market.underlying_symbol != "BTC-USD" && market.underlying_symbol != "ETH-USD" {
             return None;
         }
 
@@ -245,31 +247,34 @@ impl OrbStrategy {
             return None;
         }
 
-        // Measure the breakout magnitude
-        let btc_move = spot - start_price;
-        let btc_move_abs = btc_move.abs();
+        // Measure the breakout magnitude (percentage-based for cross-coin support)
+        let price_move = spot - start_price;
+        let move_abs = price_move.abs();
+        let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
 
         // --- ATR filter: skip if move is noise relative to volatility ---
         let atr_val = self.atr(&market.underlying_symbol);
         if let Some(atr) = atr_val {
-            if atr > 0.0 && btc_move_abs < atr * MIN_ATR_MULTIPLE {
+            if atr > 0.0 && move_abs < atr * MIN_ATR_MULTIPLE {
                 debug!(
                     question = %market.question,
-                    btc_move = format!("{:+.1}", btc_move),
+                    price_move = format!("{:+.1}", price_move),
+                    move_pct = format!("{:.3}%", move_pct),
                     atr = format!("{:.1}", atr),
-                    atr_multiple = format!("{:.2}", btc_move_abs / atr),
+                    atr_multiple = format!("{:.2}", move_abs / atr),
                     "ORB: move below ATR threshold"
                 );
                 return None;
             }
         }
 
-        let accuracy = match Self::empirical_accuracy(btc_move_abs, elapsed) {
+        let accuracy = match Self::empirical_accuracy(move_pct, elapsed) {
             Some(a) => a,
             None => {
                 debug!(
                     question = %market.question,
-                    btc_move = format!("{:+.1}", btc_move),
+                    price_move = format!("{:+.1}", price_move),
+                    move_pct = format!("{:.3}%", move_pct),
                     start_price = format!("{:.1}", start_price),
                     spot = format!("{:.1}", spot),
                     elapsed_secs = elapsed,
@@ -282,12 +287,13 @@ impl OrbStrategy {
 
         // --- Volume filter: require trade flow confirmation on lower tiers ---
         let flow = price.trade_flow_imbalance;
-        let flow_confirms = (btc_move > 0.0 && flow > 0.0) || (btc_move < 0.0 && flow < 0.0);
+        let flow_confirms = (price_move > 0.0 && flow > 0.0) || (price_move < 0.0 && flow < 0.0);
 
-        if btc_move_abs < 50.0 && !flow_confirms {
+        if move_pct < 0.07 && !flow_confirms {
             debug!(
                 question = %market.question,
-                btc_move = format!("{:+.1}", btc_move),
+                price_move = format!("{:+.1}", price_move),
+                move_pct = format!("{:.3}%", move_pct),
                 flow = format!("{:.2}", flow),
                 "ORB: volume flow doesn't confirm direction"
             );
@@ -295,7 +301,7 @@ impl OrbStrategy {
         }
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
-        let (side, token_id, implied_price) = if btc_move > 0.0 {
+        let (side, token_id, implied_price) = if price_move > 0.0 {
             (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
         } else {
             (Side::Sell, &market.token_id_no, market.implied_prob_no)
@@ -313,7 +319,8 @@ impl OrbStrategy {
         if edge <= 0.0 {
             debug!(
                 question = %market.question,
-                btc_move = format!("{:+.1}", btc_move),
+                price_move = format!("{:+.1}", price_move),
+                move_pct = format!("{:.3}%", move_pct),
                 accuracy = format!("{:.0}%", accuracy * 100.0),
                 implied = format!("{:.1}%", implied_prob * 100.0),
                 cost = format!("{:.1}%", total_cost_f64 * 100.0),
@@ -323,12 +330,13 @@ impl OrbStrategy {
             return None;
         }
 
-        let size_usd = self.tiered_size(btc_move_abs, elapsed);
-        let atr_multiple = atr_val.map(|a| if a > 0.0 { btc_move_abs / a } else { 0.0 });
+        let size_usd = self.tiered_size(move_pct, elapsed);
+        let atr_multiple = atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 });
 
         info!(
             question = %market.question,
-            btc_move = format!("{:+.1}", btc_move),
+            price_move = format!("{:+.1}", price_move),
+            move_pct = format!("{:.3}%", move_pct),
             accuracy = format!("{:.0}%", accuracy * 100.0),
             implied = format!("{:.1}%", implied_prob * 100.0),
             edge = format!("{:.1}%", edge * 100.0),
@@ -349,7 +357,7 @@ impl OrbStrategy {
             confidence: edge,
             price: implied_price,
             metadata: SignalMetadata::Orb {
-                btc_move,
+                btc_move: price_move,
                 accuracy_tier: accuracy,
                 implied_prob,
                 edge,
@@ -586,21 +594,24 @@ mod tests {
 
     #[test]
     fn test_accuracy_tiers() {
-        // Small moves filtered out — only $50+ trades now
-        assert_eq!(OrbStrategy::empirical_accuracy(5.0, 120), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(10.0, 120), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(25.0, 90), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(39.0, 120), None);
-        // $40+ needs 60s
-        assert_eq!(OrbStrategy::empirical_accuracy(40.0, 59), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(40.0, 60), Some(0.72));
-        // $50+ needs 45s
-        assert_eq!(OrbStrategy::empirical_accuracy(50.0, 44), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(50.0, 45), Some(0.76));
-        // $100+ needs 30s
-        assert_eq!(OrbStrategy::empirical_accuracy(100.0, 29), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(100.0, 30), Some(0.99));
-        assert_eq!(OrbStrategy::empirical_accuracy(200.0, 30), Some(0.99));
+        // Too small at any time
+        assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90), None);
+        // 0.05% needs 60s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 59), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60), Some(0.72));
+        // 0.07% needs 45s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45), Some(0.76));
+        // 0.15% needs 30s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 29), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 30), Some(0.92));
+        // Mid-window: 0.05% at 150s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 150), Some(0.87));
+        // Mid-window: 0.10% at 180s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 180), Some(0.91));
+        // Mid-window: 0.20% at 180s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.20, 180), Some(0.94));
     }
 
     #[test]
@@ -634,14 +645,14 @@ mod tests {
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        // Only $5 move — below $10 threshold
+        // Only 0.006% move — below 0.05% threshold
         strategy
             .latest_prices
             .insert("BTC-USD".to_string(), make_price("BTC-USD", 80005.0, now));
         seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
-        assert!(signals.is_empty(), "should not signal on <$10 move");
+        assert!(signals.is_empty(), "should not signal on <0.05% move");
     }
 
     #[test]
@@ -650,7 +661,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // $60 move up, market pricing Up at 0.55 (below 76% accuracy)
+        // 0.075% move up ($60 on BTC), market pricing Up at 0.55
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
         strategy
@@ -661,7 +672,7 @@ mod tests {
             "BTC-USD".to_string(),
             make_price_with_flow("BTC-USD", 80060.0, now, 0.3),
         );
-        seed_atr(&mut strategy, "BTC-USD", 20.0); // ATR=20, move=60 → 3x ATR ✓
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
@@ -674,7 +685,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // $60 move down, market pricing Down (No) at 0.55 (below 76% accuracy)
+        // 0.075% move down ($60 on BTC), market pricing Down (No) at 0.55
         let market = make_updown_market("m1", 80000.0, window_start, 0.45);
         strategy.markets.insert("m1".to_string(), market);
         strategy
@@ -746,13 +757,13 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // $150 move → 99% accuracy, market at 0.85
+        // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.85
         let market = make_updown_market("m1", 80000.0, window_start, 0.85);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        // Large moves ($50+) don't need flow confirmation
+        // Large moves (0.07%+) don't need flow confirmation
         strategy
             .latest_prices
             .insert("BTC-USD".to_string(), make_price("BTC-USD", 80150.0, now));
@@ -767,8 +778,8 @@ mod tests {
             ..
         } = &signals[0].metadata
         {
-            assert_eq!(*accuracy_tier, 0.99);
-            assert!(*edge > 0.10, "should have >10% edge on $150 move at 0.85 implied");
+            assert_eq!(*accuracy_tier, 0.92);
+            assert!(*edge > 0.05, "should have >5% edge on 0.19% move at 0.85 implied");
         } else {
             panic!("expected Orb metadata");
         }
