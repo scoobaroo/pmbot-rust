@@ -116,42 +116,26 @@ impl ResolutionSniperStrategy {
                 continue;
             }
 
-            let spot = price.vwap.to_f64().unwrap_or(0.0);
-            if spot == 0.0 {
-                continue;
-            }
+            // Determine winning side from implied probability.
+            // Near resolution, the market prices reflect the likely outcome.
+            // If Yes is trading at 80%+, Up is winning. If No is 80%+, Down is winning.
+            let yes_prob = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+            let no_prob = market.implied_prob_no.to_f64().unwrap_or(0.5);
 
-            // Capture strike price from live data at first sight of market
-            let strike = *self.strike_prices
-                .entry(market.condition_id.clone())
-                .or_insert(spot);
-
-            if strike == 0.0 {
-                continue;
-            }
-
-            // Determine which side is winning
-            let price_distance_pct = (spot - strike).abs() / spot;
-            if price_distance_pct < MIN_PRICE_DISTANCE_PCT {
-                debug!(
-                    market = %market.question,
-                    spot = spot,
-                    strike = strike,
-                    distance_pct = format!("{:.4}%", price_distance_pct * 100.0),
-                    "sniper: price too close to strike, skipping"
-                );
-                continue;
-            }
-
-            // Determine winning side and token
-            let btc_above_strike = spot > strike;
-            let (winning_side, token_id) = if btc_above_strike {
-                // BTC above strike → "Up" wins → buy YES token
-                (Side::Buy, &market.token_id_yes)
+            let (winning_side, winning_prob) = if yes_prob > no_prob {
+                (Side::Buy, yes_prob)  // Up winning → buy YES
             } else {
-                // BTC below strike → "Down" wins → buy NO token
-                (Side::Sell, &market.token_id_no)
+                (Side::Sell, no_prob)   // Down winning → buy NO
             };
+
+            // Only enter if one side is clearly winning (>80% implied)
+            if winning_prob < 0.80 {
+                continue;
+            }
+
+            let spot = price.vwap.to_f64().unwrap_or(0.0);
+            let strike = 0.0; // not used for signal generation, just metadata
+            let price_distance_pct = winning_prob - 0.5; // how far from 50/50
 
             // Aggressive pricing: bid at 0.95 to sweep the book.
             // At 96-98% win rate, paying 0.95 for a $1.00 payout = 5% edge per trade.
@@ -174,7 +158,7 @@ impl ResolutionSniperStrategy {
 
             info!(
                 market = %market.question,
-                side = if btc_above_strike { "UP (YES)" } else { "DOWN (NO)" },
+                side = if winning_side == Side::Buy { "UP (YES)" } else { "DOWN (NO)" },
                 spot = format!("{:.2}", spot),
                 strike = format!("{:.2}", strike),
                 distance = format!("{:.2}%", price_distance_pct * 100.0),
@@ -368,18 +352,20 @@ mod tests {
     }
 
     #[test]
-    fn test_no_signal_price_at_strike() {
+    fn test_no_signal_when_uncertain() {
         let config = test_config();
         let mut strat = ResolutionSniperStrategy::new(&config);
 
         let now = Utc::now().timestamp();
-        let market = make_market("cond1", 84000.0, now - 270);
+        // Market with 50/50 implied — neither side is clearly winning
+        let mut market = make_market("cond1", 84000.0, now - 270);
+        market.implied_prob_yes = dec!(0.52);
+        market.implied_prob_no = dec!(0.48);
         strat.on_markets_discovered(vec![market]);
 
-        // Price right at strike — too uncertain
-        let price = make_price("BTC-USD", 84010.0); // only $10 above, 0.012%
+        let price = make_price("BTC-USD", 84010.0);
         let signals = strat.on_price_update(&price);
-        assert!(signals.is_empty(), "should not enter when price is near strike");
+        assert!(signals.is_empty(), "should not enter when implied prob < 80%");
     }
 
     #[test]
