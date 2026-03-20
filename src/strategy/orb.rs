@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::polymarket::fees::FeeCalculator;
 use crate::polymarket::ws_orderbook::BookCache;
 use crate::strategy::traits::{Strategy, StrategyEvent, StrategySubscriptions};
+use crate::types::candle::Timeframe;
 use crate::types::events::{PolymarketUpdate, SignalMetadata, TradeSignal, TradeTarget};
 use crate::types::market::{AggregatedPrice, MarketType, PolymarketMarket};
 use crate::types::order::Side;
@@ -9,31 +10,37 @@ use chrono::{DateTime, Utc};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
 /// Default half-spread when no live book data is available.
 const DEFAULT_HALF_SPREAD: Decimal = dec!(0.01);
 
-/// Seconds to wait after window start before evaluating (opening range formation).
-const DEFAULT_ENTRY_DELAY_SECS: i64 = 60;
-
 /// Minimum seconds before window end to allow entry.
 const MIN_TIME_REMAINING_SECS: i64 = 30;
 
+/// ATR lookback period (number of 1m candles).
+const ATR_PERIOD: usize = 14;
+
+/// Minimum ATR multiple for a move to qualify. Below this, the move is noise.
+const MIN_ATR_MULTIPLE: f64 = 0.7;
+
 /// Opening Range Breakout strategy for Polymarket 5-minute BTC UpDown markets.
 ///
-/// Based on backtested edge: the first 60 seconds of BTC price action in a
-/// 5-minute window predicts the resolution with high accuracy. Larger moves
-/// correlate with higher accuracy:
+/// Based on backtested edge (4,389 trades): the first 60–120 seconds of BTC price
+/// action in a 5-minute window predicts the resolution with high accuracy. Larger
+/// moves correlate with higher accuracy:
 ///
-///   $10–25 move  → 68% accuracy
-///   $25–50 move  → 72% accuracy
-///   $50–100 move → 76% accuracy
-///   $100+ move   → 99% accuracy
+///   $10+ move  → 57% accuracy (needs 120s confirmation)
+///   $25+ move  → 68% accuracy (needs 90s)
+///   $50+ move  → 76% accuracy (needs 60s)
+///   $100+ move → 99% accuracy (needs 60s)
 ///
-/// Strategy: wait 60s, measure |spot - strike|, buy the winning side if
-/// empirical accuracy > implied probability + fees. Hold to resolution.
+/// Filters:
+///   - ATR: move must exceed 0.7× ATR(14) on 1m candles to avoid ranging markets
+///   - Volume: trade flow imbalance must confirm direction on lower tiers ($10-25)
+///
+/// Position sizing: half-Kelly based on edge magnitude.
 pub struct OrbStrategy {
     markets: HashMap<String, PolymarketMarket>,
     latest_prices: HashMap<String, AggregatedPrice>,
@@ -45,7 +52,10 @@ pub struct OrbStrategy {
     book_cache: Option<BookCache>,
     ws_book_max_stale_secs: u64,
     max_position_usd: Decimal,
-    entry_delay_secs: i64,
+    /// Rolling 1m candle true ranges for ATR computation, keyed by symbol.
+    true_ranges: HashMap<String, VecDeque<f64>>,
+    /// Previous candle close per symbol (needed for true range calculation).
+    prev_close: HashMap<String, f64>,
 }
 
 impl OrbStrategy {
@@ -59,7 +69,8 @@ impl OrbStrategy {
             book_cache: None,
             ws_book_max_stale_secs: config.ws_book_max_stale_secs,
             max_position_usd: config.max_position_usd,
-            entry_delay_secs: DEFAULT_ENTRY_DELAY_SECS,
+            true_ranges: HashMap::new(),
+            prev_close: HashMap::new(),
         }
     }
 
@@ -91,20 +102,63 @@ impl OrbStrategy {
         DEFAULT_HALF_SPREAD
     }
 
-    /// Empirical accuracy from backtested ORB tiers.
-    /// Returns None if the move is too small to have edge after fees.
-    fn empirical_accuracy(btc_move_abs: f64) -> Option<f64> {
-        if btc_move_abs >= 100.0 {
+    /// Current ATR for a symbol, or None if not enough candles yet.
+    fn atr(&self, symbol: &str) -> Option<f64> {
+        let trs = self.true_ranges.get(symbol)?;
+        if trs.len() < ATR_PERIOD {
+            return None;
+        }
+        let sum: f64 = trs.iter().rev().take(ATR_PERIOD).sum();
+        Some(sum / ATR_PERIOD as f64)
+    }
+
+    /// Update ATR state from a completed 1m candle.
+    fn update_atr(&mut self, symbol: &str, high: f64, low: f64, close: f64) {
+        let tr = if let Some(&prev_c) = self.prev_close.get(symbol) {
+            // True range: max(high-low, |high-prev_close|, |low-prev_close|)
+            (high - low)
+                .max((high - prev_c).abs())
+                .max((low - prev_c).abs())
+        } else {
+            high - low
+        };
+        self.prev_close.insert(symbol.to_string(), close);
+
+        let trs = self
+            .true_ranges
+            .entry(symbol.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(ATR_PERIOD + 1));
+        trs.push_back(tr);
+        if trs.len() > ATR_PERIOD * 2 {
+            trs.pop_front();
+        }
+    }
+
+    /// Empirical accuracy from backtested ORB tiers (4,389 trades).
+    /// Returns None if the move is too small or hasn't had enough confirmation time.
+    /// Bigger moves need less wait — $100+ moves are clear by 60s, small moves need 90s+.
+    fn empirical_accuracy(btc_move_abs: f64, elapsed_secs: i64) -> Option<f64> {
+        // Only trade large, high-conviction moves ($50+)
+        // $10-$25 moves are too noisy (57-68% accuracy) and don't justify the fees
+        if btc_move_abs >= 100.0 && elapsed_secs >= 30 {
             Some(0.99)
-        } else if btc_move_abs >= 50.0 {
+        } else if btc_move_abs >= 50.0 && elapsed_secs >= 45 {
             Some(0.76)
-        } else if btc_move_abs >= 25.0 {
-            Some(0.72)
-        } else if btc_move_abs >= 10.0 {
-            Some(0.68)
         } else {
             None
         }
+    }
+
+    /// Half-Kelly position sizing: bigger edge → bigger bet.
+    fn kelly_size(&self, edge: f64, implied_prob: f64) -> Decimal {
+        let odds = 1.0 / implied_prob - 1.0;
+        let win_prob = implied_prob + edge;
+        let kelly_f = (odds * win_prob - (1.0 - win_prob)) / odds;
+        let half_kelly = kelly_f * 0.5;
+        // Clamp between 25% and 100% of max position (Polymarket min order is $5)
+        let fraction = half_kelly.clamp(0.25, 1.0);
+        let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
+        Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
     }
 
     fn evaluate_all_markets(&self) -> Vec<TradeSignal> {
@@ -126,16 +180,18 @@ impl OrbStrategy {
             _ => return None,
         };
 
+        // Only trade 5-minute windows — accuracy tiers were backtested on this horizon
+        if window_secs != 300 {
+            return None;
+        }
+
         // One entry per market
         if self.entered_markets.contains(&market.condition_id) {
             return None;
         }
 
         let price = self.latest_prices.get(&market.underlying_symbol)?;
-        let spot = price
-            .oracle_price
-            .and_then(|d| d.to_f64())
-            .unwrap_or_else(|| price.vwap.to_f64().unwrap_or(0.0));
+        let spot = price.vwap.to_f64().unwrap_or(0.0);
 
         if spot <= 0.0 {
             return None;
@@ -149,11 +205,6 @@ impl OrbStrategy {
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now).max(0) as f64;
 
-        // Wait for opening range to form
-        if elapsed < self.entry_delay_secs {
-            return None;
-        }
-
         // Too close to expiry
         if time_remaining_secs < MIN_TIME_REMAINING_SECS as f64 {
             return None;
@@ -163,14 +214,55 @@ impl OrbStrategy {
         let btc_move = spot - start_price;
         let btc_move_abs = btc_move.abs();
 
-        let accuracy = Self::empirical_accuracy(btc_move_abs)?;
+        // --- ATR filter: skip if move is noise relative to volatility ---
+        let atr_val = self.atr(&market.underlying_symbol);
+        if let Some(atr) = atr_val {
+            if atr > 0.0 && btc_move_abs < atr * MIN_ATR_MULTIPLE {
+                debug!(
+                    question = %market.question,
+                    btc_move = format!("{:+.1}", btc_move),
+                    atr = format!("{:.1}", atr),
+                    atr_multiple = format!("{:.2}", btc_move_abs / atr),
+                    "ORB: move below ATR threshold"
+                );
+                return None;
+            }
+        }
+
+        let accuracy = match Self::empirical_accuracy(btc_move_abs, elapsed) {
+            Some(a) => a,
+            None => {
+                debug!(
+                    question = %market.question,
+                    btc_move = format!("{:+.1}", btc_move),
+                    start_price = format!("{:.1}", start_price),
+                    spot = format!("{:.1}", spot),
+                    elapsed_secs = elapsed,
+                    atr = format!("{:.1}", atr_val.unwrap_or(0.0)),
+                    "ORB: move too small for any accuracy tier"
+                );
+                return None;
+            }
+        };
+
+        // --- Volume filter: require trade flow confirmation on lower tiers ---
+        let flow = price.trade_flow_imbalance;
+        let flow_confirms = (btc_move > 0.0 && flow > 0.0) || (btc_move < 0.0 && flow < 0.0);
+
+        if btc_move_abs < 50.0 && !flow_confirms {
+            debug!(
+                question = %market.question,
+                btc_move = format!("{:+.1}", btc_move),
+                flow = format!("{:.2}", flow),
+                "ORB: volume flow doesn't confirm direction"
+            );
+            return None;
+        }
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
         let (side, token_id, implied_price) = if btc_move > 0.0 {
-            // BTC moved up → buy YES (Up token)
             (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
         } else {
-            // BTC moved down → buy NO (Down token)
             (Side::Sell, &market.token_id_no, market.implied_prob_no)
         };
 
@@ -196,6 +288,9 @@ impl OrbStrategy {
             return None;
         }
 
+        let size_usd = self.kelly_size(edge, implied_prob);
+        let atr_multiple = atr_val.map(|a| if a > 0.0 { btc_move_abs / a } else { 0.0 });
+
         info!(
             question = %market.question,
             btc_move = format!("{:+.1}", btc_move),
@@ -203,7 +298,11 @@ impl OrbStrategy {
             implied = format!("{:.1}%", implied_prob * 100.0),
             edge = format!("{:.1}%", edge * 100.0),
             side = %side,
-            size_usd = %self.max_position_usd,
+            size_usd = %size_usd,
+            max_usd = %self.max_position_usd,
+            atr = format!("{:.1}", atr_val.unwrap_or(0.0)),
+            atr_mult = format!("{:.1}x", atr_multiple.unwrap_or(0.0)),
+            flow = format!("{:.2}", flow),
             elapsed_secs = elapsed,
             "ORB: breakout signal"
         );
@@ -211,7 +310,7 @@ impl OrbStrategy {
         Some(TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
             side,
-            size_usd: self.max_position_usd,
+            size_usd,
             confidence: edge,
             price: implied_price,
             metadata: SignalMetadata::Orb {
@@ -259,7 +358,7 @@ impl Strategy for OrbStrategy {
     fn subscriptions(&self) -> StrategySubscriptions {
         StrategySubscriptions {
             price_updates: true,
-            candles: false,
+            candles: true,
             execution_feedback: true,
             polymarket_updates: true,
             ml_predictions: false,
@@ -280,6 +379,23 @@ impl Strategy for OrbStrategy {
                 }
                 signals
             }
+            StrategyEvent::CandleComplete(candle) => {
+                if candle.timeframe == Timeframe::M1 {
+                    let high = candle.high.to_f64().unwrap_or(0.0);
+                    let low = candle.low.to_f64().unwrap_or(0.0);
+                    let close = candle.close.to_f64().unwrap_or(0.0);
+                    self.update_atr(&candle.symbol, high, low, close);
+
+                    if let Some(atr) = self.atr(&candle.symbol) {
+                        debug!(
+                            symbol = %candle.symbol,
+                            atr = format!("{:.1}", atr),
+                            "ORB: ATR updated"
+                        );
+                    }
+                }
+                Vec::new()
+            }
             StrategyEvent::PolymarketUpdate(update) => {
                 match update {
                     PolymarketUpdate::MarketsDiscovered(new_markets) => {
@@ -292,8 +408,11 @@ impl Strategy for OrbStrategy {
                                     .updown_start_prices
                                     .contains_key(&market.condition_id)
                                 {
-                                    // Use strike price from market (this is the window start price)
-                                    let start = market.strike.to_f64().unwrap_or(0.0);
+                                    let start = self
+                                        .latest_prices
+                                        .get(&market.underlying_symbol)
+                                        .map(|p| p.vwap.to_f64().unwrap_or(0.0))
+                                        .unwrap_or(0.0);
                                     if start > 0.0 {
                                         self.updown_start_prices.insert(
                                             market.condition_id.clone(),
@@ -357,11 +476,12 @@ mod tests {
             latest_prices: HashMap::new(),
             updown_start_prices: HashMap::new(),
             entered_markets: HashSet::new(),
-            fee_calculator: FeeCalculator::new(156), // 1.56%
+            fee_calculator: FeeCalculator::new(0),
             book_cache: None,
             ws_book_max_stale_secs: 30,
             max_position_usd: dec!(100),
-            entry_delay_secs: 60,
+            true_ranges: HashMap::new(),
+            prev_close: HashMap::new(),
         }
     }
 
@@ -390,6 +510,15 @@ mod tests {
     }
 
     fn make_price(symbol: &str, vwap: f64, ts: DateTime<Utc>) -> AggregatedPrice {
+        make_price_with_flow(symbol, vwap, ts, 0.5)
+    }
+
+    fn make_price_with_flow(
+        symbol: &str,
+        vwap: f64,
+        ts: DateTime<Utc>,
+        flow: f64,
+    ) -> AggregatedPrice {
         use crate::types::market::Exchange;
         AggregatedPrice {
             symbol: symbol.to_string(),
@@ -402,24 +531,38 @@ mod tests {
             volatility: 0.5,
             num_feeds: 1,
             oracle_price: Some(Decimal::from_f64_retain(vwap).unwrap()),
-            trade_flow_imbalance: 0.0,
-            recent_buy_volume: 0.0,
-            recent_sell_volume: 0.0,
+            trade_flow_imbalance: flow,
+            recent_buy_volume: 100.0,
+            recent_sell_volume: 100.0,
             funding_rate: None,
             mark_price: None,
+            binance_mid: Some(Decimal::from_f64_retain(vwap).unwrap()),
             timestamp: ts,
+        }
+    }
+
+    /// Seed ATR with enough candles so it's available for tests.
+    fn seed_atr(strategy: &mut OrbStrategy, symbol: &str, atr_approx: f64) {
+        for i in 0..ATR_PERIOD {
+            let base = 80000.0 + (i as f64);
+            strategy.update_atr(symbol, base + atr_approx, base, base + atr_approx * 0.5);
         }
     }
 
     #[test]
     fn test_accuracy_tiers() {
-        assert_eq!(OrbStrategy::empirical_accuracy(5.0), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(10.0), Some(0.68));
-        assert_eq!(OrbStrategy::empirical_accuracy(15.0), Some(0.68));
-        assert_eq!(OrbStrategy::empirical_accuracy(25.0), Some(0.72));
-        assert_eq!(OrbStrategy::empirical_accuracy(50.0), Some(0.76));
-        assert_eq!(OrbStrategy::empirical_accuracy(100.0), Some(0.99));
-        assert_eq!(OrbStrategy::empirical_accuracy(200.0), Some(0.99));
+        // Small moves filtered out — only $50+ trades now
+        assert_eq!(OrbStrategy::empirical_accuracy(5.0, 120), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(10.0, 120), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(25.0, 90), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(49.0, 120), None);
+        // $50+ needs 45s
+        assert_eq!(OrbStrategy::empirical_accuracy(50.0, 44), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(50.0, 45), Some(0.76));
+        // $100+ needs 30s
+        assert_eq!(OrbStrategy::empirical_accuracy(100.0, 29), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(100.0, 30), Some(0.99));
+        assert_eq!(OrbStrategy::empirical_accuracy(200.0, 30), Some(0.99));
     }
 
     #[test]
@@ -436,6 +579,7 @@ mod tests {
         strategy
             .latest_prices
             .insert("BTC-USD".to_string(), make_price("BTC-USD", 80050.0, now));
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty(), "should not signal before 60s");
@@ -445,7 +589,7 @@ mod tests {
     fn test_no_signal_small_move() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70; // 70s elapsed
+        let window_start = now.timestamp() - 120;
 
         let market = make_updown_market("m1", 80000.0, window_start, 0.52);
         strategy.markets.insert("m1".to_string(), market);
@@ -456,6 +600,7 @@ mod tests {
         strategy
             .latest_prices
             .insert("BTC-USD".to_string(), make_price("BTC-USD", 80005.0, now));
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty(), "should not signal on <$10 move");
@@ -465,59 +610,67 @@ mod tests {
     fn test_signal_on_breakout_up() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70;
+        let window_start = now.timestamp() - 120;
 
-        // $30 move up, market pricing Up at 0.60 (below 72% accuracy)
-        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
+        // $60 move up, market pricing Up at 0.55 (below 76% accuracy)
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        strategy
-            .latest_prices
-            .insert("BTC-USD".to_string(), make_price("BTC-USD", 80030.0, now));
+        // Positive flow confirms up move
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.3),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0); // ATR=20, move=60 → 3x ATR ✓
 
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].side, Side::Buy); // Buy Up token
+        assert_eq!(signals[0].side, Side::Buy);
     }
 
     #[test]
     fn test_signal_on_breakout_down() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70;
+        let window_start = now.timestamp() - 120;
 
-        // $30 move down, market pricing Down (No) at 0.60 (below 72% accuracy)
-        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
+        // $60 move down, market pricing Down (No) at 0.55 (below 76% accuracy)
+        let market = make_updown_market("m1", 80000.0, window_start, 0.45);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        strategy
-            .latest_prices
-            .insert("BTC-USD".to_string(), make_price("BTC-USD", 79970.0, now));
+        // Negative flow confirms down move
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 79940.0, now, -0.3),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].side, Side::Sell); // Buy Down (No) token
+        assert_eq!(signals[0].side, Side::Sell);
     }
 
     #[test]
     fn test_no_signal_when_implied_above_accuracy() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70;
+        let window_start = now.timestamp() - 120;
 
-        // $15 move (68% accuracy tier), but market already pricing at 0.70
-        let market = make_updown_market("m1", 80000.0, window_start, 0.70);
+        // $15 move (57% accuracy tier), market already pricing at 0.60
+        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        strategy
-            .latest_prices
-            .insert("BTC-USD".to_string(), make_price("BTC-USD", 80015.0, now));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80015.0, now, 0.3),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 10.0);
 
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty(), "no edge when implied > accuracy");
@@ -527,25 +680,24 @@ mod tests {
     fn test_one_entry_per_market() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70;
+        let window_start = now.timestamp() - 120;
 
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        strategy
-            .latest_prices
-            .insert("BTC-USD".to_string(), make_price("BTC-USD", 80060.0, now));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
-        // First evaluation → signal
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
 
-        // Mark as entered
         strategy.entered_markets.insert("m1".to_string());
 
-        // Second evaluation → no signal (already entered)
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty());
     }
@@ -554,7 +706,7 @@ mod tests {
     fn test_large_move_high_accuracy() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
-        let window_start = now.timestamp() - 70;
+        let window_start = now.timestamp() - 120;
 
         // $150 move → 99% accuracy, market at 0.85
         let market = make_updown_market("m1", 80000.0, window_start, 0.85);
@@ -562,9 +714,11 @@ mod tests {
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
+        // Large moves ($50+) don't need flow confirmation
         strategy
             .latest_prices
             .insert("BTC-USD".to_string(), make_price("BTC-USD", 80150.0, now));
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
@@ -580,5 +734,117 @@ mod tests {
         } else {
             panic!("expected Orb metadata");
         }
+    }
+
+    #[test]
+    fn test_atr_filter_rejects_noise() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        // $12 move but ATR is $20, so move is only 0.6x ATR (below 0.7 threshold)
+        let market = make_updown_market("m1", 80000.0, window_start, 0.45);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80012.0, now, 0.3),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0); // ATR=20, move=12 → 0.6x ATR ✗
+
+        let signals = strategy.evaluate_all_markets();
+        assert!(signals.is_empty(), "should reject move below 0.7x ATR");
+    }
+
+    #[test]
+    fn test_volume_filter_rejects_counter_flow() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        // $30 move up but negative trade flow (sellers dominating)
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80030.0, now, -0.2), // negative flow on up move
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert!(signals.is_empty(), "should reject when flow contradicts direction");
+    }
+
+    #[test]
+    fn test_volume_filter_skipped_for_large_moves() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        // $60 move up with negative flow — large moves skip volume filter
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, -0.2),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert_eq!(
+            signals.len(),
+            1,
+            "$50+ moves should bypass volume filter"
+        );
+    }
+
+    #[test]
+    fn test_atr_computation() {
+        let mut strategy = make_test_strategy();
+        // Not enough candles yet
+        assert!(strategy.atr("BTC-USD").is_none());
+
+        // Feed 14 candles with consistent range of $10
+        for i in 0..14 {
+            let base = 80000.0 + (i as f64);
+            strategy.update_atr("BTC-USD", base + 10.0, base, base + 5.0);
+        }
+
+        let atr = strategy.atr("BTC-USD").unwrap();
+        assert!(
+            (atr - 10.0).abs() < 0.5,
+            "ATR should be ~10 with $10 ranges, got {}",
+            atr
+        );
+    }
+
+    #[test]
+    fn test_no_atr_passes_through() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        // No ATR data yet — filter should pass through (not block)
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.3),
+        );
+        // No seed_atr — ATR is None
+
+        let signals = strategy.evaluate_all_markets();
+        assert_eq!(signals.len(), 1, "should still signal when ATR unavailable");
     }
 }
