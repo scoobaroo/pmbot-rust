@@ -48,6 +48,8 @@ pub struct OrbStrategy {
     updown_start_prices: HashMap<String, (f64, i64)>,
     /// Markets we've already entered — one entry per market, hold to resolution.
     entered_markets: HashSet<String>,
+    /// Track active positions by condition_id → side, to prevent opposing orders.
+    active_sides: HashMap<String, Side>,
     fee_calculator: FeeCalculator,
     book_cache: Option<BookCache>,
     ws_book_max_stale_secs: u64,
@@ -65,6 +67,7 @@ impl OrbStrategy {
             latest_prices: HashMap::new(),
             updown_start_prices: HashMap::new(),
             entered_markets: HashSet::new(),
+            active_sides: HashMap::new(),
             fee_calculator: FeeCalculator::new(config.fee_rate_bps),
             book_cache: None,
             ws_book_max_stale_secs: config.ws_book_max_stale_secs,
@@ -193,9 +196,10 @@ impl OrbStrategy {
         Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
     }
 
-    fn evaluate_all_markets(&self) -> Vec<TradeSignal> {
+    fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
         let mut signals = Vec::new();
-        for market in self.markets.values() {
+        let market_list: Vec<PolymarketMarket> = self.markets.values().cloned().collect();
+        for market in &market_list {
             if let Some(s) = self.evaluate_updown_market(market) {
                 signals.push(s);
             }
@@ -203,7 +207,7 @@ impl OrbStrategy {
         signals
     }
 
-    fn evaluate_updown_market(&self, market: &PolymarketMarket) -> Option<TradeSignal> {
+    fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
         let (window_start_ts, window_secs) = match market.market_type {
             MarketType::UpDown {
                 window_start_ts,
@@ -307,14 +311,34 @@ impl OrbStrategy {
             (Side::Sell, &market.token_id_no, market.implied_prob_no)
         };
 
+        // Don't place opposing orders — if we already have a position on this
+        // market's underlying in the opposite direction, skip
+        if let Some(existing_side) = self.active_sides.get(&market.condition_id) {
+            if *existing_side != side {
+                debug!(
+                    question = %market.question,
+                    existing = ?existing_side,
+                    new = ?side,
+                    "ORB: skipping opposing order"
+                );
+                return None;
+            }
+        }
+
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Deduct trading costs
-        let half_spread = self.get_half_spread(token_id);
-        let total_cost = self.fee_calculator.total_cost(implied_price, half_spread);
-        let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
+        // Aggressive pricing: bid above implied to sweep the book immediately.
+        // Add 5c to implied price (e.g., 0.55 → 0.60) to ensure instant fill.
+        // On 17-25% edge signals, 5c of slippage still leaves 12-20% edge.
+        let aggressive_price = (implied_price + Decimal::new(5, 2)).min(Decimal::new(95, 2));
 
-        let edge = accuracy - implied_prob - total_cost_f64;
+        // Deduct trading costs using aggressive price
+        let half_spread = self.get_half_spread(token_id);
+        let total_cost = self.fee_calculator.total_cost(aggressive_price, half_spread);
+        let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
+        let aggressive_f64 = aggressive_price.to_f64().unwrap_or(0.5);
+
+        let edge = accuracy - aggressive_f64 - total_cost_f64;
 
         if edge <= 0.0 {
             debug!(
@@ -350,12 +374,15 @@ impl OrbStrategy {
             "ORB: breakout signal"
         );
 
+        // Track our side to prevent opposing orders
+        self.active_sides.insert(market.condition_id.clone(), side);
+
         Some(TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
             side,
             size_usd,
             confidence: edge,
-            price: implied_price,
+            price: aggressive_price,
             metadata: SignalMetadata::Orb {
                 btc_move: price_move,
                 accuracy_tier: accuracy,
@@ -385,6 +412,7 @@ impl OrbStrategy {
             self.markets.remove(cid);
             self.updown_start_prices.remove(cid);
             self.entered_markets.remove(cid);
+            self.active_sides.remove(cid);
         }
 
         if !expired.is_empty() {
@@ -519,6 +547,7 @@ mod tests {
             latest_prices: HashMap::new(),
             updown_start_prices: HashMap::new(),
             entered_markets: HashSet::new(),
+            active_sides: HashMap::new(),
             fee_calculator: FeeCalculator::new(0),
             book_cache: None,
             ws_book_max_stale_secs: 30,
@@ -757,8 +786,8 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.85
-        let market = make_updown_market("m1", 80000.0, window_start, 0.85);
+        // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.70
+        let market = make_updown_market("m1", 80000.0, window_start, 0.70);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -779,7 +808,7 @@ mod tests {
         } = &signals[0].metadata
         {
             assert_eq!(*accuracy_tier, 0.92);
-            assert!(*edge > 0.05, "should have >5% edge on 0.19% move at 0.85 implied");
+            assert!(*edge > 0.10, "should have >10% edge on 0.19% move at 0.70 implied + 0.05 premium");
         } else {
             panic!("expected Orb metadata");
         }
