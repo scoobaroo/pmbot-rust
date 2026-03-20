@@ -89,6 +89,16 @@ impl ResolutionSniperStrategy {
         let now = Utc::now();
         let mut signals = Vec::new();
 
+        // Periodic debug: log market count
+        if self.markets.len() > 0 && self.latest_prices.len() <= 7 {
+            info!(
+                markets = self.markets.len(),
+                live_prices = self.live_poly_prices.len(),
+                price_symbol = %price.symbol,
+                "sniper: state check"
+            );
+        }
+
         // Check all UpDown markets for this symbol
         let matching_markets: Vec<PolymarketMarket> = self
             .markets
@@ -96,6 +106,24 @@ impl ResolutionSniperStrategy {
             .filter(|m| m.underlying_symbol == price.symbol)
             .cloned()
             .collect();
+
+        if !matching_markets.is_empty() {
+            let in_window: Vec<_> = matching_markets.iter().filter(|m| {
+                if let MarketType::UpDown { window_start_ts, window_secs } = m.market_type {
+                    let remaining = (window_start_ts + window_secs as i64) - now.timestamp();
+                    remaining <= ENTRY_WINDOW_SECS && remaining >= MIN_TIME_REMAINING_SECS
+                } else { false }
+            }).collect();
+            if !in_window.is_empty() {
+                info!(
+                    symbol = %price.symbol,
+                    total_markets = matching_markets.len(),
+                    in_entry_window = in_window.len(),
+                    has_live_prices = self.live_poly_prices.len(),
+                    "sniper: markets in entry window"
+                );
+            }
+        }
 
         for market in matching_markets {
             // Skip if already entered
@@ -120,23 +148,24 @@ impl ResolutionSniperStrategy {
             }
 
             let spot = price.vwap.to_f64().unwrap_or(0.0);
+            if spot == 0.0 { continue; }
 
-            // Get live Polymarket prices from PriceUpdate events
-            let (yes_price, no_price) = match self.live_poly_prices.get(&market.condition_id) {
-                Some(&(y, n)) => (y, n),
-                None => continue,
+            // Get strike price (captured at window start)
+            let strike = match self.strike_prices.get(&market.condition_id) {
+                Some(&s) if s > 0.0 => s,
+                _ => continue,
             };
 
-            let (winning_side, winning_prob) = if yes_price > no_price {
-                (Side::Buy, yes_price)
-            } else {
-                (Side::Sell, no_price)
-            };
+            // Determine winner from exchange price vs strike
+            let move_pct = (spot - strike).abs() / strike * 100.0;
 
-            // Only enter if one side is clearly winning (>85%)
-            if winning_prob < 0.85 {
+            // Need minimum 0.03% move to be confident (backtest: 90%+ at 30s)
+            if move_pct < 0.03 {
                 continue;
             }
+
+            let winning_side = if spot > strike { Side::Buy } else { Side::Sell };
+            let winning_prob = move_pct; // used for metadata only
 
             let strike = 0.0;
             let price_distance_pct = winning_prob - 0.5;
@@ -204,10 +233,15 @@ impl ResolutionSniperStrategy {
     fn on_markets_discovered(&mut self, markets: Vec<PolymarketMarket>) {
         for m in markets {
             if matches!(m.market_type, MarketType::UpDown { .. }) {
-                // Update live prices from scanner (refreshed every 60s)
-                let yes_f = m.implied_prob_yes.to_f64().unwrap_or(0.5);
-                let no_f = m.implied_prob_no.to_f64().unwrap_or(0.5);
-                self.live_poly_prices.insert(m.condition_id.clone(), (yes_f, no_f));
+                // Capture strike from current exchange price on first discovery
+                if !self.strike_prices.contains_key(&m.condition_id) {
+                    if let Some(price) = self.latest_prices.get(&m.underlying_symbol) {
+                        let vwap = price.vwap.to_f64().unwrap_or(0.0);
+                        if vwap > 0.0 {
+                            self.strike_prices.insert(m.condition_id.clone(), vwap);
+                        }
+                    }
+                }
                 self.markets.insert(m.condition_id.clone(), m);
             }
         }
