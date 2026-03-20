@@ -222,7 +222,8 @@ impl OrbStrategy {
         }
 
         // BTC and ETH only — accuracy tiers validated on backtest data
-        if market.underlying_symbol != "BTC-USD" && market.underlying_symbol != "ETH-USD" {
+        let is_eth = market.underlying_symbol == "ETH-USD";
+        if market.underlying_symbol != "BTC-USD" && !is_eth {
             return None;
         }
 
@@ -255,6 +256,12 @@ impl OrbStrategy {
         let price_move = spot - start_price;
         let move_abs = price_move.abs();
         let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
+
+        // ETH is noisier — require 0.15%+ (~$3.15) minimum vs BTC's 0.05%
+        // Backtest: ETH at 0.05% only 67% sustained, at 0.15% = 75.5%, at 0.20% = 80%
+        if is_eth && move_pct < 0.15 {
+            return None;
+        }
 
         // --- ATR filter: skip if move is noise relative to volatility ---
         let atr_val = self.atr(&market.underlying_symbol);
