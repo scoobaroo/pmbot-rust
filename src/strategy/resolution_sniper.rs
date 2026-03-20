@@ -34,7 +34,7 @@ const MIN_PRICE_DISTANCE_PCT: f64 = 0.0005; // 0.05% of price (~$42 at $84k)
 /// Resolution Sniper strategy for Polymarket UpDown markets.
 ///
 /// Buys near-certain outcomes (95c-99c) in the final 60 seconds before
-/// market resolution. When BTC is clearly above/below the strike price,
+/// market resolution. When the price is clearly above/below the strike,
 /// one side trades at ~99c. We buy at 99c via limit order, market resolves
 /// at $1.00, profit is ~1c per share minus negligible fees.
 ///
@@ -47,6 +47,8 @@ pub struct ResolutionSniperStrategy {
     markets: HashMap<String, PolymarketMarket>,
     /// Latest exchange prices per symbol.
     latest_prices: HashMap<String, AggregatedPrice>,
+    /// Captured strike price at window start, per condition_id.
+    strike_prices: HashMap<String, f64>,
     /// Markets we've already entered — one entry per market.
     entered_markets: HashSet<String>,
     /// Book cache for reading live Polymarket orderbook prices.
@@ -63,6 +65,7 @@ impl ResolutionSniperStrategy {
         Self {
             markets: HashMap::new(),
             latest_prices: HashMap::new(),
+            strike_prices: HashMap::new(),
             entered_markets: HashSet::new(),
             book_cache: None,
             ws_book_max_stale_secs: config.ws_book_max_stale_secs,
@@ -114,9 +117,16 @@ impl ResolutionSniperStrategy {
             }
 
             let spot = price.vwap.to_f64().unwrap_or(0.0);
-            let strike = market.strike.to_f64().unwrap_or(0.0);
+            if spot == 0.0 {
+                continue;
+            }
 
-            if spot == 0.0 || strike == 0.0 {
+            // Capture strike price from live data at first sight of market
+            let strike = *self.strike_prices
+                .entry(market.condition_id.clone())
+                .or_insert(spot);
+
+            if strike == 0.0 {
                 continue;
             }
 
@@ -143,38 +153,9 @@ impl ResolutionSniperStrategy {
                 (Side::Sell, &market.token_id_no)
             };
 
-            // Get live book price for the winning token
-            let book_price = self.get_book_ask(token_id);
-
-            // Determine entry price
-            let entry_price = match book_price {
-                Some(ask) if ask >= MIN_BUY_PRICE && ask <= MAX_BUY_PRICE => ask,
-                Some(ask) if ask < MIN_BUY_PRICE => {
-                    debug!(
-                        market = %market.question,
-                        ask = %ask,
-                        "sniper: ask too low, outcome not certain enough"
-                    );
-                    continue;
-                }
-                Some(ask) if ask > MAX_BUY_PRICE => {
-                    // Place limit at our max — may not fill but preserves edge
-                    TARGET_BUY_PRICE
-                }
-                _ => {
-                    // No book data — use implied prob if available
-                    let implied = if btc_above_strike {
-                        market.implied_prob_yes
-                    } else {
-                        market.implied_prob_no
-                    };
-                    if implied >= MIN_BUY_PRICE && implied <= MAX_BUY_PRICE {
-                        implied
-                    } else {
-                        continue;
-                    }
-                }
-            };
+            // Aggressive pricing: bid at 0.95 to sweep the book.
+            // At 96-98% win rate, paying 0.95 for a $1.00 payout = 5% edge per trade.
+            let entry_price = dec!(0.95);
 
             // Verify fee is negligible at this price
             let fee = self.fee_calculator.taker_fee(entry_price);
@@ -254,6 +235,7 @@ impl ResolutionSniperStrategy {
         for id in expired {
             self.markets.remove(&id);
             self.entered_markets.remove(&id);
+            self.strike_prices.remove(&id);
         }
     }
 
@@ -361,6 +343,7 @@ mod tests {
         let now = Utc::now().timestamp();
         let market = make_market("cond1", 84000.0, now - 60); // 60s elapsed, 240s remaining
         strat.on_markets_discovered(vec![market]);
+        strat.strike_prices.insert("cond1".to_string(), 84000.0);
 
         let price = make_price("BTC-USD", 85000.0); // clearly above strike
         let signals = strat.on_price_update(&price);
@@ -374,8 +357,9 @@ mod tests {
 
         // Market with 30s remaining — in the entry window
         let now = Utc::now().timestamp();
-        let market = make_market("cond1", 84000.0, now - 270); // 270s elapsed, 30s remaining
+        let market = make_market("cond1", 84000.0, now - 270);
         strat.on_markets_discovered(vec![market]);
+        strat.strike_prices.insert("cond1".to_string(), 84000.0);
 
         let price = make_price("BTC-USD", 85000.0); // clearly above strike
         let signals = strat.on_price_update(&price);
@@ -406,6 +390,7 @@ mod tests {
         let now = Utc::now().timestamp();
         let market = make_market("cond1", 84000.0, now - 270);
         strat.on_markets_discovered(vec![market]);
+        strat.strike_prices.insert("cond1".to_string(), 84000.0);
 
         let price = make_price("BTC-USD", 85000.0);
         let s1 = strat.on_price_update(&price);
@@ -422,10 +407,10 @@ mod tests {
 
         let now = Utc::now().timestamp();
         let mut market = make_market("cond1", 85000.0, now - 270);
-        // When BTC is below strike, the NO token (Down) should be near-certain
         market.implied_prob_yes = dec!(0.01);
         market.implied_prob_no = dec!(0.99);
         strat.on_markets_discovered(vec![market]);
+        strat.strike_prices.insert("cond1".to_string(), 85000.0);
 
         let price = make_price("BTC-USD", 84000.0); // below strike → Down wins
         let signals = strat.on_price_update(&price);
