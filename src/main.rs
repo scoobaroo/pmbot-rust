@@ -463,13 +463,27 @@ async fn main() {
     }
 
     // Spawn execution engine
+    // Use copytrade key if configured (routes all strategies through the funded account)
+    let exec_private_key = if !config.copy_trade_private_key.is_empty() {
+        info!("execution engine using copytrade account");
+        &config.copy_trade_private_key
+    } else {
+        &config.polymarket_private_key
+    };
+    let exec_funder = if !config.copy_trade_funder_address.is_empty() {
+        Some(config.copy_trade_funder_address.clone())
+    } else {
+        None
+    };
     let poly_client = if config.mode == RunMode::Live {
-        match pmbot_rust::polymarket::auth::derive_api_credentials(&config.polymarket_private_key)
+        match pmbot_rust::polymarket::auth::derive_api_credentials(exec_private_key)
             .await
         {
-            Ok((creds, signer)) => Some(pmbot_rust::polymarket::client::PolymarketClient::new(
-                creds, signer,
-            )),
+            Ok((creds, signer)) => Some(
+                pmbot_rust::polymarket::client::PolymarketClient::new_with_funder(
+                    creds, signer, exec_funder,
+                ),
+            ),
             Err(e) => {
                 tracing::error!(error = %e, "failed to derive Polymarket credentials");
                 None
