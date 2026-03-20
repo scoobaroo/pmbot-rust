@@ -47,6 +47,8 @@ pub struct ResolutionSniperStrategy {
     markets: HashMap<String, PolymarketMarket>,
     /// Latest exchange prices per symbol.
     latest_prices: HashMap<String, AggregatedPrice>,
+    /// Live Polymarket prices per condition_id → (yes_price, no_price).
+    live_poly_prices: HashMap<String, (f64, f64)>,
     /// Captured strike price at window start, per condition_id.
     strike_prices: HashMap<String, f64>,
     /// Markets we've already entered — one entry per market.
@@ -65,6 +67,7 @@ impl ResolutionSniperStrategy {
         Self {
             markets: HashMap::new(),
             latest_prices: HashMap::new(),
+            live_poly_prices: HashMap::new(),
             strike_prices: HashMap::new(),
             entered_markets: HashSet::new(),
             book_cache: None,
@@ -118,33 +121,19 @@ impl ResolutionSniperStrategy {
 
             let spot = price.vwap.to_f64().unwrap_or(0.0);
 
-            // Get LIVE orderbook prices for both tokens to determine winning side.
-            // The discovery-time implied_prob is stale (set 4+ min ago at ~50/50).
-            // We need the current book prices to know which side is winning.
-            let yes_bid = self.get_book_bid(&market.token_id_yes);
-            let no_bid = self.get_book_bid(&market.token_id_no);
-
-            let (winning_side, winning_prob) = match (yes_bid, no_bid) {
-                (Some(yb), Some(nb)) => {
-                    let yf = yb.to_f64().unwrap_or(0.5);
-                    let nf = nb.to_f64().unwrap_or(0.5);
-                    if yf > nf {
-                        (Side::Buy, yf)
-                    } else {
-                        (Side::Sell, nf)
-                    }
-                }
-                (Some(yb), None) => (Side::Buy, yb.to_f64().unwrap_or(0.5)),
-                (None, Some(nb)) => (Side::Sell, nb.to_f64().unwrap_or(0.5)),
-                (None, None) => {
-                    // Fallback to discovery-time implied prob (less reliable)
-                    let yf = market.implied_prob_yes.to_f64().unwrap_or(0.5);
-                    let nf = market.implied_prob_no.to_f64().unwrap_or(0.5);
-                    if yf > nf { (Side::Buy, yf) } else { (Side::Sell, nf) }
-                }
+            // Get live Polymarket prices from PriceUpdate events
+            let (yes_price, no_price) = match self.live_poly_prices.get(&market.condition_id) {
+                Some(&(y, n)) => (y, n),
+                None => continue,
             };
 
-            // Only enter if one side is clearly winning (>85% implied from live book)
+            let (winning_side, winning_prob) = if yes_price > no_price {
+                (Side::Buy, yes_price)
+            } else {
+                (Side::Sell, no_price)
+            };
+
+            // Only enter if one side is clearly winning (>85%)
             if winning_prob < 0.85 {
                 continue;
             }
@@ -215,6 +204,10 @@ impl ResolutionSniperStrategy {
     fn on_markets_discovered(&mut self, markets: Vec<PolymarketMarket>) {
         for m in markets {
             if matches!(m.market_type, MarketType::UpDown { .. }) {
+                // Update live prices from scanner (refreshed every 60s)
+                let yes_f = m.implied_prob_yes.to_f64().unwrap_or(0.5);
+                let no_f = m.implied_prob_no.to_f64().unwrap_or(0.5);
+                self.live_poly_prices.insert(m.condition_id.clone(), (yes_f, no_f));
                 self.markets.insert(m.condition_id.clone(), m);
             }
         }
@@ -238,6 +231,7 @@ impl ResolutionSniperStrategy {
             self.markets.remove(&id);
             self.entered_markets.remove(&id);
             self.strike_prices.remove(&id);
+            self.live_poly_prices.remove(&id);
         }
     }
 
@@ -298,6 +292,17 @@ impl Strategy for ResolutionSniperStrategy {
             StrategyEvent::PriceUpdate(price) => self.on_price_update(&price),
             StrategyEvent::PolymarketUpdate(PolymarketUpdate::MarketsDiscovered(markets)) => {
                 self.on_markets_discovered(markets);
+                Vec::new()
+            }
+            StrategyEvent::PolymarketUpdate(PolymarketUpdate::PriceUpdate {
+                condition_id,
+                yes_price,
+                no_price,
+            }) => {
+                self.live_poly_prices.insert(
+                    condition_id,
+                    (yes_price.to_f64().unwrap_or(0.5), no_price.to_f64().unwrap_or(0.5)),
+                );
                 Vec::new()
             }
             _ => Vec::new(),
