@@ -151,14 +151,18 @@ impl OrbStrategy {
         }
     }
 
-    /// Half-Kelly position sizing: bigger edge → bigger bet.
-    fn kelly_size(&self, edge: f64, implied_prob: f64) -> Decimal {
-        let odds = 1.0 / implied_prob - 1.0;
-        let win_prob = implied_prob + edge;
-        let kelly_f = (odds * win_prob - (1.0 - win_prob)) / odds;
-        let half_kelly = kelly_f * 0.5;
-        // Clamp between 25% and 100% of max position (Polymarket min order is $5)
-        let fraction = half_kelly.clamp(0.25, 1.0);
+    /// Tiered position sizing: bigger move → bigger bet.
+    ///   $40+  → 33% of max
+    ///   $50+  → 50% of max
+    ///   $100+ → 100% of max
+    fn tiered_size(&self, btc_move_abs: f64) -> Decimal {
+        let fraction = if btc_move_abs >= 100.0 {
+            1.0
+        } else if btc_move_abs >= 50.0 {
+            0.5
+        } else {
+            0.33
+        };
         let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
         Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
     }
@@ -290,7 +294,7 @@ impl OrbStrategy {
             return None;
         }
 
-        let size_usd = self.kelly_size(edge, implied_prob);
+        let size_usd = self.tiered_size(btc_move_abs);
         let atr_multiple = atr_val.map(|a| if a > 0.0 { btc_move_abs / a } else { 0.0 });
 
         info!(
