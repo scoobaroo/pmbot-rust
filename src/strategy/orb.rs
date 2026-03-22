@@ -28,6 +28,12 @@ const ATR_PERIOD: usize = 14;
 /// Minimum ATR multiple for a move to qualify. Below this, the move is noise.
 const MIN_ATR_MULTIPLE: f64 = 0.7;
 
+/// Maximum percentage of bankroll to risk per trade (3-5%).
+const MAX_RISK_PER_TRADE_PCT: f64 = 0.04; // 4% of bankroll per trade
+
+/// Maximum percentage of bankroll in open positions at once.
+const MAX_TOTAL_EXPOSURE_PCT: f64 = 0.25; // 25% max deployed at once
+
 /// Take profit floor: exit when book bid reaches this level.
 const TAKE_PROFIT_MIN: f64 = 0.75;
 
@@ -200,6 +206,9 @@ pub struct OrbStrategy {
     web_state: Option<SharedWebState>,
     /// Maps order_id → condition_id so we can link OrderFilled back to position.
     pending_orders: HashMap<String, String>,
+    /// Estimated bankroll for dynamic position sizing.
+    /// Starts from config max_position_usd * 10, adjusts with wins/losses.
+    bankroll: f64,
 }
 
 impl OrbStrategy {
@@ -219,7 +228,15 @@ impl OrbStrategy {
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),
+            bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
         }
+    }
+
+    /// Set the starting bankroll (call before running if known).
+    pub fn with_bankroll(mut self, bankroll: f64) -> Self {
+        self.bankroll = bankroll;
+        info!(bankroll = format!("${:.0}", bankroll), "ORB: bankroll set");
+        self
     }
 
     pub fn with_book_cache(mut self, cache: BookCache) -> Self {
@@ -415,28 +432,46 @@ impl OrbStrategy {
         }
     }
 
-    /// Tiered position sizing: bigger move → bigger bet, velocity entries sized down.
+    /// Dynamic position sizing: 3-5% of bankroll, scaled by signal strength.
     ///
-    /// Velocity entries (≤20s): smaller size — accuracy is lower but entry price
-    /// is much better (buying at 55¢ vs 75¢). Take-profit exits protect downside.
+    /// Base size = 4% of bankroll. Tiered by signal quality:
+    ///   Velocity (≤20s): 50-100% of base (smaller but better price)
+    ///   Confirmed large (0.15%+): 100% of base
+    ///   Confirmed medium (0.07%+): 75% of base
+    ///   Confirmed small (0.06%+): 50% of base
+    ///   Mid-window (150s+): 100% of base (highest accuracy)
     ///
-    /// Confirmed entries (30s+): standard sizing from backtested tiers.
-    /// Mid-window (150s+): larger sizing — highest accuracy.
+    /// Also checks total exposure — won't exceed 25% of bankroll in open positions.
     fn tiered_size(&self, move_pct: f64, elapsed_secs: i64) -> Decimal {
+        let base = self.bankroll * MAX_RISK_PER_TRADE_PCT;
+
         let fraction = if elapsed_secs <= 20 {
-            // Velocity entries: smaller size, better price
-            if move_pct >= 0.15 { 0.50 }      // massive fast move
-            else if move_pct >= 0.10 { 0.33 }  // strong fast move
-            else { 0.25 }                       // decent fast move
+            if move_pct >= 0.15 { 1.0 }
+            else if move_pct >= 0.10 { 0.75 }
+            else { 0.50 }
         } else if elapsed_secs >= 150 {
-            if move_pct >= 0.15 { 1.0 } else { 0.75 }
+            1.0
         } else {
             if move_pct >= 0.15 { 1.0 }
-            else if move_pct >= 0.07 { 0.5 }
-            else { 0.25 }
+            else if move_pct >= 0.07 { 0.75 }
+            else { 0.50 }
         };
-        let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
-        Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
+
+        let size = base * fraction;
+
+        // Cap total exposure: don't exceed 25% of bankroll across all open positions
+        let current_exposure: f64 = self.open_positions.values()
+            .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
+            .sum();
+        let remaining = (self.bankroll * MAX_TOTAL_EXPOSURE_PCT) - current_exposure;
+        let size = size.min(remaining.max(0.0));
+
+        // Minimum viable order size ($5)
+        if size < 5.0 {
+            return Decimal::ZERO;
+        }
+
+        Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO)
     }
 
     fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
@@ -759,6 +794,14 @@ impl OrbStrategy {
         }
 
         let size_usd = self.tiered_size(move_pct, elapsed);
+        if size_usd == Decimal::ZERO {
+            debug!(
+                question = %market.question,
+                bankroll = format!("${:.0}", self.bankroll),
+                "ORB: max exposure reached or bankroll too low — skipping"
+            );
+            return None;
+        }
         let atr_multiple = atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 });
 
         info!(
@@ -1162,6 +1205,14 @@ impl Strategy for OrbStrategy {
                             );
                         }
 
+                        // Adjust bankroll based on outcome
+                        self.bankroll += pnl;
+                        info!(
+                            bankroll = format!("${:.0}", self.bankroll),
+                            pnl = format!("{:+.2}", pnl),
+                            "ORB: bankroll updated"
+                        );
+
                         // Clean up position
                         self.open_positions.remove(condition_id);
                     }
@@ -1196,6 +1247,7 @@ mod tests {
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),
+            bankroll: 1000.0,
         }
     }
 

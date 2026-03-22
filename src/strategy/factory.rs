@@ -1,4 +1,5 @@
 use crate::config::{Config, StrategyName};
+use rust_decimal::prelude::*;
 use crate::polymarket::ws_orderbook::BookCache;
 use crate::strategy::black_scholes::BlackScholesStrategy;
 use crate::strategy::bollinger::BollingerBandsStrategy;
@@ -56,6 +57,12 @@ pub fn create_strategy(
             if let Some(ws) = web_state {
                 s = s.with_web_state(ws);
             }
+            // Set bankroll from BANKROLL env var (default: max_position_usd * 10)
+            let bankroll: f64 = std::env::var("BANKROLL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0);
+            s = s.with_bankroll(bankroll);
             Box::new(s)
         }
         StrategyName::Sniper => {
