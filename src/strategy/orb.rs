@@ -11,6 +11,8 @@ use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use tracing::{debug, info, warn};
 
 /// Default half-spread when no live book data is available.
@@ -31,12 +33,122 @@ const TAKE_PROFIT_MIN: f64 = 0.75;
 /// Take profit ceiling: above this, let it resolve to $1.00 instead of paying exit fees.
 const TAKE_PROFIT_MAX: f64 = 0.95;
 
-/// Tracks an open ORB position for early exit logic.
+/// Tracks an open ORB position for early exit logic and data recording.
 #[derive(Debug, Clone)]
 struct OrbPosition {
     side: Side,
     entry_price: Decimal,
     size_usd: Decimal,
+    /// Timestamp of entry signal.
+    entry_time: DateTime<Utc>,
+    /// Symbol (BTC-USD / ETH-USD).
+    symbol: String,
+    /// Accuracy tier at entry.
+    accuracy: f64,
+    /// Computed edge at entry.
+    edge: f64,
+    /// Trade flow at entry.
+    flow: f64,
+    /// Move percentage at entry.
+    move_pct: f64,
+    /// ATR multiple at entry.
+    atr_multiple: f64,
+    /// Window duration (300 or 900).
+    window_secs: u32,
+    /// Max favorable excursion — peak book bid seen after entry.
+    max_bid_seen: f64,
+    /// Max implied prob seen after entry (for comparison with bid).
+    max_implied_seen: f64,
+}
+
+/// Writes structured CSV data for post-session analysis.
+struct OrbDataLogger;
+
+impl OrbDataLogger {
+    const TRADES_FILE: &'static str = "data/orb_trades.csv";
+    const REJECTIONS_FILE: &'static str = "data/orb_rejections.csv";
+
+    fn log_entry(pos: &OrbPosition, condition_id: &str) {
+        let header = "timestamp,condition_id,symbol,side,window_secs,entry_price,size_usd,\
+                       accuracy,edge,flow,move_pct,atr_multiple";
+        let row = format!(
+            "{},{},{},{},{},{:.4},{},{:.3},{:.4},{:.3},{:.4},{:.2}",
+            pos.entry_time.to_rfc3339(),
+            condition_id,
+            pos.symbol,
+            pos.side,
+            pos.window_secs,
+            pos.entry_price,
+            pos.size_usd,
+            pos.accuracy,
+            pos.edge,
+            pos.flow,
+            pos.move_pct,
+            pos.atr_multiple,
+        );
+        Self::append(Self::TRADES_FILE, header, &row);
+    }
+
+    fn log_exit(
+        pos: &OrbPosition,
+        condition_id: &str,
+        exit_type: &str,
+        exit_price: f64,
+        pnl_pct: f64,
+    ) {
+        // Append exit columns to a separate line referencing the same condition_id
+        let header = "timestamp,condition_id,symbol,exit_type,entry_price,exit_price,\
+                       pnl_pct,max_bid_seen,max_implied_seen,hold_secs";
+        let hold_secs = (Utc::now() - pos.entry_time).num_seconds();
+        let row = format!(
+            "{},{},{},{},{:.4},{:.4},{:.2},{:.4},{:.4},{}",
+            Utc::now().to_rfc3339(),
+            condition_id,
+            pos.symbol,
+            exit_type,
+            pos.entry_price,
+            exit_price,
+            pnl_pct,
+            pos.max_bid_seen,
+            pos.max_implied_seen,
+            hold_secs,
+        );
+        Self::append("data/orb_exits.csv", header, &row);
+    }
+
+    fn log_rejection(
+        condition_id: &str,
+        symbol: &str,
+        reason: &str,
+        move_pct: f64,
+        flow: f64,
+        elapsed: i64,
+        atr_multiple: f64,
+    ) {
+        let header = "timestamp,condition_id,symbol,reason,move_pct,flow,elapsed_secs,atr_multiple";
+        let row = format!(
+            "{},{},{},{},{:.4},{:.3},{},{:.2}",
+            Utc::now().to_rfc3339(),
+            condition_id,
+            symbol,
+            reason,
+            move_pct,
+            flow,
+            elapsed,
+            atr_multiple,
+        );
+        Self::append(Self::REJECTIONS_FILE, header, &row);
+    }
+
+    fn append(path: &str, header: &str, row: &str) {
+        let file_exists = std::path::Path::new(path).exists();
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            if !file_exists {
+                let _ = writeln!(f, "{}", header);
+            }
+            let _ = writeln!(f, "{}", row);
+        }
+    }
 }
 
 /// Opening Range Breakout strategy for Polymarket 5-minute BTC UpDown markets.
@@ -303,6 +415,10 @@ impl OrbStrategy {
                     atr_multiple = format!("{:.2}", move_abs / atr),
                     "ORB: move below ATR threshold"
                 );
+                OrbDataLogger::log_rejection(
+                    &market.condition_id, &market.underlying_symbol,
+                    "atr_filter", move_pct, price.trade_flow_imbalance, elapsed, move_abs / atr,
+                );
                 return None;
             }
         }
@@ -317,6 +433,11 @@ impl OrbStrategy {
                     price_move = format!("{:+.1}", price_move),
                     prev_move = format!("{:.1}", prev_move),
                     "ORB: momentum stalling or reversing — skipping"
+                );
+                OrbDataLogger::log_rejection(
+                    &market.condition_id, &market.underlying_symbol,
+                    "momentum_stall", move_pct, price.trade_flow_imbalance, elapsed,
+                    atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
                 );
                 return None;
             }
@@ -334,6 +455,11 @@ impl OrbStrategy {
                     elapsed_secs = elapsed,
                     atr = format!("{:.1}", atr_val.unwrap_or(0.0)),
                     "ORB: move too small for any accuracy tier"
+                );
+                OrbDataLogger::log_rejection(
+                    &market.condition_id, &market.underlying_symbol,
+                    "move_too_small", move_pct, price.trade_flow_imbalance, elapsed,
+                    atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
                 );
                 return None;
             }
@@ -353,6 +479,11 @@ impl OrbStrategy {
                 flow = format!("{:.2}", flow),
                 flow_strong,
                 "ORB: flow doesn't confirm direction or too weak (<0.3)"
+            );
+            OrbDataLogger::log_rejection(
+                &market.condition_id, &market.underlying_symbol,
+                "weak_flow", move_pct, flow, elapsed,
+                atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
             );
             return None;
         }
@@ -404,6 +535,11 @@ impl OrbStrategy {
                 edge = format!("{:.1}%", edge * 100.0),
                 "ORB: no edge after fees"
             );
+            OrbDataLogger::log_rejection(
+                &market.condition_id, &market.underlying_symbol,
+                "no_edge", move_pct, flow, elapsed,
+                atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
+            );
             return None;
         }
 
@@ -427,12 +563,29 @@ impl OrbStrategy {
             "ORB: breakout signal"
         );
 
+        let window_secs_u32 = match market.market_type {
+            MarketType::UpDown { window_secs, .. } => window_secs,
+            _ => 300,
+        };
+
         // Track position for one-entry-per-market and early exit
-        self.open_positions.insert(market.condition_id.clone(), OrbPosition {
+        let pos = OrbPosition {
             side,
             entry_price: aggressive_price,
             size_usd,
-        });
+            entry_time: self.current_time(),
+            symbol: market.underlying_symbol.clone(),
+            accuracy,
+            edge,
+            flow,
+            move_pct,
+            atr_multiple: atr_multiple.unwrap_or(0.0),
+            window_secs: window_secs_u32 as u32,
+            max_bid_seen: 0.0,
+            max_implied_seen: 0.0,
+        };
+        OrbDataLogger::log_entry(&pos, &market.condition_id);
+        self.open_positions.insert(market.condition_id.clone(), pos);
 
         Some(TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
@@ -466,6 +619,22 @@ impl OrbStrategy {
             .collect();
 
         for cid in &expired {
+            // Log resolution for positions that held to expiry (didn't take profit)
+            if let Some(pos) = self.open_positions.get(cid) {
+                OrbDataLogger::log_exit(
+                    pos, cid, "resolution", 0.0, // actual P&L unknown here — filled by paper tracker
+                    0.0,
+                );
+                info!(
+                    condition_id = %cid,
+                    symbol = %pos.symbol,
+                    side = %pos.side,
+                    max_bid = format!("{:.2}", pos.max_bid_seen),
+                    max_implied = format!("{:.2}", pos.max_implied_seen),
+                    entry = format!("{:.2}", pos.entry_price),
+                    "ORB: position held to resolution — MFE data logged"
+                );
+            }
             self.markets.remove(cid);
             self.updown_start_prices.remove(cid);
             self.open_positions.remove(cid);
@@ -566,25 +735,38 @@ impl Strategy for OrbStrategy {
                             market.implied_prob_no = no_price;
                         }
 
-                        // --- Take-profit exit based on orderbook best bid ---
-                        // The best bid is what someone will actually pay us — the real
-                        // signal for profit, not the implied midpoint.
-                        if let Some(pos) = self.open_positions.get(&condition_id) {
-                            let token_id = match pos.side {
-                                Side::Buy => self.markets.get(&condition_id).map(|m| m.token_id_yes.clone()),
-                                Side::Sell => self.markets.get(&condition_id).map(|m| m.token_id_no.clone()),
+                        // --- MFE tracking + take-profit exit based on orderbook best bid ---
+                        if let Some(pos) = self.open_positions.get_mut(&condition_id) {
+                            let (current_implied, token_id) = match pos.side {
+                                Side::Buy => (yes_price.to_f64().unwrap_or(0.0), self.markets.get(&condition_id).map(|m| m.token_id_yes.clone())),
+                                Side::Sell => (no_price.to_f64().unwrap_or(0.0), self.markets.get(&condition_id).map(|m| m.token_id_no.clone())),
                             };
+
+                            // Track max implied probability seen (MFE data)
+                            if current_implied > pos.max_implied_seen {
+                                pos.max_implied_seen = current_implied;
+                            }
 
                             if let Some(tid) = token_id {
                                 if let Some(best_bid) = self.get_book_bid(&tid) {
                                     let bid_f64 = best_bid.to_f64().unwrap_or(0.0);
-                                    let entry_f64 = pos.entry_price.to_f64().unwrap_or(0.5);
 
-                                    // Take profit when best bid is in range — this is our
-                                    // actual realizable exit price
+                                    // Track max bid seen (realizable MFE)
+                                    if let Some(pos) = self.open_positions.get_mut(&condition_id) {
+                                        if bid_f64 > pos.max_bid_seen {
+                                            pos.max_bid_seen = bid_f64;
+                                        }
+                                    }
+
+                                    let entry_f64 = self.open_positions.get(&condition_id)
+                                        .map(|p| p.entry_price.to_f64().unwrap_or(0.5))
+                                        .unwrap_or(0.5);
+
+                                    // Take profit when best bid is in range
                                     if bid_f64 >= TAKE_PROFIT_MIN && bid_f64 <= TAKE_PROFIT_MAX {
                                         if let Some(market) = self.markets.get(&condition_id).cloned() {
                                             let profit_pct = (bid_f64 - entry_f64) / entry_f64 * 100.0;
+                                            let pos = self.open_positions.get(&condition_id).unwrap().clone();
 
                                             info!(
                                                 condition_id = %condition_id,
@@ -592,7 +774,13 @@ impl Strategy for OrbStrategy {
                                                 entry = format!("{:.2}", entry_f64),
                                                 best_bid = %best_bid,
                                                 profit = format!("{:+.1}%", profit_pct),
+                                                max_bid = format!("{:.2}", pos.max_bid_seen),
+                                                max_implied = format!("{:.2}", pos.max_implied_seen),
                                                 "ORB: take-profit exit at book bid"
+                                            );
+
+                                            OrbDataLogger::log_exit(
+                                                &pos, &condition_id, "take_profit", bid_f64, profit_pct,
                                             );
 
                                             let signal = TradeSignal {
@@ -603,7 +791,7 @@ impl Strategy for OrbStrategy {
                                                 price: best_bid,
                                                 metadata: SignalMetadata::Orb {
                                                     btc_move: 0.0,
-                                                    accuracy_tier: 0.0,
+                                                    accuracy_tier: pos.accuracy,
                                                     implied_prob: bid_f64,
                                                     edge: profit_pct / 100.0,
                                                     start_price: 0.0,
@@ -724,6 +912,24 @@ mod tests {
             mark_price: None,
             binance_mid: Some(Decimal::from_f64_retain(vwap).unwrap()),
             timestamp: ts,
+        }
+    }
+
+    fn make_test_position(side: Side, entry_price: f64, size_usd: f64) -> OrbPosition {
+        OrbPosition {
+            side,
+            entry_price: Decimal::from_f64_retain(entry_price).unwrap(),
+            size_usd: Decimal::from_f64_retain(size_usd).unwrap(),
+            entry_time: Utc::now(),
+            symbol: "BTC-USD".to_string(),
+            accuracy: 0.76,
+            edge: 0.10,
+            flow: 0.5,
+            move_pct: 0.07,
+            atr_multiple: 1.5,
+            window_secs: 300,
+            max_bid_seen: 0.0,
+            max_implied_seen: 0.0,
         }
     }
 
@@ -906,11 +1112,7 @@ mod tests {
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1);
 
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Buy,
-            entry_price: dec!(0.60),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
 
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty());
@@ -1118,11 +1320,7 @@ mod tests {
         // Set up a market and an open position (bought YES at 0.60)
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Buy,
-            entry_price: dec!(0.60),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80100.0, now),
@@ -1153,11 +1351,7 @@ mod tests {
 
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Buy,
-            entry_price: dec!(0.60),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80050.0, now),
@@ -1185,11 +1379,7 @@ mod tests {
 
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Buy,
-            entry_price: dec!(0.60),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80200.0, now),
@@ -1218,11 +1408,7 @@ mod tests {
         // No book cache at all — should not exit even if implied is high
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Buy,
-            entry_price: dec!(0.60),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80100.0, now),
@@ -1249,11 +1435,7 @@ mod tests {
         // Holding a NO position (Side::Sell)
         let market = make_updown_market("m1", 80000.0, window_start, 0.45);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), OrbPosition {
-            side: Side::Sell,
-            entry_price: dec!(0.55),
-            size_usd: dec!(50),
-        });
+        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Sell, 0.55, 50.0));
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 79800.0, now),
