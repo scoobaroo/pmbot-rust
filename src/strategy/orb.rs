@@ -58,6 +58,8 @@ pub struct OrbStrategy {
     true_ranges: HashMap<String, VecDeque<f64>>,
     /// Previous candle close per symbol (needed for true range calculation).
     prev_close: HashMap<String, f64>,
+    /// Previous VWAP per symbol — used to confirm momentum is sustained at entry.
+    prev_vwap: HashMap<String, f64>,
 }
 
 impl OrbStrategy {
@@ -74,6 +76,7 @@ impl OrbStrategy {
             max_position_usd: config.max_position_usd,
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
+            prev_vwap: HashMap::new(),
         }
     }
 
@@ -167,12 +170,11 @@ impl OrbStrategy {
         }
 
         // === Early window — opening range breakout ===
+        // 72% tier (0.05% at 60s) dropped — edge too thin after fees + aggressive pricing
         if move_pct >= 0.15 && elapsed_secs >= 30 {
             Some(0.92)
         } else if move_pct >= 0.07 && elapsed_secs >= 45 {
             Some(0.76)
-        } else if move_pct >= 0.05 && elapsed_secs >= 60 {
-            Some(0.72)
         } else {
             None
         }
@@ -279,6 +281,21 @@ impl OrbStrategy {
             }
         }
 
+        // --- Momentum filter: price must still be moving in breakout direction ---
+        // Catches false breakouts where BTC spikes then reverses before we enter.
+        if let Some(&prev) = self.prev_vwap.get(&market.underlying_symbol) {
+            let prev_move = (prev - start_price).abs();
+            if move_abs <= prev_move {
+                debug!(
+                    question = %market.question,
+                    price_move = format!("{:+.1}", price_move),
+                    prev_move = format!("{:.1}", prev_move),
+                    "ORB: momentum stalling or reversing — skipping"
+                );
+                return None;
+            }
+        }
+
         let accuracy = match Self::empirical_accuracy(move_pct, elapsed) {
             Some(a) => a,
             None => {
@@ -296,17 +313,20 @@ impl OrbStrategy {
             }
         };
 
-        // --- Volume filter: require trade flow confirmation on lower tiers ---
+        // --- Volume filter: require strong flow confirmation on ALL tiers ---
+        // Weak flow = noise/chop. Require both correct direction AND magnitude ≥0.3.
         let flow = price.trade_flow_imbalance;
         let flow_confirms = (price_move > 0.0 && flow > 0.0) || (price_move < 0.0 && flow < 0.0);
+        let flow_strong = flow.abs() >= 0.3;
 
-        if move_pct < 0.07 && !flow_confirms {
+        if !flow_confirms || !flow_strong {
             debug!(
                 question = %market.question,
                 price_move = format!("{:+.1}", price_move),
                 move_pct = format!("{:.3}%", move_pct),
                 flow = format!("{:.2}", flow),
-                "ORB: volume flow doesn't confirm direction"
+                flow_strong,
+                "ORB: flow doesn't confirm direction or too weak (<0.3)"
             );
             return None;
         }
@@ -446,6 +466,11 @@ impl Strategy for OrbStrategy {
     fn on_event(&mut self, event: StrategyEvent) -> Vec<TradeSignal> {
         match event {
             StrategyEvent::PriceUpdate(price) => {
+                // Save previous VWAP before overwriting — used for momentum confirmation
+                if let Some(old) = self.latest_prices.get(&price.symbol) {
+                    self.prev_vwap
+                        .insert(price.symbol.clone(), old.vwap.to_f64().unwrap_or(0.0));
+                }
                 self.latest_prices.insert(price.symbol.clone(), price);
                 self.gc_expired_markets();
                 let signals = self.evaluate_all_markets();
@@ -561,6 +586,7 @@ mod tests {
             max_position_usd: dec!(100),
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
+            prev_vwap: HashMap::new(),
         }
     }
 
@@ -633,9 +659,9 @@ mod tests {
         // Too small at any time
         assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90), None);
-        // 0.05% needs 60s
+        // 0.05% at 60s — dropped (72% tier too thin after fees)
         assert_eq!(OrbStrategy::empirical_accuracy(0.05, 59), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60), Some(0.72));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60), None);
         // 0.07% needs 45s
         assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45), Some(0.76));
@@ -866,12 +892,12 @@ mod tests {
     }
 
     #[test]
-    fn test_volume_filter_skipped_for_large_moves() {
+    fn test_volume_filter_rejects_weak_flow_on_large_moves() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // $60 move up with negative flow — large moves skip volume filter
+        // $60 move up with negative flow — ALL tiers now require strong confirming flow
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
         strategy
@@ -884,10 +910,9 @@ mod tests {
         seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
-        assert_eq!(
-            signals.len(),
-            1,
-            "$50+ moves should bypass volume filter"
+        assert!(
+            signals.is_empty(),
+            "should reject large move with counter-flow"
         );
     }
 
@@ -931,5 +956,51 @@ mod tests {
 
         let signals = strategy.evaluate_all_markets();
         assert_eq!(signals.len(), 1, "should still signal when ATR unavailable");
+    }
+
+    #[test]
+    fn test_momentum_filter_rejects_stalling_move() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        // Previous VWAP was further from start than current → move is reversing
+        strategy.prev_vwap.insert("BTC-USD".to_string(), 80070.0);
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert!(signals.is_empty(), "should reject when momentum is stalling");
+    }
+
+    #[test]
+    fn test_momentum_filter_passes_accelerating_move() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        // Previous VWAP was closer to start than current → move is accelerating
+        strategy.prev_vwap.insert("BTC-USD".to_string(), 80050.0);
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert_eq!(signals.len(), 1, "should signal when momentum is accelerating");
     }
 }
