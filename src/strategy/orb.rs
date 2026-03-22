@@ -965,11 +965,31 @@ impl Strategy for OrbStrategy {
             StrategyEvent::ExecutionFeedback(event) => {
                 match &event {
                     crate::types::events::ExecutionEvent::OrderPlaced(order) => {
-                        // Track order_id → condition_id for linking fills to positions
-                        self.pending_orders.insert(
-                            order.id.clone(),
-                            order.condition_id.clone(),
-                        );
+                        // Push FILLED event to dashboard immediately on order placement
+                        // (OrderFilled events don't reliably fire from CLOB)
+                        if let Some(pos) = self.open_positions.get(&order.condition_id) {
+                            info!(
+                                condition_id = %order.condition_id,
+                                side = %order.side,
+                                price = %order.price,
+                                size = %order.size,
+                                "ORB: order placed"
+                            );
+                            self.push_web_event(OrbTradeEvent {
+                                timestamp: Utc::now().to_rfc3339(),
+                                symbol: pos.symbol.clone(),
+                                side: format!("{}", order.side),
+                                action: "FILLED".to_string(),
+                                price: order.price.to_f64().unwrap_or(0.0),
+                                size_usd: (order.price * order.size).to_f64().unwrap_or(0.0),
+                                move_pct: pos.move_pct,
+                                accuracy: pos.accuracy,
+                                edge: pos.edge,
+                                flow: pos.flow,
+                                window_secs: pos.window_secs,
+                                reason: String::new(),
+                            });
+                        }
                     }
                     crate::types::events::ExecutionEvent::OrderFilled(fill) => {
                         info!(
@@ -978,29 +998,8 @@ impl Strategy for OrbStrategy {
                             size = %fill.size,
                             "ORB: order filled"
                         );
-
-                        // Push FILLED event to dashboard using position data
-                        if let Some(cid) = self.pending_orders.remove(&fill.order_id) {
-                            if let Some(pos) = self.open_positions.get(&cid) {
-                                self.push_web_event(OrbTradeEvent {
-                                    timestamp: fill.timestamp.to_rfc3339(),
-                                    symbol: pos.symbol.clone(),
-                                    side: format!("{}", fill.side),
-                                    action: "FILLED".to_string(),
-                                    price: fill.price.to_f64().unwrap_or(0.0),
-                                    size_usd: (fill.price * fill.size).to_f64().unwrap_or(0.0),
-                                    move_pct: pos.move_pct,
-                                    accuracy: pos.accuracy,
-                                    edge: pos.edge,
-                                    flow: pos.flow,
-                                    window_secs: pos.window_secs,
-                                    reason: format!("fee: {:.4}", fill.fee),
-                                });
-                            }
-                        }
                     }
                     crate::types::events::ExecutionEvent::OrderFailed { order_id, error } => {
-                        self.pending_orders.remove(order_id);
                         warn!(order_id = %order_id, error = %error, "ORB: order failed");
                     }
                     crate::types::events::ExecutionEvent::MarketResolved { condition_id, pnl, won } => {
