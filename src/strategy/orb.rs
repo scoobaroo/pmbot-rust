@@ -279,25 +279,43 @@ impl OrbStrategy {
         }
     }
 
-    /// Empirical accuracy from backtested ORB tiers (4,389 trades).
-    /// Returns None if the move is too small or hasn't had enough confirmation time.
+    /// Empirical accuracy from backtested ORB tiers + velocity-based fast entries.
     ///
-    /// Uses percentage-based thresholds so it works across BTC and ETH:
-    ///   BTC $87K: 0.05% = ~$44, 0.10% = ~$87, 0.15% = ~$131
-    ///   ETH $2K:  0.05% = ~$1,  0.10% = ~$2,  0.15% = ~$3
+    /// Two systems:
+    /// 1. **Velocity tiers** (< 20s): large moves happening fast = Polymarket hasn't
+    ///    repriced yet. Lower accuracy but much better entry prices (55-60¢ vs 75¢+).
+    ///    Flow + momentum filters protect against false breakouts.
+    ///    Take-profit exits protect against reversals.
     ///
-    /// Two entry windows based on backtest data (72 windows per coin):
+    /// 2. **Confirmed tiers** (20s+): original backtested accuracy levels.
     ///
-    /// Early window (0-120s):
-    ///   0.05% at 60s  → BTC 76%, ETH 71%
-    ///   0.07% at 45s  → BTC 83%, ETH 76%
-    ///   0.15% at 30s  → BTC 92%, ETH 79%
+    /// Velocity = move_pct / elapsed. Fast violent moves are the highest-edge entries
+    /// because we're buying before Polymarket market makers adjust.
     ///
-    /// Mid window (150-240s):
-    ///   0.05% at 150s → BTC 87%, ETH 83%
-    ///   0.10% at 180s → BTC 90%, ETH 91%
-    ///   0.20% at 180s → BTC 100%, ETH 94%
+    /// Percentage thresholds (cross-coin):
+    ///   BTC $70K: 0.06% = ~$42, 0.10% = ~$70, 0.15% = ~$105
+    ///   ETH $2K:  0.06% = ~$1.2, 0.10% = ~$2,  0.15% = ~$3
     fn empirical_accuracy(move_pct: f64, elapsed_secs: i64) -> Option<f64> {
+        let elapsed = elapsed_secs.max(1); // avoid division by zero
+
+        // === Velocity tiers: fast entries before market reprices ===
+        // The edge here isn't accuracy — it's entry price. At 10s the token
+        // is still at 50-55¢. By 45s it's at 75¢+. Same move, worse price.
+        if elapsed <= 10 {
+            // Violent breakout in ≤10s — market hasn't repriced
+            if move_pct >= 0.15 { return Some(0.85); }  // massive move, very fast
+            if move_pct >= 0.10 { return Some(0.72); }  // strong move, very fast
+        } else if elapsed <= 15 {
+            if move_pct >= 0.15 { return Some(0.88); }
+            if move_pct >= 0.10 { return Some(0.75); }
+            if move_pct >= 0.07 { return Some(0.68); }
+        } else if elapsed <= 20 {
+            if move_pct >= 0.15 { return Some(0.90); }
+            if move_pct >= 0.10 { return Some(0.78); }
+            if move_pct >= 0.07 { return Some(0.72); }
+            if move_pct >= 0.06 { return Some(0.68); }
+        }
+
         // === Mid-window momentum (150s+) — highest accuracy entries ===
         if elapsed_secs >= 180 {
             if move_pct >= 0.20 { return Some(0.94); }
@@ -308,33 +326,37 @@ impl OrbStrategy {
             if move_pct >= 0.05 { return Some(0.87); }
         }
 
-        // === Early window — opening range breakout ===
+        // === Confirmed window (30-120s) — backtested accuracy ===
         if move_pct >= 0.15 && elapsed_secs >= 30 {
             Some(0.92)
         } else if move_pct >= 0.07 && elapsed_secs >= 45 {
             Some(0.76)
         } else if move_pct >= 0.06 && elapsed_secs >= 50 {
-            // ~$50 at BTC $84k. ~74% accuracy — thin for hold-to-resolution but
-            // viable with take-profit exits + flow/momentum filters protecting downside.
             Some(0.74)
         } else {
             None
         }
     }
 
-    /// Tiered position sizing: bigger move → bigger bet.
-    ///   0.06% early  → 25% of max (thin edge, small size)
-    ///   0.07% early  → 50% of max
-    ///   0.15%+ early → 100% of max
-    ///   0.05%+ mid   → 75% of max
-    ///   0.15%+ mid   → 100% of max
+    /// Tiered position sizing: bigger move → bigger bet, velocity entries sized down.
+    ///
+    /// Velocity entries (≤20s): smaller size — accuracy is lower but entry price
+    /// is much better (buying at 55¢ vs 75¢). Take-profit exits protect downside.
+    ///
+    /// Confirmed entries (30s+): standard sizing from backtested tiers.
+    /// Mid-window (150s+): larger sizing — highest accuracy.
     fn tiered_size(&self, move_pct: f64, elapsed_secs: i64) -> Decimal {
-        let fraction = if elapsed_secs >= 150 {
+        let fraction = if elapsed_secs <= 20 {
+            // Velocity entries: smaller size, better price
+            if move_pct >= 0.15 { 0.50 }      // massive fast move
+            else if move_pct >= 0.10 { 0.33 }  // strong fast move
+            else { 0.25 }                       // decent fast move
+        } else if elapsed_secs >= 150 {
             if move_pct >= 0.15 { 1.0 } else { 0.75 }
         } else {
             if move_pct >= 0.15 { 1.0 }
             else if move_pct >= 0.07 { 0.5 }
-            else { 0.25 } // 0.06% tier — smaller size for thinner edge
+            else { 0.25 }
         };
         let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
         Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
@@ -965,12 +987,31 @@ mod tests {
 
     #[test]
     fn test_accuracy_tiers() {
-        // Too small at any time
+        // === Velocity tiers (≤20s) ===
+        // Too small even at high velocity
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 5), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 10), None);
+        // 0.10% in ≤10s — violent breakout
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 8), Some(0.72));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 5), Some(0.85));
+        // 0.07% in ≤15s — strong breakout
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 12), Some(0.68));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 15), Some(0.75));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 14), Some(0.88));
+        // 0.06% in ≤20s — decent breakout
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 18), Some(0.68));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 20), Some(0.72));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 20), Some(0.78));
+
+        // === Confirmed tiers (30s+) ===
+        // Too small at any confirmed time
         assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90), None);
-        // 0.05% at 60s — dropped (72% tier too thin after fees)
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 59), None);
+        // 0.05% — no early tier (dropped)
         assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60), None);
+        // 0.06% needs 50s
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 49), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 50), Some(0.74));
         // 0.07% needs 45s
         assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45), Some(0.76));
@@ -1003,6 +1044,56 @@ mod tests {
 
         let signals = strategy.evaluate_all_markets();
         assert!(signals.is_empty(), "should not signal before 60s");
+    }
+
+    #[test]
+    fn test_velocity_entry_fast_breakout() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 8; // only 8 seconds elapsed
+
+        // 0.10% move ($80 on BTC) in 8 seconds — violent breakout
+        let market = make_updown_market("m1", 80000.0, window_start, 0.52);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        // Strong positive flow confirms real buying pressure
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80080.0, now, 0.6),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert_eq!(signals.len(), 1, "should fire on 0.10% move in 8s");
+        assert_eq!(signals[0].side, Side::Buy);
+
+        // Entry price should be cheap — implied is 0.52, aggressive = 0.57
+        let price_f64 = signals[0].price.to_f64().unwrap();
+        assert!(price_f64 < 0.65, "velocity entry should get cheap price, got {}", price_f64);
+    }
+
+    #[test]
+    fn test_velocity_rejects_small_fast_move() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 8; // 8 seconds
+
+        // 0.05% move in 8s — not big enough for velocity tier
+        let market = make_updown_market("m1", 80000.0, window_start, 0.52);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy
+            .updown_start_prices
+            .insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80040.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert!(signals.is_empty(), "0.05% in 8s should not trigger velocity entry");
     }
 
     #[test]
