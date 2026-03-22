@@ -87,11 +87,21 @@ BINANCE_HEADER = [
     "timestamp", "symbol", "price", "bid", "ask", "volume_24h",
     "quote_volume_24h", "trades_24h", "price_change_pct",
 ]
+FLOW_HEADER = [
+    "timestamp", "symbol", "buy_volume", "sell_volume", "net_flow",
+    "buy_trades", "sell_trades", "vwap_buy", "vwap_sell",
+]
+FUNDING_HEADER = [
+    "timestamp", "symbol", "funding_rate", "mark_price", "index_price",
+    "next_funding_time",
+]
 
 markets_f, markets_w = open_csv("markets.csv", MARKETS_HEADER)
 ticks_f, ticks_w = open_csv("ticks.csv", TICKS_HEADER)
 resolutions_f, resolutions_w = open_csv("resolutions.csv", RESOLUTIONS_HEADER)
 binance_f, binance_w = open_csv("binance.csv", BINANCE_HEADER)
+flow_f, flow_w = open_csv("flow.csv", FLOW_HEADER)
+funding_f, funding_w = open_csv("funding.csv", FUNDING_HEADER)
 binance_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -99,8 +109,13 @@ binance_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 active_markets: dict = {}  # condition_id -> market dict
 seen_condition_ids: set = set()  # all condition_ids we've ever seen
-stats = {"markets": 0, "ticks": 0, "resolutions": 0, "binance_ticks": 0}
+stats = {"markets": 0, "ticks": 0, "resolutions": 0, "binance_ticks": 0, "flow_ticks": 0, "funding_ticks": 0}
 latest_binance: dict = {}  # symbol -> {price, bid, ask, ...}
+latest_funding: dict = {}  # symbol -> {rate, mark, index}
+
+# Rolling 1-second flow buckets for aggTrade aggregation
+flow_buckets: dict = {}  # symbol -> {buy_vol, sell_vol, buy_cost, sell_cost, buy_n, sell_n, last_flush}
+FLOW_FLUSH_INTERVAL = 1.0  # flush flow data every 1 second
 
 # ---------------------------------------------------------------------------
 # Binance WebSocket (runs in background thread)
@@ -110,10 +125,129 @@ BINANCE_SYMBOLS = ["btcusdt", "ethusdt"]
 BINANCE_SYMBOL_MAP = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
 
 
-def start_binance_ws():
-    """Connect to Binance combined stream for real-time price ticks."""
-    streams = "/".join(f"{s}@ticker" for s in BINANCE_SYMBOLS)
-    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+def flush_flow_bucket(symbol: str):
+    """Write accumulated flow data for a symbol and reset the bucket."""
+    bucket = flow_buckets.get(symbol)
+    if not bucket or (bucket["buy_n"] == 0 and bucket["sell_n"] == 0):
+        return
+
+    buy_vol = bucket["buy_vol"]
+    sell_vol = bucket["sell_vol"]
+    net_flow = buy_vol - sell_vol
+    vwap_buy = bucket["buy_cost"] / buy_vol if buy_vol > 0 else 0
+    vwap_sell = bucket["sell_cost"] / sell_vol if sell_vol > 0 else 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    with binance_lock:
+        flow_w.writerow([
+            now, symbol,
+            f"{buy_vol:.4f}", f"{sell_vol:.4f}", f"{net_flow:.4f}",
+            bucket["buy_n"], bucket["sell_n"],
+            f"{vwap_buy:.2f}", f"{vwap_sell:.2f}",
+        ])
+        stats["flow_ticks"] += 1
+        if stats["flow_ticks"] % 100 == 0:
+            flow_f.flush()
+
+    # Reset bucket
+    flow_buckets[symbol] = {
+        "buy_vol": 0, "sell_vol": 0, "buy_cost": 0, "sell_cost": 0,
+        "buy_n": 0, "sell_n": 0, "last_flush": time.time(),
+    }
+
+
+def start_binance_spot_ws():
+    """Spot streams: ticker (price) + aggTrade (buy/sell flow)."""
+    ticker_streams = [f"{s}@ticker" for s in BINANCE_SYMBOLS]
+    agg_streams = [f"{s}@aggTrade" for s in BINANCE_SYMBOLS]
+    all_streams = "/".join(ticker_streams + agg_streams)
+    url = f"wss://stream.binance.com:9443/stream?streams={all_streams}"
+
+    def on_message(ws, message):
+        try:
+            msg = json.loads(message)
+            stream = msg.get("stream", "")
+            data = msg.get("data", msg)
+            symbol_raw = data.get("s", "")
+            symbol = BINANCE_SYMBOL_MAP.get(symbol_raw, symbol_raw)
+
+            if "@ticker" in stream:
+                # Price tick
+                tick = {
+                    "price": float(data.get("c", 0)),
+                    "bid": float(data.get("b", 0)),
+                    "ask": float(data.get("a", 0)),
+                    "volume_24h": float(data.get("v", 0)),
+                    "quote_volume_24h": float(data.get("q", 0)),
+                    "trades_24h": int(data.get("n", 0)),
+                    "price_change_pct": float(data.get("P", 0)),
+                }
+                latest_binance[symbol] = tick
+
+                now = datetime.now(timezone.utc).isoformat()
+                with binance_lock:
+                    binance_w.writerow([
+                        now, symbol,
+                        f"{tick['price']:.2f}", f"{tick['bid']:.2f}", f"{tick['ask']:.2f}",
+                        f"{tick['volume_24h']:.2f}", f"{tick['quote_volume_24h']:.0f}",
+                        tick["trades_24h"], f"{tick['price_change_pct']:.2f}",
+                    ])
+                    stats["binance_ticks"] += 1
+                    if stats["binance_ticks"] % 100 == 0:
+                        binance_f.flush()
+
+            elif "@aggTrade" in stream:
+                # Aggregate trade — accumulate into flow bucket
+                price = float(data.get("p", 0))
+                qty = float(data.get("q", 0))
+                is_buyer_maker = data.get("m", False)  # True = sell, False = buy
+
+                if symbol not in flow_buckets:
+                    flow_buckets[symbol] = {
+                        "buy_vol": 0, "sell_vol": 0, "buy_cost": 0, "sell_cost": 0,
+                        "buy_n": 0, "sell_n": 0, "last_flush": time.time(),
+                    }
+
+                bucket = flow_buckets[symbol]
+                if is_buyer_maker:
+                    # Seller initiated (taker sell)
+                    bucket["sell_vol"] += qty
+                    bucket["sell_cost"] += qty * price
+                    bucket["sell_n"] += 1
+                else:
+                    # Buyer initiated (taker buy)
+                    bucket["buy_vol"] += qty
+                    bucket["buy_cost"] += qty * price
+                    bucket["buy_n"] += 1
+
+                # Flush every second
+                if time.time() - bucket["last_flush"] >= FLOW_FLUSH_INTERVAL:
+                    flush_flow_bucket(symbol)
+
+        except Exception as e:
+            log.debug(f"Binance spot WS parse error: {e}")
+
+    def on_error(ws, error):
+        log.warning(f"Binance spot WS error: {error}")
+
+    def on_close(ws, close_status, close_msg):
+        log.warning(f"Binance spot WS closed: {close_status} {close_msg}")
+        time.sleep(3)
+        start_binance_spot_ws()
+
+    def on_open(ws):
+        log.info("Binance spot WebSocket connected (ticker + aggTrade)")
+
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error,
+                                 on_close=on_close, on_open=on_open)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+
+
+def start_binance_futures_ws():
+    """Futures streams: mark price (funding rate, mark/index price) every 1s."""
+    futures_symbols = ["btcusdt", "ethusdt"]
+    streams = "/".join(f"{s}@markPrice@1s" for s in futures_symbols)
+    url = f"wss://fstream.binance.com/stream?streams={streams}"
 
     def on_message(ws, message):
         try:
@@ -122,60 +256,45 @@ def start_binance_ws():
             symbol_raw = data.get("s", "")
             symbol = BINANCE_SYMBOL_MAP.get(symbol_raw, symbol_raw)
 
-            tick = {
-                "price": float(data.get("c", 0)),      # last price
-                "bid": float(data.get("b", 0)),         # best bid
-                "ask": float(data.get("a", 0)),         # best ask
-                "volume_24h": float(data.get("v", 0)),  # base volume
-                "quote_volume_24h": float(data.get("q", 0)),  # quote volume
-                "trades_24h": int(data.get("n", 0)),    # trade count
-                "price_change_pct": float(data.get("P", 0)),  # 24h change %
-            }
+            funding_rate = float(data.get("r", 0))
+            mark_price = float(data.get("p", 0))
+            index_price = float(data.get("i", 0))
+            next_funding = int(data.get("T", 0))
 
-            latest_binance[symbol] = tick
+            latest_funding[symbol] = {
+                "rate": funding_rate,
+                "mark": mark_price,
+                "index": index_price,
+            }
 
             now = datetime.now(timezone.utc).isoformat()
             with binance_lock:
-                binance_w.writerow([
+                funding_w.writerow([
                     now, symbol,
-                    f"{tick['price']:.2f}",
-                    f"{tick['bid']:.2f}",
-                    f"{tick['ask']:.2f}",
-                    f"{tick['volume_24h']:.2f}",
-                    f"{tick['quote_volume_24h']:.0f}",
-                    tick["trades_24h"],
-                    f"{tick['price_change_pct']:.2f}",
+                    f"{funding_rate:.8f}", f"{mark_price:.2f}", f"{index_price:.2f}",
+                    next_funding,
                 ])
-                stats["binance_ticks"] += 1
-                if stats["binance_ticks"] % 100 == 0:
-                    binance_f.flush()
+                stats["funding_ticks"] += 1
+                if stats["funding_ticks"] % 100 == 0:
+                    funding_f.flush()
 
         except Exception as e:
-            log.debug(f"Binance WS parse error: {e}")
+            log.debug(f"Binance futures WS parse error: {e}")
 
     def on_error(ws, error):
-        log.warning(f"Binance WS error: {error}")
+        log.warning(f"Binance futures WS error: {error}")
 
     def on_close(ws, close_status, close_msg):
-        log.warning(f"Binance WS closed: {close_status} {close_msg}")
-        # Reconnect after delay
+        log.warning(f"Binance futures WS closed: {close_status} {close_msg}")
         time.sleep(3)
-        start_binance_ws()
+        start_binance_futures_ws()
 
     def on_open(ws):
-        log.info("Binance WebSocket connected")
+        log.info("Binance futures WebSocket connected (funding + mark price)")
 
-    ws = websocket.WebSocketApp(
-        url,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-        on_open=on_open,
-    )
-
-    thread = threading.Thread(target=ws.run_forever, daemon=True)
-    thread.start()
-    return thread
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error,
+                                 on_close=on_close, on_open=on_open)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -345,9 +464,11 @@ def main():
     log.info(f"Assets: {[s for _, s in ASSETS]}, Windows: {[l for _, l in WINDOWS]}")
     log.info(f"Data dir: {DATA_DIR.resolve()}")
 
-    # Start Binance WebSocket for real-time exchange prices
-    log.info("Starting Binance WebSocket for BTC/ETH price stream...")
-    start_binance_ws()
+    # Start Binance WebSockets for real-time data
+    log.info("Starting Binance spot WS (price + aggTrade flow)...")
+    start_binance_spot_ws()
+    log.info("Starting Binance futures WS (funding rate + mark price)...")
+    start_binance_futures_ws()
 
     last_discovery = 0
     last_status = 0
@@ -402,14 +523,20 @@ def main():
                 ticks_f.flush()
                 with binance_lock:
                     binance_f.flush()
+                    flow_f.flush()
+                    funding_f.flush()
                 prices = " | ".join(
                     f"{s}=${t['price']:.0f}" for s, t in latest_binance.items()
                 )
+                funding_info = " | ".join(
+                    f"{s} fr={t['rate']:.6f}" for s, t in latest_funding.items()
+                )
                 log.info(
                     f"Status: {len(active_markets)} active, "
-                    f"{stats['markets']} discovered, {stats['ticks']} poly ticks, "
-                    f"{stats['binance_ticks']} binance ticks, "
-                    f"{stats['resolutions']} resolved | {prices}"
+                    f"{stats['markets']} disc, {stats['ticks']} poly, "
+                    f"{stats['binance_ticks']} price, {stats['flow_ticks']} flow, "
+                    f"{stats['funding_ticks']} funding, "
+                    f"{stats['resolutions']} resolved | {prices} | {funding_info}"
                 )
 
             time.sleep(BOOK_INTERVAL)
@@ -420,10 +547,10 @@ def main():
         ticks_f.flush()
         with binance_lock:
             binance_f.flush()
-        markets_f.close()
-        ticks_f.close()
-        resolutions_f.close()
-        binance_f.close()
+            flow_f.flush()
+            funding_f.flush()
+        for f in [markets_f, ticks_f, resolutions_f, binance_f, flow_f, funding_f]:
+            f.close()
         log.info(f"Final: {stats}")
 
 
