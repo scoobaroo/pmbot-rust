@@ -625,8 +625,23 @@ impl OrbStrategy {
 
         // Aggressive pricing: bid above implied to sweep the book immediately.
         // Add 5c to implied price (e.g., 0.55 → 0.60) to ensure instant fill.
-        // On 17-25% edge signals, 5c of slippage still leaves 12-20% edge.
         let aggressive_price = (implied_price + Decimal::new(5, 2)).min(Decimal::new(95, 2));
+
+        // Max entry price cap — don't buy above 70¢. Guarantees ≥30% return on win.
+        if aggressive_price > Decimal::new(70, 2) {
+            debug!(
+                question = %market.question,
+                price = format!("{:.2}", aggressive_price),
+                implied = format!("{:.2}", implied_prob),
+                "ORB: entry price too high (>70¢) — return not worth risk"
+            );
+            OrbDataLogger::log_rejection(
+                &market.condition_id, &market.underlying_symbol,
+                "price_too_high", move_pct, flow, elapsed,
+                atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
+            );
+            return None;
+        }
 
         // Deduct trading costs using aggressive price
         let half_spread = self.get_half_spread(token_id);
@@ -1404,8 +1419,8 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.70
-        let market = make_updown_market("m1", 80000.0, window_start, 0.70);
+        // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.60
+        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1426,7 +1441,7 @@ mod tests {
         } = &signals[0].metadata
         {
             assert_eq!(*accuracy_tier, 0.92);
-            assert!(*edge > 0.10, "should have >10% edge on 0.19% move at 0.70 implied + 0.05 premium");
+            assert!(*edge > 0.10, "should have >10% edge on 0.19% move at 0.60 implied + 0.05 premium");
         } else {
             panic!("expected Orb metadata");
         }
