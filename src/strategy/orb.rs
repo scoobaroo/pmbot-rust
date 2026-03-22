@@ -34,6 +34,12 @@ const MAX_RISK_PER_TRADE_PCT: f64 = 0.04; // 4% of bankroll per trade
 /// Maximum percentage of bankroll in open positions at once.
 const MAX_TOTAL_EXPOSURE_PCT: f64 = 0.25; // 25% max deployed at once
 
+/// Pause trading after this many consecutive losses.
+const MAX_CONSECUTIVE_LOSSES: u32 = 3;
+
+/// How long to pause after hitting the loss streak (in seconds).
+const COOLDOWN_SECS: i64 = 1800; // 30 minutes
+
 /// Take profit floor: exit when book bid reaches this level.
 const TAKE_PROFIT_MIN: f64 = 0.75;
 
@@ -209,6 +215,10 @@ pub struct OrbStrategy {
     /// Estimated bankroll for dynamic position sizing.
     /// Starts from config max_position_usd * 10, adjusts with wins/losses.
     bankroll: f64,
+    /// Consecutive loss counter — pauses trading after MAX_CONSECUTIVE_LOSSES.
+    consecutive_losses: u32,
+    /// Timestamp when cooldown expires (resume trading after this time).
+    cooldown_until: Option<DateTime<Utc>>,
 }
 
 impl OrbStrategy {
@@ -229,6 +239,8 @@ impl OrbStrategy {
             web_state: None,
             pending_orders: HashMap::new(),
             bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
+            consecutive_losses: 0,
+            cooldown_until: None,
         }
     }
 
@@ -486,6 +498,20 @@ impl OrbStrategy {
     }
 
     fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
+        // --- Circuit breaker: pause after consecutive losses ---
+        if let Some(cooldown) = self.cooldown_until {
+            if self.current_time() < cooldown {
+                return None; // still in cooldown
+            }
+            // Cooldown expired — resume trading
+            info!(
+                consecutive_losses = self.consecutive_losses,
+                "ORB: cooldown expired — resuming trading"
+            );
+            self.cooldown_until = None;
+            self.consecutive_losses = 0;
+        }
+
         let (window_start_ts, window_secs) = match market.market_type {
             MarketType::UpDown {
                 window_start_ts,
@@ -1207,9 +1233,28 @@ impl Strategy for OrbStrategy {
 
                         // Adjust bankroll based on outcome
                         self.bankroll += pnl;
+
+                        // Track consecutive losses for circuit breaker
+                        if *won {
+                            self.consecutive_losses = 0;
+                        } else {
+                            self.consecutive_losses += 1;
+                            if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES {
+                                let cooldown_end = Utc::now() + chrono::Duration::seconds(COOLDOWN_SECS);
+                                self.cooldown_until = Some(cooldown_end);
+                                warn!(
+                                    consecutive_losses = self.consecutive_losses,
+                                    cooldown_minutes = COOLDOWN_SECS / 60,
+                                    "ORB: loss streak circuit breaker — pausing for {}min",
+                                    COOLDOWN_SECS / 60
+                                );
+                            }
+                        }
+
                         info!(
                             bankroll = format!("${:.0}", self.bankroll),
                             pnl = format!("{:+.2}", pnl),
+                            consecutive_losses = self.consecutive_losses,
                             "ORB: bankroll updated"
                         );
 
@@ -1248,6 +1293,8 @@ mod tests {
             web_state: None,
             pending_orders: HashMap::new(),
             bankroll: 1000.0,
+            consecutive_losses: 0,
+            cooldown_until: None,
         }
     }
 
