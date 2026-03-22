@@ -117,6 +117,7 @@ impl ExecutionEngine {
                 _ = resolve_interval.tick() => {
                     if self.config.mode != RunMode::Backtest {
                         self.resolve_expired_via_api(&exec_tx).await;
+                        self.cancel_stale_orders(&exec_tx).await;
                     }
                 }
             }
@@ -671,6 +672,36 @@ impl ExecutionEngine {
         }
 
         self.paper_tracker.maybe_report();
+    }
+
+    /// Cancel orders that have been open longer than 30 seconds.
+    /// Stale limit orders on 5m/15m markets waste collateral.
+    async fn cancel_stale_orders(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
+        const STALE_SECS: i64 = 30;
+        let now = Utc::now();
+        let stale: Vec<String> = self
+            .open_orders
+            .iter()
+            .filter(|(_, order)| (now - order.created_at).num_seconds() > STALE_SECS)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for order_id in stale {
+            if let Some(client) = &self.client {
+                if let Err(e) = client.cancel_order(&order_id).await {
+                    warn!(order_id = %order_id, error = %e, "failed to cancel stale order");
+                } else {
+                    info!(order_id = %order_id, "cancelled stale order (>30s unfilled)");
+                }
+            }
+            let _ = exec_tx
+                .send(ExecutionEvent::OrderCancelled {
+                    order_id: order_id.clone(),
+                    reason: "stale (>30s)".to_string(),
+                })
+                .await;
+            self.open_orders.remove(&order_id);
+        }
     }
 
     async fn cancel_all_open_orders(&mut self, exec_tx: &mpsc::Sender<ExecutionEvent>) {
