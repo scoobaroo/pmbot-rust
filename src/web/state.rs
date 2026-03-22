@@ -120,12 +120,16 @@ fn load_csv_exits(trades: &mut VecDeque<OrbTradeEvent>, path: &str) {
         let cols: Vec<&str> = line.split(',').collect();
         if cols.len() < 10 { continue; }
         let exit_type = cols[3];
-        let action = if exit_type == "resolution" {
-            // Check pnl to determine won/lost — resolution with pnl > 0 = won
-            let pnl: f64 = cols[6].parse().unwrap_or(0.0);
-            if pnl > 0.0 { "WON" } else { "LOST" }
-        } else {
-            "EXIT"
+        let action = match exit_type {
+            "WON" => "WON",
+            "LOST" => "LOST",
+            "take_profit" => "EXIT",
+            "resolution" => {
+                // Old format — pnl was unknown, check if we can determine from pnl field
+                let pnl: f64 = cols[6].parse().unwrap_or(0.0);
+                if pnl > 0.0 { "WON" } else if pnl < 0.0 { "LOST" } else { continue } // skip unknown
+            }
+            _ => continue,
         };
         let pnl_pct: f64 = cols[6].parse().unwrap_or(0.0);
         trades.push_back(OrbTradeEvent {

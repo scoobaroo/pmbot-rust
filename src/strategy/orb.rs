@@ -783,25 +783,10 @@ impl OrbStrategy {
             .collect();
 
         for cid in &expired {
-            // Log resolution for positions that held to expiry (didn't take profit)
-            if let Some(pos) = self.open_positions.get(cid) {
-                OrbDataLogger::log_exit(
-                    pos, cid, "resolution", 0.0, // actual P&L unknown here — filled by paper tracker
-                    0.0,
-                );
-                info!(
-                    condition_id = %cid,
-                    symbol = %pos.symbol,
-                    side = %pos.side,
-                    max_bid = format!("{:.2}", pos.max_bid_seen),
-                    max_implied = format!("{:.2}", pos.max_implied_seen),
-                    entry = format!("{:.2}", pos.entry_price),
-                    "ORB: position held to resolution — MFE data logged"
-                );
-            }
             self.markets.remove(cid);
             self.updown_start_prices.remove(cid);
-            self.open_positions.remove(cid);
+            // Don't remove open_positions here — wait for MarketResolved
+            // event from execution engine which has the actual W/L outcome.
         }
 
         if !expired.is_empty() {
@@ -921,32 +906,49 @@ impl Strategy for OrbStrategy {
                     }
                     crate::types::events::ExecutionEvent::MarketResolved { condition_id, pnl, won } => {
                         let result = if *won { "WON" } else { "LOST" };
-                        info!(
-                            condition_id = %condition_id,
-                            pnl = format!("{:+.2}", pnl),
-                            result,
-                            "ORB: market resolved"
-                        );
 
-                        // Look up position data for the dashboard event
-                        let (symbol, side, entry_price) = self.open_positions.get(condition_id)
-                            .map(|p| (p.symbol.clone(), format!("{}", p.side), p.entry_price.to_f64().unwrap_or(0.0)))
-                            .unwrap_or_else(|| ("BTC-USD".to_string(), "?".to_string(), 0.0));
+                        // Look up position data before removing
+                        if let Some(pos) = self.open_positions.get(condition_id) {
+                            info!(
+                                condition_id = %condition_id,
+                                symbol = %pos.symbol,
+                                side = %pos.side,
+                                entry = format!("{:.2}", pos.entry_price),
+                                pnl = format!("{:+.2}", pnl),
+                                result,
+                                max_bid = format!("{:.2}", pos.max_bid_seen),
+                                max_implied = format!("{:.2}", pos.max_implied_seen),
+                                "ORB: market resolved"
+                            );
 
-                        self.push_web_event(OrbTradeEvent {
-                            timestamp: Utc::now().to_rfc3339(),
-                            symbol,
-                            side,
-                            action: if *won { "WON".to_string() } else { "LOST".to_string() },
-                            price: entry_price,
-                            size_usd: *pnl,
-                            move_pct: 0.0,
-                            accuracy: 0.0,
-                            edge: *pnl,
-                            flow: 0.0,
-                            window_secs: 0,
-                            reason: format!("P&L: {:+.2}", pnl),
-                        });
+                            // Log to CSV with actual outcome
+                            OrbDataLogger::log_exit(
+                                pos, condition_id, result, 0.0, *pnl,
+                            );
+
+                            // Push to web dashboard
+                            self.push_web_event(OrbTradeEvent {
+                                timestamp: Utc::now().to_rfc3339(),
+                                symbol: pos.symbol.clone(),
+                                side: format!("{}", pos.side),
+                                action: result.to_string(),
+                                price: pos.entry_price.to_f64().unwrap_or(0.0),
+                                size_usd: *pnl,
+                                move_pct: pos.move_pct,
+                                accuracy: pos.accuracy,
+                                edge: *pnl,
+                                flow: pos.flow,
+                                window_secs: pos.window_secs,
+                                reason: format!("P&L: ${:+.2} | entry: {:.0}c", pnl, pos.entry_price.to_f64().unwrap_or(0.0) * 100.0),
+                            });
+                        } else {
+                            info!(
+                                condition_id = %condition_id,
+                                pnl = format!("{:+.2}", pnl),
+                                result,
+                                "ORB: market resolved (position already cleaned)"
+                            );
+                        }
 
                         // Clean up position
                         self.open_positions.remove(condition_id);
