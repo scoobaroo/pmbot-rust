@@ -865,13 +865,11 @@ impl OrbStrategy {
             }
         }
 
-        // Phase 3: generate exit signals
-        // Two take-profit paths:
-        //   A) Cheap entry pump: bought at 10-25¢, now at 25¢+ → lock in 10¢+ gain
-        //   B) Late window: < 2 min remaining, bid at 75-95¢ → lock before reversal
+        // Phase 3: generate exit signals — late window take-profit only
+        // Cheap entries (10-15¢) are left to resolve — the $1 payout on a win
+        // is too valuable to cut short for a small scalp.
         let now = self.current_time();
         let now_ts = now.timestamp();
-        let regime = self.regime("BTC-USD"); // used for bearish bias on pump exits
         let mut signals = Vec::new();
         let mut to_close = Vec::new();
 
@@ -890,72 +888,8 @@ impl OrbStrategy {
             let entry_f64 = pos.entry_price.to_f64().unwrap_or(0.5);
             let current_spread = spread.unwrap_or(1.0);
             let time_remaining = pos.window_end_ts - now_ts;
-            let profit = bid_f64 - entry_f64;
 
-            // --- Path A: Cheap entry pump exit ---
-            // If we entered cheap (< 30¢) and price pumped 10¢+, lock it in.
-            // In bearish regime, be more aggressive — take profit at smaller gains
-            // because counter-trend moves reverse fast.
-            let min_pump_profit = if regime < -0.2 { 0.08 } else { 0.10 }; // 8¢ bearish, 10¢ normal
-            let cheap_entry = entry_f64 <= 0.30;
-            let pumped = profit >= min_pump_profit;
-
-            if cheap_entry && pumped && current_spread <= TAKE_PROFIT_MAX_SPREAD {
-                if let Some(market) = self.markets.get(cid).cloned() {
-                    let profit_pct = profit / entry_f64 * 100.0;
-                    info!(
-                        condition_id = %cid,
-                        side = %pos.side,
-                        entry = format!("{:.2}", entry_f64),
-                        best_bid = %best_bid,
-                        profit = format!("{:+.0}%", profit_pct),
-                        regime = format!("{:.2}", regime),
-                        "ORB: cheap entry pump — locking in profit"
-                    );
-
-                    OrbDataLogger::log_exit(&pos, cid, "pump_exit", bid_f64, profit_pct);
-
-                    signals.push(TradeSignal {
-                        target: TradeTarget::Polymarket(market),
-                        side: pos.side,
-                        size_usd: pos.size_usd,
-                        confidence: 0.0,
-                        price: best_bid,
-                        metadata: SignalMetadata::Orb {
-                            btc_move: 0.0,
-                            accuracy_tier: pos.accuracy,
-                            implied_prob: bid_f64,
-                            edge: profit_pct / 100.0,
-                            start_price: 0.0,
-                            spot: 0.0,
-                            elapsed_secs: 0.0,
-                            time_remaining_secs: time_remaining as f64,
-                        },
-                        timestamp: now,
-                        is_exit: true,
-                    });
-
-                    self.push_web_event(OrbTradeEvent {
-                        timestamp: now.to_rfc3339(),
-                        symbol: pos.symbol.clone(),
-                        side: format!("{}", pos.side),
-                        action: "EXIT".to_string(),
-                        price: bid_f64,
-                        size_usd: profit_pct,
-                        move_pct: pos.move_pct,
-                        accuracy: pos.accuracy,
-                        edge: profit_pct / 100.0,
-                        flow: 0.0,
-                        window_secs: pos.window_secs,
-                        reason: format!("pump exit: {:.0}¢ → {:.0}¢ ({:+.0}%)", entry_f64 * 100.0, bid_f64 * 100.0, profit_pct),
-                    });
-
-                    to_close.push(cid.clone());
-                    continue;
-                }
-            }
-
-            // --- Path B: Late window take-profit ---
+            // --- Late window take-profit ---
             if bid_f64 < TAKE_PROFIT_MIN || bid_f64 > TAKE_PROFIT_MAX {
                 continue;
             }
@@ -978,7 +912,7 @@ impl OrbStrategy {
                 None => continue,
             };
 
-            let profit_pct = profit / entry_f64 * 100.0;
+            let profit_pct = (bid_f64 - entry_f64) / entry_f64 * 100.0;
 
             info!(
                 condition_id = %cid,
