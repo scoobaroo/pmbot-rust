@@ -38,7 +38,15 @@ import websocket
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 DATA_DIR = Path("data/polymarket")
-ASSETS = [("btc", "BTC-USD"), ("eth", "ETH-USD")]
+ASSETS = [
+    ("btc", "BTC-USD"),
+    ("eth", "ETH-USD"),
+    ("sol", "SOL-USD"),
+    ("xrp", "XRP-USD"),
+    ("doge", "DOGE-USD"),
+    ("bnb", "BNB-USD"),
+    ("hype", "HYPE-USD"),
+]
 WINDOWS = [(300, "5m"), (900, "15m")]
 BOOK_INTERVAL = 2  # seconds between orderbook snapshots
 
@@ -121,8 +129,11 @@ FLOW_FLUSH_INTERVAL = 1.0  # flush flow data every 1 second
 # Binance WebSocket (runs in background thread)
 # ---------------------------------------------------------------------------
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
-BINANCE_SYMBOLS = ["btcusdt", "ethusdt"]
-BINANCE_SYMBOL_MAP = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
+BINANCE_SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "dogeusdt", "bnbusdt"]
+BINANCE_SYMBOL_MAP = {
+    "BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD",
+    "XRPUSDT": "XRP-USD", "DOGEUSDT": "DOGE-USD", "BNBUSDT": "BNB-USD",
+}
 
 
 def flush_flow_bucket(symbol: str):
