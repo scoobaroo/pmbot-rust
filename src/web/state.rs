@@ -64,8 +64,8 @@ pub type SharedWebState = Arc<WebState>;
 pub fn new_web_state() -> SharedWebState {
     let mut trades = VecDeque::new();
 
-    // Load historical trades from CSV so they survive restarts
-    load_csv_trades(&mut trades, "data/orb_trades.csv", "ENTRY");
+    // Only load exits with real outcomes (WON/LOST) — not signal-based entries
+    // Live FILLED events are pushed in real-time from OrderFilled handler
     load_csv_exits(&mut trades, "data/orb_exits.csv");
 
     // Sort by timestamp descending (most recent first)
