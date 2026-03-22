@@ -341,6 +341,14 @@ async fn main() {
             pmbot_rust::web::server::background_refresh(ws2, refresh_sd).await;
         });
 
+        // Poll Polymarket API for trade resolutions (WON/LOST)
+        let ws3 = web_state.clone();
+        let resolve_sd = shutdown.clone();
+        let resolve_wallet = config.copy_trade_funder_address.clone();
+        tokio::spawn(async move {
+            pmbot_rust::web::server::poll_resolutions(ws3, resolve_wallet, resolve_sd).await;
+        });
+
         info!(port = config.web_port, "web dashboard spawned");
     }
 
