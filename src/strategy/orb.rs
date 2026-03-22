@@ -536,6 +536,46 @@ impl OrbStrategy {
             return None;
         }
 
+        // --- Funding rate signal: confirms or warns against direction ---
+        // Negative funding = shorts paying longs = bearish positioning
+        // Positive funding = longs paying shorts = bullish positioning
+        let funding = price.funding_rate.unwrap_or(0.0);
+        let funding_confirms = (price_move > 0.0 && funding > 0.0)
+            || (price_move < 0.0 && funding < 0.0);
+        let funding_extreme = funding.abs() > 0.0001; // > 0.01% = crowded
+
+        // Adjust accuracy based on funding alignment
+        let accuracy = if funding_extreme && !funding_confirms {
+            // Extreme funding against our direction = crowded counter-trade
+            // Potential squeeze — boost accuracy (we're trading the squeeze)
+            let boosted = (accuracy + 0.03).min(0.98);
+            debug!(
+                question = %market.question,
+                funding = format!("{:.6}", funding),
+                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
+                accuracy_boost = format!("{:.0}% -> {:.0}%", accuracy * 100.0, boosted * 100.0),
+                "ORB: extreme counter-funding — squeeze potential, boosting accuracy"
+            );
+            boosted
+        } else if funding_extreme && funding_confirms {
+            // Extreme funding in our direction = crowded trade, reversal risk
+            // Reduce accuracy to be more cautious
+            let reduced = accuracy - 0.03;
+            debug!(
+                question = %market.question,
+                funding = format!("{:.6}", funding),
+                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
+                accuracy_reduction = format!("{:.0}% -> {:.0}%", accuracy * 100.0, reduced * 100.0),
+                "ORB: extreme aligned funding — crowded, reducing accuracy"
+            );
+            reduced
+        } else if funding_confirms {
+            // Mild funding confirms our direction — slight boost
+            accuracy + 0.01
+        } else {
+            accuracy
+        };
+
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
         let (side, token_id, implied_price) = if price_move > 0.0 {
             (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
@@ -607,6 +647,8 @@ impl OrbStrategy {
             atr = format!("{:.1}", atr_val.unwrap_or(0.0)),
             atr_mult = format!("{:.1}x", atr_multiple.unwrap_or(0.0)),
             flow = format!("{:.2}", flow),
+            funding = format!("{:.6}", funding),
+            funding_confirms,
             elapsed_secs = elapsed,
             "ORB: breakout signal"
         );
