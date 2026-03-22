@@ -566,65 +566,59 @@ impl Strategy for OrbStrategy {
                             market.implied_prob_no = no_price;
                         }
 
-                        // --- Take-profit exit on open positions ---
+                        // --- Take-profit exit based on orderbook best bid ---
+                        // The best bid is what someone will actually pay us — the real
+                        // signal for profit, not the implied midpoint.
                         if let Some(pos) = self.open_positions.get(&condition_id) {
-                            let (current_implied, token_id) = match pos.side {
-                                Side::Buy => (yes_price.to_f64().unwrap_or(0.0), self.markets.get(&condition_id).map(|m| m.token_id_yes.clone())),
-                                Side::Sell => (no_price.to_f64().unwrap_or(0.0), self.markets.get(&condition_id).map(|m| m.token_id_no.clone())),
+                            let token_id = match pos.side {
+                                Side::Buy => self.markets.get(&condition_id).map(|m| m.token_id_yes.clone()),
+                                Side::Sell => self.markets.get(&condition_id).map(|m| m.token_id_no.clone()),
                             };
 
-                            if current_implied >= TAKE_PROFIT_MIN && current_implied <= TAKE_PROFIT_MAX {
-                                if let (Some(market), Some(tid)) = (self.markets.get(&condition_id).cloned(), token_id) {
-                                    // Use orderbook best bid for exit pricing — don't sell into thin air
-                                    let book_bid = self.get_book_bid(&tid);
-                                    let sell_price = match book_bid {
-                                        Some(bid) => bid,
-                                        None => {
-                                            // Fallback: implied - 2¢ if no book data
-                                            let implied = match pos.side {
-                                                Side::Buy => yes_price,
-                                                Side::Sell => no_price,
-                                            };
-                                            (implied - dec!(0.02)).max(dec!(0.01))
-                                        }
-                                    };
-
+                            if let Some(tid) = token_id {
+                                if let Some(best_bid) = self.get_book_bid(&tid) {
+                                    let bid_f64 = best_bid.to_f64().unwrap_or(0.0);
                                     let entry_f64 = pos.entry_price.to_f64().unwrap_or(0.5);
-                                    let profit_pct = (current_implied - entry_f64) / entry_f64 * 100.0;
 
-                                    info!(
-                                        condition_id = %condition_id,
-                                        side = %pos.side,
-                                        entry = format!("{:.2}", entry_f64),
-                                        current = format!("{:.2}", current_implied),
-                                        sell_price = %sell_price,
-                                        book_bid = format!("{}", book_bid.map(|b| b.to_string()).unwrap_or("none".into())),
-                                        profit = format!("{:+.1}%", profit_pct),
-                                        "ORB: take-profit exit"
-                                    );
+                                    // Take profit when best bid is in range — this is our
+                                    // actual realizable exit price
+                                    if bid_f64 >= TAKE_PROFIT_MIN && bid_f64 <= TAKE_PROFIT_MAX {
+                                        if let Some(market) = self.markets.get(&condition_id).cloned() {
+                                            let profit_pct = (bid_f64 - entry_f64) / entry_f64 * 100.0;
 
-                                    let signal = TradeSignal {
-                                        target: TradeTarget::Polymarket(market),
-                                        side: pos.side,
-                                        size_usd: pos.size_usd,
-                                        confidence: 0.0,
-                                        price: sell_price,
-                                        metadata: SignalMetadata::Orb {
-                                            btc_move: 0.0,
-                                            accuracy_tier: 0.0,
-                                            implied_prob: current_implied,
-                                            edge: profit_pct / 100.0,
-                                            start_price: 0.0,
-                                            spot: 0.0,
-                                            elapsed_secs: 0.0,
-                                            time_remaining_secs: 0.0,
-                                        },
-                                        timestamp: self.current_time(),
-                                        is_exit: true,
-                                    };
+                                            info!(
+                                                condition_id = %condition_id,
+                                                side = %pos.side,
+                                                entry = format!("{:.2}", entry_f64),
+                                                best_bid = %best_bid,
+                                                profit = format!("{:+.1}%", profit_pct),
+                                                "ORB: take-profit exit at book bid"
+                                            );
 
-                                    self.open_positions.remove(&condition_id);
-                                    return vec![signal];
+                                            let signal = TradeSignal {
+                                                target: TradeTarget::Polymarket(market),
+                                                side: pos.side,
+                                                size_usd: pos.size_usd,
+                                                confidence: 0.0,
+                                                price: best_bid,
+                                                metadata: SignalMetadata::Orb {
+                                                    btc_move: 0.0,
+                                                    accuracy_tier: 0.0,
+                                                    implied_prob: bid_f64,
+                                                    edge: profit_pct / 100.0,
+                                                    start_price: 0.0,
+                                                    spot: 0.0,
+                                                    elapsed_secs: 0.0,
+                                                    time_remaining_secs: 0.0,
+                                                },
+                                                timestamp: self.current_time(),
+                                                is_exit: true,
+                                            };
+
+                                            self.open_positions.remove(&condition_id);
+                                            return vec![signal];
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -731,6 +725,24 @@ mod tests {
             binance_mid: Some(Decimal::from_f64_retain(vwap).unwrap()),
             timestamp: ts,
         }
+    }
+
+    /// Set up a book cache with a specific best bid for a token.
+    fn seed_book_cache(strategy: &mut OrbStrategy, token_id: &str, best_bid: f64) {
+        use crate::polymarket::ws_orderbook::{new_book_cache, BookSnapshot};
+        let cache = new_book_cache();
+        {
+            let mut books = cache.blocking_write();
+            books.insert(token_id.to_string(), BookSnapshot {
+                best_bid: Decimal::from_f64_retain(best_bid).unwrap(),
+                best_ask: Decimal::from_f64_retain(best_bid + 0.02).unwrap(),
+                spread: dec!(0.02),
+                depth_bid: dec!(500),
+                depth_ask: dec!(500),
+                timestamp: Utc::now(),
+            });
+        }
+        strategy.book_cache = Some(cache);
     }
 
     /// Seed ATR with enough candles so it's available for tests.
@@ -1098,12 +1110,12 @@ mod tests {
     // ---- Take-profit exit tests ----
 
     #[test]
-    fn test_take_profit_exit_at_080() {
+    fn test_take_profit_exit_at_book_bid_080() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
 
-        // Set up a market and an open position
+        // Set up a market and an open position (bought YES at 0.60)
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
         strategy.open_positions.insert("m1".to_string(), OrbPosition {
@@ -1111,30 +1123,30 @@ mod tests {
             entry_price: dec!(0.60),
             size_usd: dec!(50),
         });
-        // Need a latest price for current_time()
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80100.0, now),
         );
+        // Book bid at 0.80 for the YES token
+        seed_book_cache(&mut strategy, "m1-yes", 0.80);
 
-        // Simulate Polymarket price update: yes_price moves to 0.80
         let signals = strategy.on_event(StrategyEvent::PolymarketUpdate(
             PolymarketUpdate::PriceUpdate {
                 condition_id: "m1".to_string(),
-                yes_price: dec!(0.80),
-                no_price: dec!(0.20),
+                yes_price: dec!(0.82),
+                no_price: dec!(0.18),
             },
         ));
 
         assert_eq!(signals.len(), 1, "should generate take-profit exit signal");
         assert!(signals[0].is_exit, "signal should be an exit");
         assert_eq!(signals[0].side, Side::Buy, "exit keeps same side as entry");
-        // Position should be removed
+        assert!(signals[0].price > dec!(0.79) && signals[0].price < dec!(0.81), "exit at book bid ~0.80, not implied");
         assert!(!strategy.open_positions.contains_key("m1"), "position should be closed");
     }
 
     #[test]
-    fn test_no_exit_below_take_profit_threshold() {
+    fn test_no_exit_when_book_bid_below_threshold() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
@@ -1150,22 +1162,23 @@ mod tests {
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80050.0, now),
         );
+        // Book bid at 0.65 — below 0.75 take-profit floor
+        seed_book_cache(&mut strategy, "m1-yes", 0.65);
 
-        // Price at 0.65 — below 0.75 take-profit floor
         let signals = strategy.on_event(StrategyEvent::PolymarketUpdate(
             PolymarketUpdate::PriceUpdate {
                 condition_id: "m1".to_string(),
-                yes_price: dec!(0.65),
-                no_price: dec!(0.35),
+                yes_price: dec!(0.67),
+                no_price: dec!(0.33),
             },
         ));
 
-        assert!(signals.is_empty(), "should not exit below take-profit threshold");
+        assert!(signals.is_empty(), "should not exit when book bid below threshold");
         assert!(strategy.open_positions.contains_key("m1"), "position should remain open");
     }
 
     #[test]
-    fn test_no_exit_above_take_profit_ceiling() {
+    fn test_no_exit_when_book_bid_above_ceiling() {
         let mut strategy = make_test_strategy();
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
@@ -1181,8 +1194,9 @@ mod tests {
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80200.0, now),
         );
+        // Book bid at 0.97 — above 0.95 ceiling, let it resolve to $1.00
+        seed_book_cache(&mut strategy, "m1-yes", 0.97);
 
-        // Price at 0.98 — above 0.95 ceiling, let it resolve to $1.00
         let signals = strategy.on_event(StrategyEvent::PolymarketUpdate(
             PolymarketUpdate::PriceUpdate {
                 condition_id: "m1".to_string(),
@@ -1192,6 +1206,37 @@ mod tests {
         ));
 
         assert!(signals.is_empty(), "should not exit above ceiling — let it resolve to $1");
+        assert!(strategy.open_positions.contains_key("m1"), "position should remain open");
+    }
+
+    #[test]
+    fn test_no_exit_without_book_data() {
+        let mut strategy = make_test_strategy();
+        let now = Utc::now();
+        let window_start = now.timestamp() - 60;
+
+        // No book cache at all — should not exit even if implied is high
+        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy.open_positions.insert("m1".to_string(), OrbPosition {
+            side: Side::Buy,
+            entry_price: dec!(0.60),
+            size_usd: dec!(50),
+        });
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price("BTC-USD", 80100.0, now),
+        );
+
+        let signals = strategy.on_event(StrategyEvent::PolymarketUpdate(
+            PolymarketUpdate::PriceUpdate {
+                condition_id: "m1".to_string(),
+                yes_price: dec!(0.85),
+                no_price: dec!(0.15),
+            },
+        ));
+
+        assert!(signals.is_empty(), "should not exit without book data — no reliable price");
         assert!(strategy.open_positions.contains_key("m1"), "position should remain open");
     }
 
@@ -1213,18 +1258,21 @@ mod tests {
             "BTC-USD".to_string(),
             make_price("BTC-USD", 79800.0, now),
         );
+        // Book bid at 0.80 for the NO token
+        seed_book_cache(&mut strategy, "m1-no", 0.80);
 
         // NO price moves to 0.80 (BTC dropped, our NO bet is winning)
         let signals = strategy.on_event(StrategyEvent::PolymarketUpdate(
             PolymarketUpdate::PriceUpdate {
                 condition_id: "m1".to_string(),
                 yes_price: dec!(0.20),
-                no_price: dec!(0.80),
+                no_price: dec!(0.82),
             },
         ));
 
         assert_eq!(signals.len(), 1, "should exit NO position at take-profit");
         assert!(signals[0].is_exit);
         assert_eq!(signals[0].side, Side::Sell, "exit keeps Sell side for NO token");
+        assert!(signals[0].price > dec!(0.79) && signals[0].price < dec!(0.81), "exit at book bid ~0.80");
     }
 }
