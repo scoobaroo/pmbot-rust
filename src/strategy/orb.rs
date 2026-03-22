@@ -141,9 +141,10 @@ impl OrbDataLogger {
     }
 
     fn append(path: &str, header: &str, row: &str) {
-        let file_exists = std::path::Path::new(path).exists();
+        let needs_header = !std::path::Path::new(path).exists()
+            || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            if !file_exists {
+            if needs_header {
                 let _ = writeln!(f, "{}", header);
             }
             let _ = writeln!(f, "{}", row);
