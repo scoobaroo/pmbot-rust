@@ -309,18 +309,21 @@ impl OrbStrategy {
         }
 
         // === Early window — opening range breakout ===
-        // 72% tier (0.05% at 60s) dropped — edge too thin after fees + aggressive pricing
         if move_pct >= 0.15 && elapsed_secs >= 30 {
             Some(0.92)
         } else if move_pct >= 0.07 && elapsed_secs >= 45 {
             Some(0.76)
+        } else if move_pct >= 0.06 && elapsed_secs >= 50 {
+            // ~$50 at BTC $84k. ~74% accuracy — thin for hold-to-resolution but
+            // viable with take-profit exits + flow/momentum filters protecting downside.
+            Some(0.74)
         } else {
             None
         }
     }
 
     /// Tiered position sizing: bigger move → bigger bet.
-    ///   0.05% early  → 33% of max
+    ///   0.06% early  → 25% of max (thin edge, small size)
     ///   0.07% early  → 50% of max
     ///   0.15%+ early → 100% of max
     ///   0.05%+ mid   → 75% of max
@@ -331,7 +334,7 @@ impl OrbStrategy {
         } else {
             if move_pct >= 0.15 { 1.0 }
             else if move_pct >= 0.07 { 0.5 }
-            else { 0.33 }
+            else { 0.25 } // 0.06% tier — smaller size for thinner edge
         };
         let size = self.max_position_usd.to_f64().unwrap_or(20.0) * fraction;
         Decimal::from_f64_retain(size).unwrap_or(self.max_position_usd)
