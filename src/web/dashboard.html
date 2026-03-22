@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PMBot — Wallet Tracker</title>
+<title>PMBot — Trading Dashboard</title>
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --green: #3fb950; --red: #f85149; --blue: #58a6ff; --muted: #8b949e; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -36,10 +36,43 @@
   .tab-content.active { display: block; }
   .loading { color: var(--muted); text-align: center; padding: 20px; }
   .refresh-time { font-size: 0.75em; color: var(--muted); }
+  .orb-section { margin-bottom: 30px; }
+  .orb-section h2 { display: flex; align-items: center; gap: 10px; }
+  .orb-section h2 .live-dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .orb-stats { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .orb-stats .stat { background: var(--card); padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border); }
+  .orb-feed { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .orb-feed table { margin: 0; }
+  .orb-row-entry { border-left: 3px solid var(--green); }
+  .orb-row-exit { border-left: 3px solid var(--blue); }
+  .orb-row-rejected { border-left: 3px solid var(--muted); opacity: 0.6; }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
+  .badge-entry { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-exit { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge-buy { color: var(--green); }
+  .badge-sell { color: var(--red); }
 </style>
 </head>
 <body>
-<h1>PMBot Wallet Tracker</h1>
+<h1>PMBot Trading Dashboard</h1>
+
+<div class="orb-section">
+  <h2><span class="live-dot"></span> ORB Strategy — Live Feed</h2>
+  <div class="orb-stats" id="orb-stats">
+    <div class="stat"><div class="label">Trades</div><div class="value" id="orb-count">0</div></div>
+    <div class="stat"><div class="label">Session P&L</div><div class="value" id="orb-pnl">—</div></div>
+    <div class="stat"><div class="label">Last Signal</div><div class="value" id="orb-last">—</div></div>
+  </div>
+  <div class="orb-feed">
+    <table>
+      <thead><tr><th>Time</th><th>Action</th><th>Symbol</th><th>Side</th><th>Price</th><th>Size</th><th>Move %</th><th>Accuracy</th><th>Edge</th><th>Flow</th><th>Window</th></tr></thead>
+      <tbody id="orb-feed-body">
+        <tr><td colspan="11" style="color:var(--muted);text-align:center;padding:16px">Waiting for signals...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
 
 <div class="controls">
   <input type="text" id="wallet-input" placeholder="Enter wallet address (0x...)">
@@ -171,9 +204,58 @@ async function removeWallet(addr) {
   loadWallets();
 }
 
+async function loadOrbTrades() {
+  try {
+    const resp = await fetch(`${API}/api/orb/trades`);
+    const trades = await resp.json();
+    renderOrbFeed(trades);
+  } catch (e) { /* silently retry next interval */ }
+}
+
+function renderOrbFeed(trades) {
+  const body = document.getElementById('orb-feed-body');
+  const countEl = document.getElementById('orb-count');
+  const lastEl = document.getElementById('orb-last');
+
+  const entries = trades.filter(t => t.action === 'ENTRY');
+  countEl.textContent = entries.length;
+
+  if (trades.length === 0) {
+    body.innerHTML = '<tr><td colspan="11" style="color:var(--muted);text-align:center;padding:16px">Waiting for signals...</td></tr>';
+    return;
+  }
+
+  const last = trades[0];
+  const lastTime = new Date(last.timestamp).toLocaleTimeString();
+  lastEl.textContent = `${last.action} ${last.symbol} @ ${lastTime}`;
+
+  body.innerHTML = trades.slice(0, 50).map(t => {
+    const time = new Date(t.timestamp).toLocaleTimeString();
+    const rowClass = t.action === 'ENTRY' ? 'orb-row-entry' : t.action === 'EXIT' ? 'orb-row-exit' : 'orb-row-rejected';
+    const badgeClass = t.action === 'ENTRY' ? 'badge-entry' : 'badge-exit';
+    const sideClass = t.side === 'BUY' ? 'badge-buy' : 'badge-sell';
+    const window = t.window_secs === 300 ? '5m' : t.window_secs === 900 ? '15m' : `${t.window_secs}s`;
+    return `<tr class="${rowClass}">
+      <td>${time}</td>
+      <td><span class="badge ${badgeClass}">${t.action}</span></td>
+      <td>${t.symbol}</td>
+      <td class="${sideClass}">${t.side}</td>
+      <td>${t.price.toFixed(2)}&cent;</td>
+      <td>$${t.size_usd.toFixed(0)}</td>
+      <td>${t.move_pct.toFixed(3)}%</td>
+      <td>${(t.accuracy * 100).toFixed(0)}%</td>
+      <td class="${t.edge > 0 ? 'positive' : 'negative'}">${(t.edge * 100).toFixed(1)}%</td>
+      <td>${t.flow.toFixed(2)}</td>
+      <td>${window}</td>
+    </tr>`;
+  }).join('');
+}
+
 // Initial load + auto-refresh
 loadWallets();
+loadOrbTrades();
 setInterval(loadWallets, 30000);
+setInterval(loadOrbTrades, 5000);
 </script>
 </body>
 </html>

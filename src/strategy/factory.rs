@@ -9,11 +9,13 @@ use crate::strategy::orb::OrbStrategy;
 use crate::strategy::resolution_sniper::ResolutionSniperStrategy;
 use crate::strategy::traits::Strategy;
 use crate::strategy::unified::UnifiedStrategy;
+use crate::web::state::SharedWebState;
 
 pub fn create_strategy(
     name: &StrategyName,
     config: &Config,
     book_cache: Option<BookCache>,
+    web_state: Option<SharedWebState>,
 ) -> Box<dyn Strategy> {
     match name {
         StrategyName::BlackScholes => {
@@ -50,6 +52,9 @@ pub fn create_strategy(
             let mut s = OrbStrategy::new(config);
             if let Some(bc) = book_cache {
                 s = s.with_book_cache(bc);
+            }
+            if let Some(ws) = web_state {
+                s = s.with_web_state(ws);
             }
             Box::new(s)
         }

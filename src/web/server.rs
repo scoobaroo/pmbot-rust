@@ -10,6 +10,7 @@ use tracing::{info, warn};
 pub async fn run(state: SharedWebState, port: u16, shutdown: CancellationToken) {
     let app = Router::new()
         .route("/", get(handlers::dashboard))
+        .route("/api/orb/trades", get(handlers::orb_trades))
         .route("/api/wallets", get(handlers::list_wallets))
         .route("/api/wallet/{address}/activity", get(handlers::wallet_activity))
         .route("/api/wallet/{address}/positions", get(handlers::wallet_positions))

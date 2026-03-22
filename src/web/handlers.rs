@@ -12,6 +12,13 @@ pub async fn dashboard() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
 
+/// GET /api/orb/trades — recent ORB trade events (entries, exits, rejections)
+pub async fn orb_trades(State(state): State<SharedWebState>) -> Json<Value> {
+    let trades = state.orb_trades.read().await;
+    let list: Vec<_> = trades.iter().collect();
+    Json(json!(list))
+}
+
 /// GET /api/wallets — list all tracked wallets with stats
 pub async fn list_wallets(State(state): State<SharedWebState>) -> Json<Value> {
     let wallets = state.wallets.read().await;

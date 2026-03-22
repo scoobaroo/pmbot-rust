@@ -48,13 +48,20 @@ async fn main() {
     // Create Polymarket trade activity cache (shared with RL bridge + trade poller)
     let trade_activity_cache = pmbot_rust::polymarket::trade_poller::new_trade_activity_cache();
 
+    // Create web state early so strategies can push events to the dashboard
+    let web_state = if config.web_enabled {
+        Some(pmbot_rust::web::state::new_web_state())
+    } else {
+        None
+    };
+
     // Build all strategy instances and compute union of needs
     let mut strategies: Vec<Box<dyn pmbot_rust::strategy::traits::Strategy>> = Vec::new();
     let mut all_timeframes: HashSet<Timeframe> = HashSet::new();
     let mut needs_polymarket = false;
 
     for strategy_name in &config.strategies {
-        let strategy = create_strategy(strategy_name, &config, Some(book_cache.clone()));
+        let strategy = create_strategy(strategy_name, &config, Some(book_cache.clone()), web_state.clone());
         let subs = strategy.subscriptions();
         needs_polymarket |= subs.polymarket_updates;
 
@@ -297,10 +304,8 @@ async fn main() {
         None
     };
 
-    // Conditionally spawn web dashboard
-    if config.web_enabled {
-        let web_state = pmbot_rust::web::state::new_web_state();
-
+    // Conditionally spawn web dashboard (reuse web_state created earlier for strategies)
+    if let Some(ref web_state) = web_state {
         // Pre-populate with copy-trade targets
         {
             let mut wallets = web_state.wallets.write().await;
