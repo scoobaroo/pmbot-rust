@@ -192,6 +192,8 @@ pub struct OrbStrategy {
     true_ranges: HashMap<String, VecDeque<f64>>,
     /// Previous candle close per symbol (needed for true range calculation).
     prev_close: HashMap<String, f64>,
+    /// Rolling 1m closes for regime detection (last 30 candles = 30 min trend).
+    recent_closes: HashMap<String, VecDeque<f64>>,
     /// Previous VWAP per symbol — used to confirm momentum is sustained at entry.
     prev_vwap: HashMap<String, f64>,
     /// Optional web state for pushing live trade events to the dashboard.
@@ -213,6 +215,7 @@ impl OrbStrategy {
             max_position_usd: config.max_position_usd,
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
+            recent_closes: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),
@@ -298,6 +301,29 @@ impl OrbStrategy {
         Some(sum / ATR_PERIOD as f64)
     }
 
+    /// Detect market regime: returns a value from -1.0 (strong bearish) to +1.0 (strong bullish).
+    /// Uses the slope of recent 1m closes over the last 30 minutes.
+    fn regime(&self, symbol: &str) -> f64 {
+        let closes = match self.recent_closes.get(symbol) {
+            Some(c) if c.len() >= 5 => c,
+            _ => return 0.0, // not enough data
+        };
+
+        let n = closes.len() as f64;
+        let first = closes.front().copied().unwrap_or(0.0);
+        let last = closes.back().copied().unwrap_or(0.0);
+
+        if first <= 0.0 {
+            return 0.0;
+        }
+
+        // Percentage change over the lookback window
+        let pct_change = (last - first) / first;
+
+        // Clamp to [-1, 1] — ±0.5% over 30 min is strongly directional
+        (pct_change * 200.0).clamp(-1.0, 1.0)
+    }
+
     /// Update ATR state from a completed 1m candle.
     fn update_atr(&mut self, symbol: &str, high: f64, low: f64, close: f64) {
         let tr = if let Some(&prev_c) = self.prev_close.get(symbol) {
@@ -317,6 +343,16 @@ impl OrbStrategy {
         trs.push_back(tr);
         if trs.len() > ATR_PERIOD * 2 {
             trs.pop_front();
+        }
+
+        // Track recent closes for regime detection (30 candle lookback)
+        let closes = self
+            .recent_closes
+            .entry(symbol.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(31));
+        closes.push_back(close);
+        if closes.len() > 30 {
+            closes.pop_front();
         }
     }
 
@@ -615,6 +651,39 @@ impl OrbStrategy {
         } else if funding_confirms {
             // Mild funding confirms our direction — slight boost
             accuracy + 0.01
+        } else {
+            accuracy
+        };
+
+        // --- Regime bias: trend-following adjustments ---
+        // regime() returns -1.0 (bearish) to +1.0 (bullish) based on last 30 candles.
+        // Trade with the trend = boost accuracy. Trade against = penalize.
+        let regime = self.regime(&market.underlying_symbol);
+        let is_trend_aligned = (price_move > 0.0 && regime > 0.1)
+            || (price_move < 0.0 && regime < -0.1);
+        let is_counter_trend = (price_move > 0.0 && regime < -0.2)
+            || (price_move < 0.0 && regime > 0.2);
+
+        let accuracy = if is_counter_trend {
+            // Trading against the trend — reduce accuracy, higher bar to enter
+            let reduced = accuracy - 0.05;
+            debug!(
+                question = %market.question,
+                regime = format!("{:.2}", regime),
+                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
+                "ORB: counter-trend entry — reducing accuracy by 5%"
+            );
+            reduced
+        } else if is_trend_aligned {
+            // Trading with the trend — boost accuracy
+            let boosted = (accuracy + 0.03).min(0.98);
+            debug!(
+                question = %market.question,
+                regime = format!("{:.2}", regime),
+                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
+                "ORB: trend-aligned entry — boosting accuracy by 3%"
+            );
+            boosted
         } else {
             accuracy
         };
@@ -1122,6 +1191,7 @@ mod tests {
             max_position_usd: dec!(100),
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
+            recent_closes: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),
