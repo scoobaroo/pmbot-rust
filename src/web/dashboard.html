@@ -50,8 +50,12 @@
   .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
   .badge-entry { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge-exit { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge-won { background: rgba(63,185,80,0.25); color: var(--green); }
+  .badge-lost { background: rgba(248,81,73,0.25); color: var(--red); }
   .badge-buy { color: var(--green); }
   .badge-sell { color: var(--red); }
+  .orb-row-won { border-left: 3px solid var(--green); background: rgba(63,185,80,0.05); }
+  .orb-row-lost { border-left: 3px solid var(--red); background: rgba(248,81,73,0.05); }
 </style>
 </head>
 <body>
@@ -218,7 +222,19 @@ function renderOrbFeed(trades) {
   const lastEl = document.getElementById('orb-last');
 
   const entries = trades.filter(t => t.action === 'ENTRY');
+  const resolved = trades.filter(t => t.action === 'WON' || t.action === 'LOST');
+  const wins = resolved.filter(t => t.action === 'WON').length;
+  const losses = resolved.filter(t => t.action === 'LOST').length;
+  const totalPnl = resolved.reduce((sum, t) => sum + t.size_usd, 0);
   countEl.textContent = entries.length;
+
+  const pnlEl = document.getElementById('orb-pnl');
+  if (resolved.length > 0) {
+    const pnlClass = totalPnl >= 0 ? 'positive' : 'negative';
+    const sign = totalPnl >= 0 ? '+' : '';
+    pnlEl.className = `value ${pnlClass}`;
+    pnlEl.textContent = `${sign}$${totalPnl.toFixed(2)} (${wins}W/${losses}L)`;
+  }
 
   if (trades.length === 0) {
     body.innerHTML = '<tr><td colspan="11" style="color:var(--muted);text-align:center;padding:16px">Waiting for signals...</td></tr>';
@@ -231,10 +247,26 @@ function renderOrbFeed(trades) {
 
   body.innerHTML = trades.slice(0, 50).map(t => {
     const time = new Date(t.timestamp).toLocaleTimeString();
-    const rowClass = t.action === 'ENTRY' ? 'orb-row-entry' : t.action === 'EXIT' ? 'orb-row-exit' : 'orb-row-rejected';
-    const badgeClass = t.action === 'ENTRY' ? 'badge-entry' : 'badge-exit';
+    const isResult = t.action === 'WON' || t.action === 'LOST';
+    const rowClass = t.action === 'ENTRY' ? 'orb-row-entry' : t.action === 'WON' ? 'orb-row-won' : t.action === 'LOST' ? 'orb-row-lost' : t.action === 'EXIT' ? 'orb-row-exit' : 'orb-row-rejected';
+    const badgeClass = t.action === 'ENTRY' ? 'badge-entry' : t.action === 'WON' ? 'badge-won' : t.action === 'LOST' ? 'badge-lost' : 'badge-exit';
     const sideClass = t.side === 'BUY' ? 'badge-buy' : 'badge-sell';
-    const window = t.window_secs === 300 ? '5m' : t.window_secs === 900 ? '15m' : `${t.window_secs}s`;
+    const window = t.window_secs === 300 ? '5m' : t.window_secs === 900 ? '15m' : t.window_secs > 0 ? `${t.window_secs}s` : '';
+
+    if (isResult) {
+      const pnlSign = t.size_usd >= 0 ? '+' : '';
+      const pnlClass = t.size_usd >= 0 ? 'positive' : 'negative';
+      return `<tr class="${rowClass}">
+        <td>${time}</td>
+        <td><span class="badge ${badgeClass}">${t.action}</span></td>
+        <td>${t.symbol}</td>
+        <td class="${sideClass}">${t.side}</td>
+        <td>${t.price.toFixed(2)}&cent;</td>
+        <td class="${pnlClass}">${pnlSign}$${t.size_usd.toFixed(2)}</td>
+        <td colspan="5" style="color:var(--muted)">${t.reason}</td>
+      </tr>`;
+    }
+
     return `<tr class="${rowClass}">
       <td>${time}</td>
       <td><span class="badge ${badgeClass}">${t.action}</span></td>

@@ -919,6 +919,38 @@ impl Strategy for OrbStrategy {
                     crate::types::events::ExecutionEvent::OrderFailed { order_id, error } => {
                         warn!(order_id = %order_id, error = %error, "ORB: order failed");
                     }
+                    crate::types::events::ExecutionEvent::MarketResolved { condition_id, pnl, won } => {
+                        let result = if *won { "WON" } else { "LOST" };
+                        info!(
+                            condition_id = %condition_id,
+                            pnl = format!("{:+.2}", pnl),
+                            result,
+                            "ORB: market resolved"
+                        );
+
+                        // Look up position data for the dashboard event
+                        let (symbol, side, entry_price) = self.open_positions.get(condition_id)
+                            .map(|p| (p.symbol.clone(), format!("{}", p.side), p.entry_price.to_f64().unwrap_or(0.0)))
+                            .unwrap_or_else(|| ("BTC-USD".to_string(), "?".to_string(), 0.0));
+
+                        self.push_web_event(OrbTradeEvent {
+                            timestamp: Utc::now().to_rfc3339(),
+                            symbol,
+                            side,
+                            action: if *won { "WON".to_string() } else { "LOST".to_string() },
+                            price: entry_price,
+                            size_usd: *pnl,
+                            move_pct: 0.0,
+                            accuracy: 0.0,
+                            edge: *pnl,
+                            flow: 0.0,
+                            window_secs: 0,
+                            reason: format!("P&L: {:+.2}", pnl),
+                        });
+
+                        // Clean up position
+                        self.open_positions.remove(condition_id);
+                    }
                     _ => {}
                 }
                 Vec::new()
