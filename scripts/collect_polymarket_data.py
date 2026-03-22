@@ -18,16 +18,19 @@ Deployment on VPS:
     nohup python3 scripts/collect_polymarket_data.py > data/collector.log 2>&1 &
 
 Requirements:
-    pip install requests
+    pip install requests websocket-client
 """
 
 import csv
+import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import websocket
 
 # ---------------------------------------------------------------------------
 # Config
@@ -80,16 +83,99 @@ def open_csv(filename: str, header: list[str]):
     return f, writer
 
 
+BINANCE_HEADER = [
+    "timestamp", "symbol", "price", "bid", "ask", "volume_24h",
+    "quote_volume_24h", "trades_24h", "price_change_pct",
+]
+
 markets_f, markets_w = open_csv("markets.csv", MARKETS_HEADER)
 ticks_f, ticks_w = open_csv("ticks.csv", TICKS_HEADER)
 resolutions_f, resolutions_w = open_csv("resolutions.csv", RESOLUTIONS_HEADER)
+binance_f, binance_w = open_csv("binance.csv", BINANCE_HEADER)
+binance_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 active_markets: dict = {}  # condition_id -> market dict
 seen_condition_ids: set = set()  # all condition_ids we've ever seen
-stats = {"markets": 0, "ticks": 0, "resolutions": 0}
+stats = {"markets": 0, "ticks": 0, "resolutions": 0, "binance_ticks": 0}
+latest_binance: dict = {}  # symbol -> {price, bid, ask, ...}
+
+# ---------------------------------------------------------------------------
+# Binance WebSocket (runs in background thread)
+# ---------------------------------------------------------------------------
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+BINANCE_SYMBOLS = ["btcusdt", "ethusdt"]
+BINANCE_SYMBOL_MAP = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
+
+
+def start_binance_ws():
+    """Connect to Binance combined stream for real-time price ticks."""
+    streams = "/".join(f"{s}@ticker" for s in BINANCE_SYMBOLS)
+    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+
+    def on_message(ws, message):
+        try:
+            msg = json.loads(message)
+            data = msg.get("data", msg)
+            symbol_raw = data.get("s", "")
+            symbol = BINANCE_SYMBOL_MAP.get(symbol_raw, symbol_raw)
+
+            tick = {
+                "price": float(data.get("c", 0)),      # last price
+                "bid": float(data.get("b", 0)),         # best bid
+                "ask": float(data.get("a", 0)),         # best ask
+                "volume_24h": float(data.get("v", 0)),  # base volume
+                "quote_volume_24h": float(data.get("q", 0)),  # quote volume
+                "trades_24h": int(data.get("n", 0)),    # trade count
+                "price_change_pct": float(data.get("P", 0)),  # 24h change %
+            }
+
+            latest_binance[symbol] = tick
+
+            now = datetime.now(timezone.utc).isoformat()
+            with binance_lock:
+                binance_w.writerow([
+                    now, symbol,
+                    f"{tick['price']:.2f}",
+                    f"{tick['bid']:.2f}",
+                    f"{tick['ask']:.2f}",
+                    f"{tick['volume_24h']:.2f}",
+                    f"{tick['quote_volume_24h']:.0f}",
+                    tick["trades_24h"],
+                    f"{tick['price_change_pct']:.2f}",
+                ])
+                stats["binance_ticks"] += 1
+                if stats["binance_ticks"] % 100 == 0:
+                    binance_f.flush()
+
+        except Exception as e:
+            log.debug(f"Binance WS parse error: {e}")
+
+    def on_error(ws, error):
+        log.warning(f"Binance WS error: {error}")
+
+    def on_close(ws, close_status, close_msg):
+        log.warning(f"Binance WS closed: {close_status} {close_msg}")
+        # Reconnect after delay
+        time.sleep(3)
+        start_binance_ws()
+
+    def on_open(ws):
+        log.info("Binance WebSocket connected")
+
+    ws = websocket.WebSocketApp(
+        url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+
+    thread = threading.Thread(target=ws.run_forever, daemon=True)
+    thread.start()
+    return thread
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -259,6 +345,10 @@ def main():
     log.info(f"Assets: {[s for _, s in ASSETS]}, Windows: {[l for _, l in WINDOWS]}")
     log.info(f"Data dir: {DATA_DIR.resolve()}")
 
+    # Start Binance WebSocket for real-time exchange prices
+    log.info("Starting Binance WebSocket for BTC/ETH price stream...")
+    start_binance_ws()
+
     last_discovery = 0
     last_status = 0
 
@@ -310,10 +400,16 @@ def main():
             if now - last_status >= 60:
                 last_status = now
                 ticks_f.flush()
+                with binance_lock:
+                    binance_f.flush()
+                prices = " | ".join(
+                    f"{s}=${t['price']:.0f}" for s, t in latest_binance.items()
+                )
                 log.info(
                     f"Status: {len(active_markets)} active, "
-                    f"{stats['markets']} discovered, {stats['ticks']} ticks, "
-                    f"{stats['resolutions']} resolved"
+                    f"{stats['markets']} discovered, {stats['ticks']} poly ticks, "
+                    f"{stats['binance_ticks']} binance ticks, "
+                    f"{stats['resolutions']} resolved | {prices}"
                 )
 
             time.sleep(BOOK_INTERVAL)
@@ -322,9 +418,12 @@ def main():
         log.info("Shutting down...")
     finally:
         ticks_f.flush()
+        with binance_lock:
+            binance_f.flush()
         markets_f.close()
         ticks_f.close()
         resolutions_f.close()
+        binance_f.close()
         log.info(f"Final: {stats}")
 
 
