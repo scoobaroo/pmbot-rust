@@ -221,7 +221,7 @@ function renderOrbFeed(trades) {
   const countEl = document.getElementById('orb-count');
   const lastEl = document.getElementById('orb-last');
 
-  const entries = trades.filter(t => t.action === 'ENTRY');
+  const entries = trades.filter(t => t.action === 'FILLED' || t.action === 'ENTRY');
   const resolved = trades.filter(t => t.action === 'WON' || t.action === 'LOST');
   const wins = resolved.filter(t => t.action === 'WON').length;
   const losses = resolved.filter(t => t.action === 'LOST').length;
@@ -248,8 +248,8 @@ function renderOrbFeed(trades) {
   body.innerHTML = trades.slice(0, 50).map(t => {
     const time = new Date(t.timestamp).toLocaleTimeString();
     const isResult = t.action === 'WON' || t.action === 'LOST';
-    const rowClass = t.action === 'ENTRY' ? 'orb-row-entry' : t.action === 'WON' ? 'orb-row-won' : t.action === 'LOST' ? 'orb-row-lost' : t.action === 'EXIT' ? 'orb-row-exit' : 'orb-row-rejected';
-    const badgeClass = t.action === 'ENTRY' ? 'badge-entry' : t.action === 'WON' ? 'badge-won' : t.action === 'LOST' ? 'badge-lost' : 'badge-exit';
+    const rowClass = (t.action === 'ENTRY' || t.action === 'FILLED') ? 'orb-row-entry' : t.action === 'WON' ? 'orb-row-won' : t.action === 'LOST' ? 'orb-row-lost' : t.action === 'EXIT' ? 'orb-row-exit' : 'orb-row-rejected';
+    const badgeClass = (t.action === 'ENTRY' || t.action === 'FILLED') ? 'badge-entry' : t.action === 'WON' ? 'badge-won' : t.action === 'LOST' ? 'badge-lost' : 'badge-exit';
     const sideClass = t.side === 'BUY' ? 'badge-buy' : 'badge-sell';
     const window = t.window_secs === 300 ? '5m' : t.window_secs === 900 ? '15m' : t.window_secs > 0 ? `${t.window_secs}s` : '';
 

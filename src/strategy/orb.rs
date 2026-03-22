@@ -188,6 +188,8 @@ pub struct OrbStrategy {
     prev_vwap: HashMap<String, f64>,
     /// Optional web state for pushing live trade events to the dashboard.
     web_state: Option<SharedWebState>,
+    /// Maps order_id → condition_id so we can link OrderFilled back to position.
+    pending_orders: HashMap<String, String>,
 }
 
 impl OrbStrategy {
@@ -205,6 +207,7 @@ impl OrbStrategy {
             prev_close: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
+            pending_orders: HashMap::new(),
         }
     }
 
@@ -630,20 +633,7 @@ impl OrbStrategy {
             max_implied_seen: 0.0,
         };
         OrbDataLogger::log_entry(&pos, &market.condition_id);
-        self.push_web_event(OrbTradeEvent {
-            timestamp: pos.entry_time.to_rfc3339(),
-            symbol: pos.symbol.clone(),
-            side: format!("{}", pos.side),
-            action: "ENTRY".to_string(),
-            price: aggressive_price.to_f64().unwrap_or(0.0),
-            size_usd: size_usd.to_f64().unwrap_or(0.0),
-            move_pct,
-            accuracy,
-            edge,
-            flow,
-            window_secs: pos.window_secs,
-            reason: String::new(),
-        });
+        // Web dashboard event pushed on OrderFilled, not here — only filled orders count
         self.open_positions.insert(market.condition_id.clone(), pos);
 
         Some(TradeSignal {
@@ -893,6 +883,13 @@ impl Strategy for OrbStrategy {
             }
             StrategyEvent::ExecutionFeedback(event) => {
                 match &event {
+                    crate::types::events::ExecutionEvent::OrderPlaced(order) => {
+                        // Track order_id → condition_id for linking fills to positions
+                        self.pending_orders.insert(
+                            order.id.clone(),
+                            order.condition_id.clone(),
+                        );
+                    }
                     crate::types::events::ExecutionEvent::OrderFilled(fill) => {
                         info!(
                             order_id = %fill.order_id,
@@ -900,8 +897,29 @@ impl Strategy for OrbStrategy {
                             size = %fill.size,
                             "ORB: order filled"
                         );
+
+                        // Push FILLED event to dashboard using position data
+                        if let Some(cid) = self.pending_orders.remove(&fill.order_id) {
+                            if let Some(pos) = self.open_positions.get(&cid) {
+                                self.push_web_event(OrbTradeEvent {
+                                    timestamp: fill.timestamp.to_rfc3339(),
+                                    symbol: pos.symbol.clone(),
+                                    side: format!("{}", fill.side),
+                                    action: "FILLED".to_string(),
+                                    price: fill.price.to_f64().unwrap_or(0.0),
+                                    size_usd: (fill.price * fill.size).to_f64().unwrap_or(0.0),
+                                    move_pct: pos.move_pct,
+                                    accuracy: pos.accuracy,
+                                    edge: pos.edge,
+                                    flow: pos.flow,
+                                    window_secs: pos.window_secs,
+                                    reason: format!("fee: {:.4}", fill.fee),
+                                });
+                            }
+                        }
                     }
                     crate::types::events::ExecutionEvent::OrderFailed { order_id, error } => {
+                        self.pending_orders.remove(order_id);
                         warn!(order_id = %order_id, error = %error, "ORB: order failed");
                     }
                     crate::types::events::ExecutionEvent::MarketResolved { condition_id, pnl, won } => {
@@ -982,6 +1000,7 @@ mod tests {
             prev_close: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
+            pending_orders: HashMap::new(),
         }
     }
 
