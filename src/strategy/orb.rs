@@ -34,8 +34,11 @@ const MAX_RISK_PER_TRADE_PCT: f64 = 0.04; // 4% of bankroll per trade
 /// Maximum percentage of bankroll in open positions at once.
 const MAX_TOTAL_EXPOSURE_PCT: f64 = 0.25; // 25% max deployed at once
 
-/// Pause trading after this many consecutive losses.
-const MAX_CONSECUTIVE_LOSSES: u32 = 3;
+/// After this many consecutive losses, fall back to confirmed-only mode (no velocity).
+const SLOW_MODE_AFTER_LOSSES: u32 = 2;
+
+/// After this many consecutive losses, pause trading entirely.
+const PAUSE_AFTER_LOSSES: u32 = 4;
 
 /// How long to pause after hitting the loss streak (in seconds).
 const COOLDOWN_SECS: i64 = 1800; // 30 minutes
@@ -401,25 +404,26 @@ impl OrbStrategy {
     /// Percentage thresholds (cross-coin):
     ///   BTC $70K: 0.06% = ~$42, 0.10% = ~$70, 0.15% = ~$105
     ///   ETH $2K:  0.06% = ~$1.2, 0.10% = ~$2,  0.15% = ~$3
-    fn empirical_accuracy(move_pct: f64, elapsed_secs: i64) -> Option<f64> {
+    fn empirical_accuracy(move_pct: f64, elapsed_secs: i64, velocity_enabled: bool) -> Option<f64> {
         let elapsed = elapsed_secs.max(1); // avoid division by zero
 
         // === Velocity tiers: fast entries before market reprices ===
-        // The edge here isn't accuracy — it's entry price. At 10s the token
-        // is still at 50-55¢. By 45s it's at 75¢+. Same move, worse price.
-        if elapsed <= 10 {
-            // Violent breakout in ≤10s — market hasn't repriced
-            if move_pct >= 0.15 { return Some(0.85); }  // massive move, very fast
-            if move_pct >= 0.10 { return Some(0.72); }  // strong move, very fast
-        } else if elapsed <= 15 {
-            if move_pct >= 0.15 { return Some(0.88); }
-            if move_pct >= 0.10 { return Some(0.75); }
-            if move_pct >= 0.07 { return Some(0.68); }
-        } else if elapsed <= 20 {
-            if move_pct >= 0.15 { return Some(0.90); }
-            if move_pct >= 0.10 { return Some(0.78); }
-            if move_pct >= 0.07 { return Some(0.72); }
-            if move_pct >= 0.06 { return Some(0.68); }
+        // Only active when velocity_enabled (no loss streak).
+        // After 2+ losses, fall back to confirmed tiers only.
+        if velocity_enabled {
+            if elapsed <= 10 {
+                if move_pct >= 0.15 { return Some(0.85); }
+                if move_pct >= 0.10 { return Some(0.72); }
+            } else if elapsed <= 15 {
+                if move_pct >= 0.15 { return Some(0.88); }
+                if move_pct >= 0.10 { return Some(0.75); }
+                if move_pct >= 0.07 { return Some(0.68); }
+            } else if elapsed <= 20 {
+                if move_pct >= 0.15 { return Some(0.90); }
+                if move_pct >= 0.10 { return Some(0.78); }
+                if move_pct >= 0.07 { return Some(0.72); }
+                if move_pct >= 0.06 { return Some(0.68); }
+            }
         }
 
         // === Mid-window momentum (150s+) — highest accuracy entries ===
@@ -498,19 +502,22 @@ impl OrbStrategy {
     }
 
     fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
-        // --- Circuit breaker: pause after consecutive losses ---
+        // --- Circuit breaker: escalating response to loss streaks ---
+        // 0-1 losses: full speed (velocity + confirmed)
+        // 2-3 losses: slow mode (confirmed only, no velocity)
+        // 4+ losses: pause 30 minutes
         if let Some(cooldown) = self.cooldown_until {
             if self.current_time() < cooldown {
                 return None; // still in cooldown
             }
-            // Cooldown expired — resume trading
             info!(
                 consecutive_losses = self.consecutive_losses,
-                "ORB: cooldown expired — resuming trading"
+                "ORB: cooldown expired — resuming in slow mode"
             );
             self.cooldown_until = None;
-            self.consecutive_losses = 0;
+            // Don't reset losses — stay in slow mode until a win
         }
+        let velocity_enabled = self.consecutive_losses < SLOW_MODE_AFTER_LOSSES;
 
         let (window_start_ts, window_secs) = match market.market_type {
             MarketType::UpDown {
@@ -631,7 +638,12 @@ impl OrbStrategy {
             }
         }
 
-        let accuracy = match Self::empirical_accuracy(move_pct, elapsed) {
+        if !velocity_enabled && elapsed < 30 {
+            // In slow mode, skip anything under 30s — wait for confirmation
+            return None;
+        }
+
+        let accuracy = match Self::empirical_accuracy(move_pct, elapsed, velocity_enabled) {
             Some(a) => a,
             None => {
                 debug!(
@@ -1236,17 +1248,27 @@ impl Strategy for OrbStrategy {
 
                         // Track consecutive losses for circuit breaker
                         if *won {
+                            if self.consecutive_losses >= SLOW_MODE_AFTER_LOSSES {
+                                info!("ORB: win after loss streak — back to full speed");
+                            }
                             self.consecutive_losses = 0;
                         } else {
                             self.consecutive_losses += 1;
-                            if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES {
+                            if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
+                                warn!(
+                                    consecutive_losses = self.consecutive_losses,
+                                    "ORB: {} losses — switching to slow mode (confirmed entries only)",
+                                    self.consecutive_losses
+                                );
+                            }
+                            if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
                                 let cooldown_end = Utc::now() + chrono::Duration::seconds(COOLDOWN_SECS);
                                 self.cooldown_until = Some(cooldown_end);
                                 warn!(
                                     consecutive_losses = self.consecutive_losses,
                                     cooldown_minutes = COOLDOWN_SECS / 60,
-                                    "ORB: loss streak circuit breaker — pausing for {}min",
-                                    COOLDOWN_SECS / 60
+                                    "ORB: {} losses — pausing for {}min",
+                                    self.consecutive_losses, COOLDOWN_SECS / 60
                                 );
                             }
                         }
@@ -1401,43 +1423,40 @@ mod tests {
 
     #[test]
     fn test_accuracy_tiers() {
-        // === Velocity tiers (≤20s) ===
-        // Too small even at high velocity
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 5), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 10), None);
-        // 0.10% in ≤10s — violent breakout
-        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 8), Some(0.72));
-        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 5), Some(0.85));
-        // 0.07% in ≤15s — strong breakout
-        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 12), Some(0.68));
-        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 15), Some(0.75));
-        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 14), Some(0.88));
-        // 0.06% in ≤20s — decent breakout
-        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 18), Some(0.68));
-        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 20), Some(0.72));
-        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 20), Some(0.78));
+        // === Velocity tiers (≤20s, velocity_enabled=true) ===
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 5, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 10, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 8, true), Some(0.72));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 5, true), Some(0.85));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 12, true), Some(0.68));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 15, true), Some(0.75));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 14, true), Some(0.88));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 18, true), Some(0.68));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 20, true), Some(0.72));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 20, true), Some(0.78));
 
-        // === Confirmed tiers (30s+) ===
-        // Too small at any confirmed time
-        assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90), None);
-        // 0.05% — no early tier (dropped)
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60), None);
-        // 0.06% needs 50s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 49), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 50), Some(0.74));
-        // 0.07% needs 45s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45), Some(0.76));
-        // 0.15% needs 30s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 29), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 30), Some(0.92));
-        // Mid-window: 0.05% at 150s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 150), Some(0.87));
-        // Mid-window: 0.10% at 180s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 180), Some(0.91));
-        // Mid-window: 0.20% at 180s
-        assert_eq!(OrbStrategy::empirical_accuracy(0.20, 180), Some(0.94));
+        // === Velocity disabled (slow mode after losses) — same moves return None ===
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 8, false), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 5, false), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 12, false), None);
+
+        // === Confirmed tiers (30s+) — work in both modes ===
+        assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 49, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.06, 50, true), Some(0.74));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45, true), Some(0.76));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 29, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 30, true), Some(0.92));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 150, true), Some(0.87));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.10, 180, true), Some(0.91));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.20, 180, true), Some(0.94));
+
+        // Confirmed tiers work even with velocity disabled
+        assert_eq!(OrbStrategy::empirical_accuracy(0.07, 45, false), Some(0.76));
+        assert_eq!(OrbStrategy::empirical_accuracy(0.15, 30, false), Some(0.92));
     }
 
     #[test]
