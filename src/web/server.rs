@@ -43,7 +43,7 @@ pub async fn poll_resolutions(
     wallet_address: String,
     shutdown: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut seen_redeems: HashSet<String> = HashSet::new();
 

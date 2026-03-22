@@ -28,11 +28,17 @@ const ATR_PERIOD: usize = 14;
 /// Minimum ATR multiple for a move to qualify. Below this, the move is noise.
 const MIN_ATR_MULTIPLE: f64 = 0.7;
 
-/// Take profit floor: exit when implied prob reaches this level.
+/// Take profit floor: exit when book bid reaches this level.
 const TAKE_PROFIT_MIN: f64 = 0.75;
 
 /// Take profit ceiling: above this, let it resolve to $1.00 instead of paying exit fees.
 const TAKE_PROFIT_MAX: f64 = 0.95;
+
+/// Only take profit when less than this many seconds remain in the window.
+const TAKE_PROFIT_TIME_REMAINING_SECS: i64 = 120;
+
+/// Max spread to allow take-profit exit. If spread is wider, hold to resolution.
+const TAKE_PROFIT_MAX_SPREAD: f64 = 0.06;
 
 /// Tracks an open ORB position for early exit logic and data recording.
 #[derive(Debug, Clone)]
@@ -56,6 +62,8 @@ struct OrbPosition {
     atr_multiple: f64,
     /// Window duration (300 or 900).
     window_secs: u32,
+    /// Timestamp when this market's window ends.
+    window_end_ts: i64,
     /// Max favorable excursion — peak book bid seen after entry.
     max_bid_seen: f64,
     /// Max implied prob seen after entry (for comparison with bid).
@@ -238,6 +246,17 @@ impl OrbStrategy {
             .map(|p| p.timestamp)
             .max()
             .unwrap_or_else(Utc::now)
+    }
+
+    /// Look up spread from orderbook for a token.
+    fn get_book_spread(&self, token_id: &str) -> Option<f64> {
+        let cache = self.book_cache.as_ref()?;
+        let books = cache.try_read().ok()?;
+        let snap = books.get(token_id)?;
+        if !snap.is_fresh(self.ws_book_max_stale_secs) {
+            return None;
+        }
+        Some(snap.spread.to_f64().unwrap_or(1.0))
     }
 
     /// Look up best bid from orderbook for exit pricing.
@@ -710,6 +729,7 @@ impl OrbStrategy {
             move_pct,
             atr_multiple: atr_multiple.unwrap_or(0.0),
             window_secs: window_secs_u32 as u32,
+            window_end_ts: window_start_ts + window_secs as i64,
             max_bid_seen: 0.0,
             max_implied_seen: 0.0,
         };
@@ -741,9 +761,9 @@ impl OrbStrategy {
     /// Check all open positions for take-profit exits based on orderbook best bid.
     /// Called on every exchange price tick for maximum responsiveness.
     fn check_take_profits(&mut self) -> Vec<TradeSignal> {
-        // Phase 1: collect book bids and implied prices for all open positions
+        // Phase 1: collect book bids, spreads, and implied prices for all open positions
         // (avoids borrow conflicts with self.get_book_bid / self.markets)
-        let mut position_data: Vec<(String, Option<Decimal>, f64)> = Vec::new(); // (cid, book_bid, implied)
+        let mut position_data: Vec<(String, Option<Decimal>, f64, Option<f64>)> = Vec::new(); // (cid, book_bid, implied, spread)
         for (cid, pos) in &self.open_positions {
             let (token_id, implied) = match pos.side {
                 Side::Buy => (
@@ -755,12 +775,14 @@ impl OrbStrategy {
                     self.markets.get(cid).map(|m| m.implied_prob_no.to_f64().unwrap_or(0.0)).unwrap_or(0.0),
                 ),
             };
+            let tid_clone = token_id.clone();
             let bid = token_id.and_then(|tid| self.get_book_bid(&tid));
-            position_data.push((cid.clone(), bid, implied));
+            let spread = tid_clone.and_then(|tid| self.get_book_spread(&tid));
+            position_data.push((cid.clone(), bid, implied, spread));
         }
 
         // Phase 2: update MFE tracking
-        for (cid, bid, implied) in &position_data {
+        for (cid, bid, implied, _) in &position_data {
             if let Some(pos) = self.open_positions.get_mut(cid) {
                 if let Some(best_bid) = bid {
                     let bid_f64 = best_bid.to_f64().unwrap_or(0.0);
@@ -774,17 +796,20 @@ impl OrbStrategy {
             }
         }
 
-        // Phase 3: generate exit signals
+        // Phase 3: generate exit signals — only when time is running out and spread is tight
         let now = self.current_time();
+        let now_ts = now.timestamp();
         let mut signals = Vec::new();
         let mut to_close = Vec::new();
 
-        for (cid, bid, _) in &position_data {
+        for (cid, bid, _, spread) in &position_data {
             let best_bid = match bid {
                 Some(b) => *b,
                 None => continue,
             };
             let bid_f64 = best_bid.to_f64().unwrap_or(0.0);
+
+            // Must be in profitable range
             if bid_f64 < TAKE_PROFIT_MIN || bid_f64 > TAKE_PROFIT_MAX {
                 continue;
             }
@@ -793,6 +818,24 @@ impl OrbStrategy {
                 Some(p) => p.clone(),
                 None => continue,
             };
+
+            // Only take profit when < 2 minutes remaining in the window
+            let time_remaining = pos.window_end_ts - now_ts;
+            if time_remaining > TAKE_PROFIT_TIME_REMAINING_SECS {
+                continue;
+            }
+
+            // Don't exit into a wide spread — hold to resolution instead
+            let current_spread = spread.unwrap_or(1.0);
+            if current_spread > TAKE_PROFIT_MAX_SPREAD {
+                debug!(
+                    condition_id = %cid,
+                    spread = format!("{:.3}", current_spread),
+                    "ORB: spread too wide for take-profit, holding to resolution"
+                );
+                continue;
+            }
+
             let market = match self.markets.get(cid).cloned() {
                 Some(m) => m,
                 None => continue,
@@ -806,9 +849,10 @@ impl OrbStrategy {
                 side = %pos.side,
                 entry = format!("{:.2}", entry_f64),
                 best_bid = %best_bid,
+                spread = format!("{:.3}", current_spread),
                 profit = format!("{:+.1}%", profit_pct),
-                max_bid = format!("{:.2}", pos.max_bid_seen),
-                "ORB: take-profit exit at book bid"
+                time_remaining_secs = time_remaining,
+                "ORB: take-profit exit — locking in gains before window end"
             );
 
             OrbDataLogger::log_exit(&pos, cid, "take_profit", bid_f64, profit_pct);
@@ -1153,6 +1197,7 @@ mod tests {
             move_pct: 0.07,
             atr_multiple: 1.5,
             window_secs: 300,
+            window_end_ts: Utc::now().timestamp() + 300,
             max_bid_seen: 0.0,
             max_implied_seen: 0.0,
         }
@@ -1612,14 +1657,17 @@ mod tests {
         let window_start = now.timestamp() - 60;
 
         // Set up a market and an open position (bought YES at 0.60)
+        // Window ends in 60s — within take-profit time window
         let market = make_updown_market("m1", 80000.0, window_start, 0.55);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
+        let mut pos = make_test_position(Side::Buy, 0.60, 50.0);
+        pos.window_end_ts = now.timestamp() + 60; // 60s remaining
+        strategy.open_positions.insert("m1".to_string(), pos);
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 80100.0, now),
         );
-        // Book bid at 0.80 for the YES token
+        // Book bid at 0.80 for the YES token, tight spread
         seed_book_cache(&mut strategy, "m1-yes", 0.80);
 
         // Take-profit triggers on exchange PriceUpdate tick (not PolymarketUpdate)
@@ -1715,15 +1763,17 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
 
-        // Holding a NO position (Side::Sell)
+        // Holding a NO position (Side::Sell), window ends in 60s
         let market = make_updown_market("m1", 80000.0, window_start, 0.45);
         strategy.markets.insert("m1".to_string(), market);
-        strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Sell, 0.55, 50.0));
+        let mut pos = make_test_position(Side::Sell, 0.55, 50.0);
+        pos.window_end_ts = now.timestamp() + 60;
+        strategy.open_positions.insert("m1".to_string(), pos);
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price("BTC-USD", 79800.0, now),
         );
-        // Book bid at 0.80 for the NO token
+        // Book bid at 0.80 for the NO token, tight spread
         seed_book_cache(&mut strategy, "m1-no", 0.80);
 
         // Take-profit triggers on exchange PriceUpdate tick
