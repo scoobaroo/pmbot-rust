@@ -471,6 +471,30 @@ impl OrbStrategy {
             }
         }
 
+        // --- Oracle confirmation: Polymarket resolves against Chainlink, not Binance ---
+        // If oracle price is available, verify the move is confirmed on-chain.
+        // A Binance spike that Chainlink hasn't confirmed won't resolve in our favor.
+        if let Some(oracle) = price.oracle_price {
+            let oracle_f64 = oracle.to_f64().unwrap_or(0.0);
+            if oracle_f64 > 0.0 {
+                let oracle_move = oracle_f64 - start_price;
+                if (price_move > 0.0 && oracle_move <= 0.0) || (price_move < 0.0 && oracle_move >= 0.0) {
+                    debug!(
+                        question = %market.question,
+                        exchange_move = format!("{:+.1}", price_move),
+                        oracle_move = format!("{:+.1}", oracle_move),
+                        "ORB: oracle doesn't confirm exchange direction — skipping"
+                    );
+                    OrbDataLogger::log_rejection(
+                        &market.condition_id, &market.underlying_symbol,
+                        "oracle_disagrees", move_pct, price.trade_flow_imbalance, elapsed,
+                        atr_val.map(|a| if a > 0.0 { move_abs / a } else { 0.0 }).unwrap_or(0.0),
+                    );
+                    return None;
+                }
+            }
+        }
+
         // --- Momentum filter: price must still be moving in breakout direction ---
         // Catches false breakouts where BTC spikes then reverses before we enter.
         if let Some(&prev) = self.prev_vwap.get(&market.underlying_symbol) {
