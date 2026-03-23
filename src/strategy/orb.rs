@@ -1038,9 +1038,12 @@ impl OrbStrategy {
         signals
     }
 
-    /// Garbage-collect expired markets.
+    /// Garbage-collect expired markets and self-resolve expired positions.
+    /// Uses current BTC/ETH price vs start price to determine WIN/LOSS
+    /// since the Gamma API resolution path is unreliable for UpDown markets.
     fn gc_expired_markets(&mut self) {
         let now = self.current_time();
+        let now_ts = now.timestamp();
         let expired: Vec<String> = self
             .markets
             .iter()
@@ -1049,10 +1052,101 @@ impl OrbStrategy {
             .collect();
 
         for cid in &expired {
+            // Self-resolve expired positions using BTC/ETH spot price
+            if let Some(pos) = self.open_positions.get(cid) {
+                if now_ts > pos.window_end_ts + 5 {
+                    // Get the start price for this market
+                    let start_price = self.updown_start_prices.get(cid)
+                        .map(|(sp, _)| *sp);
+                    let current_price = self.latest_prices.get(&pos.symbol)
+                        .map(|p| p.vwap.to_f64().unwrap_or(0.0));
+
+                    if let (Some(start), Some(current)) = (start_price, current_price) {
+                        let went_up = current > start;
+                        let won = match pos.side {
+                            Side::Buy => went_up,   // bought UP, price went up = win
+                            Side::Sell => !went_up,  // bought DOWN, price went down = win
+                        };
+                        let result = if won { "WON" } else { "LOST" };
+                        let entry_f64 = pos.entry_price.to_f64().unwrap_or(0.5);
+                        let pnl = if won {
+                            pos.size_usd.to_f64().unwrap_or(0.0) * (1.0 / entry_f64 - 1.0)
+                        } else {
+                            -(pos.size_usd.to_f64().unwrap_or(0.0))
+                        };
+
+                        info!(
+                            condition_id = %cid,
+                            symbol = %pos.symbol,
+                            side = %pos.side,
+                            entry = format!("{:.2}", entry_f64),
+                            start_price = format!("{:.1}", start),
+                            current_price = format!("{:.1}", current),
+                            pnl = format!("{:+.2}", pnl),
+                            result,
+                            "ORB: self-resolved expired position"
+                        );
+
+                        // Update bankroll
+                        self.bankroll += pnl;
+
+                        // Track consecutive losses for circuit breaker
+                        if won {
+                            if self.consecutive_losses >= SLOW_MODE_AFTER_LOSSES {
+                                info!("ORB: win after loss streak — back to full speed");
+                            }
+                            self.consecutive_losses = 0;
+                        } else {
+                            self.consecutive_losses += 1;
+                            if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
+                                warn!(
+                                    consecutive_losses = self.consecutive_losses,
+                                    "ORB: {} losses — switching to slow mode",
+                                    self.consecutive_losses
+                                );
+                            }
+                            if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
+                                let cooldown_end = now + chrono::Duration::seconds(COOLDOWN_SECS);
+                                self.cooldown_until = Some(cooldown_end);
+                                warn!(
+                                    consecutive_losses = self.consecutive_losses,
+                                    "ORB: {} losses — pausing 30min",
+                                    self.consecutive_losses
+                                );
+                            }
+                        }
+
+                        info!(
+                            bankroll = format!("${:.0}", self.bankroll),
+                            consecutive_losses = self.consecutive_losses,
+                            "ORB: bankroll updated"
+                        );
+
+                        OrbDataLogger::log_exit(
+                            pos, cid, result, 0.0, pnl,
+                        );
+
+                        self.push_web_event(OrbTradeEvent {
+                            timestamp: now.to_rfc3339(),
+                            symbol: pos.symbol.clone(),
+                            side: format!("{}", pos.side),
+                            action: result.to_string(),
+                            price: entry_f64,
+                            size_usd: pnl,
+                            move_pct: pos.move_pct,
+                            accuracy: pos.accuracy,
+                            edge: pnl,
+                            flow: pos.flow,
+                            window_secs: pos.window_secs,
+                            reason: format!("P&L: ${:+.2} | start:{:.0} end:{:.0}", pnl, start, current),
+                        });
+                    }
+                    self.open_positions.remove(cid);
+                }
+            }
+
             self.markets.remove(cid);
             self.updown_start_prices.remove(cid);
-            // Don't remove open_positions here — wait for MarketResolved
-            // event from execution engine which has the actual W/L outcome.
         }
 
         if !expired.is_empty() {

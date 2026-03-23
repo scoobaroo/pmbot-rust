@@ -445,6 +445,20 @@ impl ExecutionEngine {
             Ok(order_id) => {
                 order.id = order_id;
                 order.status = OrderStatus::Open;
+
+                // Record in paper tracker so resolution checker can find this position.
+                // Without this, expired_updown_condition_ids() returns empty and
+                // MarketResolved events never fire in live mode.
+                let synthetic_fill = Fill {
+                    order_id: order.id.clone(),
+                    price: order.price,
+                    size: order.size,
+                    side: order.side,
+                    timestamp: Utc::now(),
+                    fee: order.size * order.price * Decimal::new(2, 4),
+                };
+                self.paper_tracker.record_fill(&order.condition_id, &synthetic_fill);
+
                 let _ = exec_tx
                     .send(ExecutionEvent::OrderPlaced(order.clone()))
                     .await;
@@ -474,6 +488,15 @@ impl ExecutionEngine {
                         Ok(order_id) => {
                             order.id = order_id;
                             order.status = OrderStatus::Open;
+                            let synthetic_fill = Fill {
+                                order_id: order.id.clone(),
+                                price: order.price,
+                                size: order.size,
+                                side: order.side,
+                                timestamp: Utc::now(),
+                                fee: order.size * order.price * Decimal::new(2, 4),
+                            };
+                            self.paper_tracker.record_fill(&order.condition_id, &synthetic_fill);
                             let _ = exec_tx
                                 .send(ExecutionEvent::OrderPlaced(order.clone()))
                                 .await;
