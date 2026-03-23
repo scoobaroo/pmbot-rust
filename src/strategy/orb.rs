@@ -606,9 +606,12 @@ impl OrbStrategy {
             return None;
         }
 
-        // BTC and ETH only — accuracy tiers validated on backtest data
+        // Supported symbols — validated by live trading data:
+        // BTC: 72% win, +$2007 | ETH: 74% win | SOL: 89% win | XRP: 90% win
         let is_eth = market.underlying_symbol == "ETH-USD";
-        if market.underlying_symbol != "BTC-USD" && !is_eth {
+        let is_alt = market.underlying_symbol == "SOL-USD"
+            || market.underlying_symbol == "XRP-USD";
+        if market.underlying_symbol != "BTC-USD" && !is_eth && !is_alt {
             return None;
         }
 
@@ -642,9 +645,8 @@ impl OrbStrategy {
         let move_abs = price_move.abs();
         let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
 
-        // ETH is noisier — require 0.15%+ (~$3.15) minimum vs BTC's 0.05%
-        // Backtest: ETH at 0.05% only 67% sustained, at 0.15% = 75.5%, at 0.20% = 80%
-        if is_eth && move_pct < 0.15 {
+        // ETH/SOL/XRP are noisier — require 0.15%+ minimum vs BTC's 0.05%
+        if (is_eth || is_alt) && move_pct < 0.15 {
             return None;
         }
 
@@ -925,8 +927,9 @@ impl OrbStrategy {
         // Add 5c to implied price (e.g., 0.55 → 0.60) to ensure instant fill.
         let aggressive_price = (implied_price + Decimal::new(5, 2)).min(Decimal::new(95, 2));
 
-        // Max entry price cap — don't buy above 70¢. Guarantees ≥30% return on win.
-        if aggressive_price > Decimal::new(70, 2) {
+        // Max entry price cap — don't buy above 50¢. Data shows 89% win rate below
+        // 50¢ but only 69% above. Everything above 50¢ is net negative P&L.
+        if aggressive_price > Decimal::new(50, 2) {
             debug!(
                 question = %market.question,
                 price = format!("{:.2}", aggressive_price),
@@ -1708,7 +1711,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 30; // only 30s elapsed
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1729,7 +1732,7 @@ mod tests {
         let window_start = now.timestamp() - 8; // only 8 seconds elapsed
 
         // 0.10% move ($80 on BTC) in 8 seconds — violent breakout
-        let market = make_updown_market("m1", 80000.0, window_start, 0.52);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1757,7 +1760,7 @@ mod tests {
         let window_start = now.timestamp() - 8; // 8 seconds
 
         // 0.05% move in 8s — not big enough for velocity tier
-        let market = make_updown_market("m1", 80000.0, window_start, 0.52);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1778,7 +1781,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.52);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1800,7 +1803,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // 0.075% move up ($60 on BTC), market pricing Up at 0.55
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1823,8 +1826,8 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        // 0.075% move down ($60 on BTC), market pricing Down (No) at 0.55
-        let market = make_updown_market("m1", 80000.0, window_start, 0.45);
+        // 0.075% move down ($60 on BTC), market pricing Down (No) at 0.40
+        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1848,7 +1851,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // $15 move (57% accuracy tier), market already pricing at 0.60
-        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1869,7 +1872,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1896,7 +1899,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // 0.19% move ($150 on BTC) → 0.92 accuracy at early window, market at 0.60
-        let market = make_updown_market("m1", 80000.0, window_start, 0.60);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1952,7 +1955,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // $30 move up but negative trade flow (sellers dominating)
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -1974,7 +1977,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // $60 move up with negative flow — ALL tiers now require strong confirming flow
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -2019,7 +2022,7 @@ mod tests {
         let window_start = now.timestamp() - 120;
 
         // No ATR data yet — filter should pass through (not block)
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -2040,7 +2043,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -2063,7 +2066,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy
             .updown_start_prices
@@ -2090,7 +2093,7 @@ mod tests {
 
         // Set up a market and an open position (bought YES at 0.60)
         // Window ends in 60s — within take-profit time window
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         let mut pos = make_test_position(Side::Buy, 0.60, 50.0);
         pos.window_end_ts = now.timestamp() + 60; // 60s remaining
@@ -2121,7 +2124,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
@@ -2146,7 +2149,7 @@ mod tests {
         let now = Utc::now();
         let window_start = now.timestamp() - 60;
 
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
@@ -2172,7 +2175,7 @@ mod tests {
         let window_start = now.timestamp() - 60;
 
         // No book cache at all — should not exit even if implied is high
-        let market = make_updown_market("m1", 80000.0, window_start, 0.55);
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
         strategy.markets.insert("m1".to_string(), market);
         strategy.open_positions.insert("m1".to_string(), make_test_position(Side::Buy, 0.60, 50.0));
         strategy.latest_prices.insert(
