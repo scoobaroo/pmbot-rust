@@ -68,6 +68,8 @@ pub struct AggregatedPrice {
     pub funding_rate: Option<f64>,
     /// Binance Futures mark price.
     pub mark_price: Option<Decimal>,
+    /// Binance spot mid-price, if available.
+    pub binance_mid: Option<Decimal>,
 }
 
 /// Whether a market is bullish ("reach $X") or bearish ("dip to $X").

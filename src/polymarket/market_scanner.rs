@@ -17,6 +17,9 @@ const UPDOWN_ASSETS: &[(&str, &str)] = &[
     ("eth", "ETH-USD"),
     ("sol", "SOL-USD"),
     ("xrp", "XRP-USD"),
+    ("doge", "DOGE-USD"),
+    ("bnb", "BNB-USD"),
+    ("hype", "HYPE-USD"),
 ];
 
 pub struct MarketScanner {
@@ -26,6 +29,9 @@ pub struct MarketScanner {
     token_tx: mpsc::Sender<Vec<String>>,
     updown_enabled: bool,
     updown_only: bool,
+    general_enabled: bool,
+    general_poll_interval_secs: u64,
+    general_min_liquidity: u64,
 }
 
 impl MarketScanner {
@@ -34,6 +40,9 @@ impl MarketScanner {
         token_tx: mpsc::Sender<Vec<String>>,
         updown_enabled: bool,
         updown_only: bool,
+        general_enabled: bool,
+        general_poll_interval_secs: u64,
+        general_min_liquidity: u64,
     ) -> Self {
         Self {
             http: Client::new(),
@@ -42,6 +51,9 @@ impl MarketScanner {
             token_tx,
             updown_enabled,
             updown_only,
+            general_enabled,
+            general_poll_interval_secs,
+            general_min_liquidity,
         }
     }
 
@@ -49,12 +61,15 @@ impl MarketScanner {
         info!(
             updown_enabled = self.updown_enabled,
             updown_only = self.updown_only,
+            general_enabled = self.general_enabled,
             "Market scanner started"
         );
 
         let mut strike_interval =
             tokio::time::interval(std::time::Duration::from_secs(self.poll_interval_secs));
-        let mut updown_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut updown_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut general_interval =
+            tokio::time::interval(std::time::Duration::from_secs(self.general_poll_interval_secs));
 
         loop {
             tokio::select! {
@@ -73,6 +88,13 @@ impl MarketScanner {
                     self.poll_and_send(
                         self.scan_updown_markets().await,
                         "up/down markets",
+                        &tx,
+                    ).await;
+                }
+                _ = general_interval.tick(), if self.general_enabled => {
+                    self.poll_and_send(
+                        self.scan_general_markets().await,
+                        "general markets",
                         &tx,
                     ).await;
                 }
@@ -149,7 +171,7 @@ impl MarketScanner {
     async fn scan_updown_markets(&self) -> Result<Vec<PolymarketMarket>, reqwest::Error> {
         let mut all_markets = Vec::new();
 
-        // Scan both 5-minute and 15-minute UpDown windows
+        // Scan 5-minute and 15-minute UpDown windows (Polymarket doesn't offer 1h)
         let windows: &[(u64, &str)] = &[(300, "5m"), (900, "15m")];
 
         for &(window_secs, label) in windows {
@@ -174,14 +196,20 @@ impl MarketScanner {
                         Some(m) => m,
                         None => continue,
                     };
+                    // Extract priceToBeat from event-level metadata (Chainlink reference price)
+                    let price_to_beat = event
+                        .get("eventMetadata")
+                        .and_then(|em| em.get("priceToBeat"))
+                        .and_then(|p| p.as_f64().or_else(|| p.as_str().and_then(|s| s.parse().ok())));
                     for m in nested {
                         if let Some(market) =
-                            parse_updown_market(m, symbol, window_start, window_secs)
+                            parse_updown_market(m, symbol, window_start, window_secs, price_to_beat)
                         {
                             info!(
                                 question = %market.question,
                                 symbol = %market.underlying_symbol,
                                 window = label,
+                                strike = %market.strike,
                                 token_up = %market.token_id_yes,
                                 implied_up = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
                                 "discovered up/down market"
@@ -195,6 +223,108 @@ impl MarketScanner {
 
         Ok(all_markets)
     }
+
+    /// Scan all active binary markets on Polymarket for 95%+ penny-picking opportunities.
+    async fn scan_general_markets(&self) -> Result<Vec<PolymarketMarket>, reqwest::Error> {
+        let mut all_markets = Vec::new();
+        let mut offset = 0u64;
+        let limit = 100u64;
+
+        loop {
+            let resp = self
+                .http
+                .get(format!("{}/markets", GAMMA_API_URL))
+                .query(&[
+                    ("active", "true"),
+                    ("closed", "false"),
+                    ("limit", &limit.to_string()),
+                    ("offset", &offset.to_string()),
+                    ("liquidity_num_min", &self.general_min_liquidity.to_string()),
+                ])
+                .send()
+                .await?;
+
+            let markets: Vec<serde_json::Value> = resp.json().await?;
+            let batch_len = markets.len();
+
+            for m in &markets {
+                if let Some(market) = parse_general_market(m) {
+                    info!(
+                        question = %market.question,
+                        implied_yes = format!("{:.1}%", market.implied_prob_yes.to_f64().unwrap_or(0.0) * 100.0),
+                        implied_no = format!("{:.1}%", market.implied_prob_no.to_f64().unwrap_or(0.0) * 100.0),
+                        token_yes = %market.token_id_yes,
+                        "discovered general market"
+                    );
+                    all_markets.push(market);
+                }
+            }
+
+            // Stop paginating when we get fewer results than the limit
+            if (batch_len as u64) < limit {
+                break;
+            }
+            offset += limit;
+        }
+
+        Ok(all_markets)
+    }
+}
+
+/// Parse a general binary market for 95%+ penny-picking.
+/// Only accepts binary markets (2 outcomes) where at least one side is >= 95%.
+fn parse_general_market(v: &serde_json::Value) -> Option<PolymarketMarket> {
+    let question = v.get("question")?.as_str()?;
+
+    // Only binary markets (2 outcomes)
+    let outcomes = v.get("outcomes")?;
+    let outcome_count = if let Some(s) = outcomes.as_str() {
+        let parsed: Vec<String> = serde_json::from_str(s).ok()?;
+        parsed.len()
+    } else if let Some(arr) = outcomes.as_array() {
+        arr.len()
+    } else {
+        return None;
+    };
+    if outcome_count != 2 {
+        return None;
+    }
+
+    let yes_price = parse_outcome_price(v, 0).unwrap_or(Decimal::new(50, 2));
+    let no_price = parse_outcome_price(v, 1).unwrap_or(Decimal::ONE - yes_price);
+
+    // Pre-filter: at least one side must be >= 95%
+    let min_prob = Decimal::new(95, 2);
+    if yes_price < min_prob && no_price < min_prob {
+        return None;
+    }
+
+    let condition_id = v.get("conditionId")?.as_str()?.to_string();
+    let (token_yes, token_no) = parse_clob_token_ids(v)?;
+
+    let end_date = v
+        .get("endDate")
+        .or_else(|| v.get("endDateIso"))
+        .and_then(|d| d.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
+
+    let end_date_ts = end_date.timestamp();
+
+    Some(PolymarketMarket {
+        condition_id,
+        token_id_yes: token_yes,
+        token_id_no: token_no,
+        question: question.to_string(),
+        underlying_symbol: "GENERAL".to_string(),
+        strike: Decimal::ZERO,
+        expiry: end_date,
+        implied_prob_yes: yes_price,
+        implied_prob_no: no_price,
+        direction: MarketDirection::Bullish,
+        market_type: MarketType::General { end_date_ts },
+    })
 }
 
 /// Returns the Unix timestamp of the current window start for the given interval.
@@ -328,6 +458,7 @@ fn parse_updown_market(
     symbol: &str,
     window_start_ts: i64,
     window_secs: u64,
+    price_to_beat: Option<f64>,
 ) -> Option<PolymarketMarket> {
     let condition_id = v.get("conditionId")?.as_str()?.to_string();
     let question = v
@@ -360,7 +491,9 @@ fn parse_updown_market(
         token_id_no: token_down, // "Down" token
         question,
         underlying_symbol: symbol.to_string(),
-        strike: Decimal::ZERO, // No strike for up/down
+        strike: price_to_beat
+            .and_then(Decimal::from_f64_retain)
+            .unwrap_or(Decimal::ZERO),
         expiry: end_date,
         implied_prob_yes: up_price,          // P(Up)
         implied_prob_no: down_price,         // P(Down)
@@ -573,12 +706,12 @@ mod tests {
             "endDate": "2026-02-28T12:05:00Z"
         });
 
-        let market = parse_updown_market(&market_json, "BTC-USD", 1772280000, 300).unwrap();
+        let market = parse_updown_market(&market_json, "BTC-USD", 1772280000, 300, Some(84000.0)).unwrap();
         assert_eq!(market.condition_id, "0xup1");
         assert_eq!(market.underlying_symbol, "BTC-USD");
         assert_eq!(market.token_id_yes, "up_token_123");
         assert_eq!(market.token_id_no, "down_token_456");
-        assert_eq!(market.strike, Decimal::ZERO);
+        assert_eq!(market.strike, Decimal::from(84000));
         assert_eq!(market.implied_prob_yes, Decimal::new(52, 2));
         assert_eq!(
             market.market_type,
@@ -619,5 +752,67 @@ mod tests {
 
         let symbols = vec!["BTC-USD".to_string()];
         assert!(parse_crypto_market(&market_json, &symbols).is_none());
+    }
+
+    #[test]
+    fn test_parse_general_market_yes_95() {
+        let market_json = serde_json::json!({
+            "question": "Will the Lakers win the NBA Finals?",
+            "conditionId": "0xgen1",
+            "clobTokenIds": "[\"gen_yes\",\"gen_no\"]",
+            "outcomePrices": "[\"0.96\",\"0.04\"]",
+            "outcomes": "[\"Yes\",\"No\"]",
+            "endDate": "2026-06-30T00:00:00Z"
+        });
+
+        let market = parse_general_market(&market_json).unwrap();
+        assert_eq!(market.condition_id, "0xgen1");
+        assert_eq!(market.underlying_symbol, "GENERAL");
+        assert_eq!(market.token_id_yes, "gen_yes");
+        assert_eq!(market.implied_prob_yes, Decimal::new(96, 2));
+        assert!(matches!(market.market_type, MarketType::General { .. }));
+    }
+
+    #[test]
+    fn test_parse_general_market_no_95() {
+        let market_json = serde_json::json!({
+            "question": "Will it snow in Miami tomorrow?",
+            "conditionId": "0xgen2",
+            "clobTokenIds": "[\"snow_yes\",\"snow_no\"]",
+            "outcomePrices": "[\"0.02\",\"0.98\"]",
+            "outcomes": "[\"Yes\",\"No\"]",
+            "endDate": "2026-04-01T00:00:00Z"
+        });
+
+        let market = parse_general_market(&market_json).unwrap();
+        assert_eq!(market.implied_prob_no, Decimal::new(98, 2));
+    }
+
+    #[test]
+    fn test_parse_general_market_rejects_below_95() {
+        let market_json = serde_json::json!({
+            "question": "Will it rain next week?",
+            "conditionId": "0xgen3",
+            "clobTokenIds": "[\"rain_yes\",\"rain_no\"]",
+            "outcomePrices": "[\"0.60\",\"0.40\"]",
+            "outcomes": "[\"Yes\",\"No\"]",
+            "endDate": "2026-04-01T00:00:00Z"
+        });
+
+        assert!(parse_general_market(&market_json).is_none());
+    }
+
+    #[test]
+    fn test_parse_general_market_rejects_3_outcomes() {
+        let market_json = serde_json::json!({
+            "question": "Who will win the election?",
+            "conditionId": "0xgen4",
+            "clobTokenIds": "[\"a\",\"b\",\"c\"]",
+            "outcomePrices": "[\"0.50\",\"0.30\",\"0.20\"]",
+            "outcomes": "[\"Alice\",\"Bob\",\"Charlie\"]",
+            "endDate": "2026-11-01T00:00:00Z"
+        });
+
+        assert!(parse_general_market(&market_json).is_none());
     }
 }

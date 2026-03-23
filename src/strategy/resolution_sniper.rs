@@ -99,6 +99,23 @@ impl ResolutionSniperStrategy {
             );
         }
 
+        // Capture strike for any markets that don't have one yet
+        let spot_f64 = price.vwap.to_f64().unwrap_or(0.0);
+        if spot_f64 > 0.0 {
+            for (cid, m) in &self.markets {
+                if m.underlying_symbol == price.symbol && !self.strike_prices.contains_key(cid) {
+                    // Will insert below after borrow ends
+                }
+            }
+            let needs_strike: Vec<String> = self.markets.iter()
+                .filter(|(cid, m)| m.underlying_symbol == price.symbol && !self.strike_prices.contains_key(*cid))
+                .map(|(cid, _)| cid.clone())
+                .collect();
+            for cid in needs_strike {
+                self.strike_prices.insert(cid, spot_f64);
+            }
+        }
+
         // Check all UpDown markets for this symbol
         let matching_markets: Vec<PolymarketMarket> = self
             .markets

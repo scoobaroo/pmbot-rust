@@ -297,6 +297,11 @@ impl Aggregator {
             .map(|(r, mp, _)| (Some(*r), Some(*mp)))
             .unwrap_or((None, None));
 
+        let binance_mid = ticks
+            .iter()
+            .find(|t| t.exchange == Exchange::Binance)
+            .map(|t| t.mid());
+
         Some(AggregatedPrice {
             symbol: symbol.to_string(),
             vwap,
@@ -314,6 +319,7 @@ impl Aggregator {
             recent_sell_volume: sell_vol,
             funding_rate,
             mark_price,
+            binance_mid,
         })
     }
 

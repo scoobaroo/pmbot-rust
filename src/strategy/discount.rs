@@ -115,6 +115,7 @@ impl DiscountStrategy {
             let signal = match market.market_type {
                 MarketType::StrikeAbove => self.evaluate_strike_market(market),
                 MarketType::UpDown { .. } => self.evaluate_updown_market(market),
+                MarketType::General { .. } => None, // Discount strategy doesn't handle general markets
             };
             if let Some(s) = signal {
                 signals.push(s);

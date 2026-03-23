@@ -155,7 +155,13 @@ impl CopyTradeBridge {
                                         last_seen.insert(target.clone(), max_ts);
                                     }
 
-                                    for trade in &new_trades {
+                                    // Aggregate fills by condition_id — whales often get
+                                    // multiple partial fills for the same market. Without
+                                    // aggregation we mirror only the first (often tiny) fill
+                                    // and skip the rest as "already mirrored".
+                                    let aggregated = Self::aggregate_trades(&new_trades);
+
+                                    for trade in &aggregated {
                                         self.process_trade(
                                             target,
                                             trade,
@@ -185,6 +191,45 @@ impl CopyTradeBridge {
         }
     }
 
+    /// Aggregate multiple partial fills for the same market into a single
+    /// combined trade. Uses VWAP for the price and sums the USDC size.
+    fn aggregate_trades(trades: &[&TraderTrade]) -> Vec<TraderTrade> {
+        let mut by_market: HashMap<String, TraderTrade> = HashMap::new();
+
+        for trade in trades {
+            let entry = by_market
+                .entry(trade.condition_id.clone())
+                .or_insert_with(|| TraderTrade {
+                    timestamp: trade.timestamp,
+                    condition_id: trade.condition_id.clone(),
+                    size: 0.0,
+                    usdc_size: 0.0,
+                    side: trade.side.clone(),
+                    price: 0.0,
+                    asset: trade.asset.clone(),
+                    outcome_index: trade.outcome_index,
+                    title: trade.title.clone(),
+                    slug: trade.slug.clone(),
+                });
+
+            entry.usdc_size += trade.usdc_size;
+            entry.size += trade.size;
+            // Keep latest timestamp
+            if trade.timestamp > entry.timestamp {
+                entry.timestamp = trade.timestamp;
+            }
+        }
+
+        // Compute VWAP price from total usdc / total size
+        for entry in by_market.values_mut() {
+            if entry.size > 0.0 {
+                entry.price = entry.usdc_size / entry.size;
+            }
+        }
+
+        by_market.into_values().collect()
+    }
+
     async fn process_trade(
         &self,
         target: &str,
@@ -192,6 +237,19 @@ impl CopyTradeBridge {
         mirrored_markets: &mut HashMap<String, String>,
         expert_log: &mut Option<std::fs::File>,
     ) {
+        // Skip short-duration crypto up/down markets — latency kills edge on these.
+        // Only mirror longer-duration markets (sports, politics, general) where
+        // a few seconds of delay doesn't matter.
+        let title_lower = trade.title.to_lowercase();
+        if title_lower.contains("up or down") || trade.slug.contains("updown") {
+            info!(
+                target = target,
+                market = %trade.title,
+                "copy-trade: SKIP — short-duration up/down market (latency too high)"
+            );
+            return;
+        }
+
         // Only one position per market across all wallets.
         // If another wallet already took the opposite side, skip to avoid conflict.
         if let Some(existing_side) = mirrored_markets.get(&trade.condition_id) {
