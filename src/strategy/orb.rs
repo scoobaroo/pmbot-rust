@@ -149,6 +149,11 @@ impl OrbDataLogger {
         elapsed: i64,
         atr_multiple: f64,
     ) {
+        // Only log rejections for moves that were close to qualifying (>0.03%)
+        // Tiny moves are just noise and generate millions of useless rows
+        if move_pct < 0.03 {
+            return;
+        }
         let header = "timestamp,condition_id,symbol,reason,move_pct,flow,elapsed_secs,atr_multiple";
         let row = format!(
             "{},{},{},{},{:.4},{:.3},{},{:.2}",
