@@ -106,6 +106,20 @@ BINANCE_HEADER = [
     "timestamp", "symbol", "price", "bid", "ask", "volume_24h",
     "quote_volume_24h", "trades_24h", "price_change_pct",
     "rsi_14", "macd_line", "macd_signal", "macd_hist",
+    "price_vel_5s", "price_vel_15s", "price_vel_30s",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+]
+OI_HEADER = [
+    "timestamp", "symbol", "open_interest", "open_interest_usd",
+    "oi_change_pct",
+]
+LIQUIDATION_HEADER = [
+    "timestamp", "symbol", "side", "quantity", "price", "usd_value",
+]
+IMBALANCE_HEADER = [
+    "timestamp", "condition_id", "symbol", "side",
+    "bid_depth", "ask_depth", "imbalance_ratio",
+    "weighted_bid_depth", "weighted_ask_depth",
 ]
 FLOW_HEADER = [
     "timestamp", "symbol", "buy_volume", "sell_volume", "net_flow",
@@ -120,6 +134,9 @@ markets_f, markets_w = open_csv("markets.csv", MARKETS_HEADER)
 ticks_f, ticks_w = open_csv("ticks.csv", TICKS_HEADER)
 l2_f, l2_w = open_csv("l2_book.csv", L2_BOOK_HEADER)
 resolutions_f, resolutions_w = open_csv("resolutions.csv", RESOLUTIONS_HEADER)
+oi_f, oi_w = open_csv("open_interest.csv", OI_HEADER)
+liq_f, liq_w = open_csv("liquidations.csv", LIQUIDATION_HEADER)
+imbalance_f, imbalance_w = open_csv("imbalance.csv", IMBALANCE_HEADER)
 binance_f, binance_w = open_csv("binance.csv", BINANCE_HEADER)
 flow_f, flow_w = open_csv("flow.csv", FLOW_HEADER)
 funding_f, funding_w = open_csv("funding.csv", FUNDING_HEADER)
@@ -154,11 +171,33 @@ def compute_rsi(closes: list, period: int = 14) -> float:
 
 def update_indicators(symbol: str, price: float) -> dict:
     if symbol not in indicators:
-        indicators[symbol] = {"closes": [], "ema12": price, "ema26": price, "signal9": 0.0}
+        indicators[symbol] = {
+            "closes": [], "ema12": price, "ema26": price, "signal9": 0.0,
+            "price_history": [],  # (timestamp, price) for velocity
+        }
     ind = indicators[symbol]
     ind["closes"].append(price)
     if len(ind["closes"]) > 100:
         ind["closes"] = ind["closes"][-100:]
+
+    # Track price history for velocity calculation
+    now = time.time()
+    ind["price_history"].append((now, price))
+    # Keep last 60 seconds
+    ind["price_history"] = [(t, p) for t, p in ind["price_history"] if now - t <= 60]
+
+    # Price velocity at different timeframes
+    def velocity(secs):
+        cutoff = now - secs
+        past = [(t, p) for t, p in ind["price_history"] if t <= cutoff + 1]
+        if not past:
+            return 0.0
+        return price - past[-1][1]
+
+    vel_5 = velocity(5)
+    vel_15 = velocity(15)
+    vel_30 = velocity(30)
+
     # EMA updates
     k12, k26, k9 = 2/13, 2/27, 2/10
     ind["ema12"] = price * k12 + ind["ema12"] * (1 - k12)
@@ -167,7 +206,22 @@ def update_indicators(symbol: str, price: float) -> dict:
     ind["signal9"] = macd_line * k9 + ind["signal9"] * (1 - k9)
     histogram = macd_line - ind["signal9"]
     rsi = compute_rsi(ind["closes"])
-    return {"rsi": rsi, "macd_line": macd_line, "macd_signal": ind["signal9"], "macd_hist": histogram}
+
+    # Time encoding (cyclical)
+    import math
+    dt = datetime.now(timezone.utc)
+    hour_frac = dt.hour + dt.minute / 60.0
+    dow = dt.weekday()
+    hour_sin = math.sin(2 * math.pi * hour_frac / 24)
+    hour_cos = math.cos(2 * math.pi * hour_frac / 24)
+    dow_sin = math.sin(2 * math.pi * dow / 7)
+    dow_cos = math.cos(2 * math.pi * dow / 7)
+
+    return {
+        "rsi": rsi, "macd_line": macd_line, "macd_signal": ind["signal9"], "macd_hist": histogram,
+        "vel_5": vel_5, "vel_15": vel_15, "vel_30": vel_30,
+        "hour_sin": hour_sin, "hour_cos": hour_cos, "dow_sin": dow_sin, "dow_cos": dow_cos,
+    }
 
 # Rolling 1-second flow buckets for aggTrade aggregation
 flow_buckets: dict = {}  # symbol -> {buy_vol, sell_vol, buy_cost, sell_cost, buy_n, sell_n, last_flush}
@@ -253,6 +307,9 @@ def start_binance_spot_ws():
                         tick["trades_24h"], f"{tick['price_change_pct']:.2f}",
                         f"{ind['rsi']:.1f}", f"{ind['macd_line']:.2f}",
                         f"{ind['macd_signal']:.2f}", f"{ind['macd_hist']:.2f}",
+                        f"{ind['vel_5']:.2f}", f"{ind['vel_15']:.2f}", f"{ind['vel_30']:.2f}",
+                        f"{ind['hour_sin']:.4f}", f"{ind['hour_cos']:.4f}",
+                        f"{ind['dow_sin']:.4f}", f"{ind['dow_cos']:.4f}",
                     ])
                     stats["binance_ticks"] += 1
                     if stats["binance_ticks"] % 100 == 0:
@@ -357,6 +414,110 @@ def start_binance_futures_ws():
     ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error,
                                  on_close=on_close, on_open=on_open)
     threading.Thread(target=ws.run_forever, daemon=True).start()
+
+
+def start_binance_liquidation_ws():
+    """Futures stream: forceOrder (liquidation events)."""
+    streams = "/".join(f"{s}@forceOrder" for s in ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "dogeusdt", "bnbusdt"])
+    url = f"wss://fstream.binance.com/stream?streams={streams}"
+
+    def on_message(ws, message):
+        try:
+            msg = json.loads(message)
+            data = msg.get("data", msg).get("o", {})
+            symbol_raw = data.get("s", "")
+            symbol = BINANCE_SYMBOL_MAP.get(symbol_raw, symbol_raw)
+            side = data.get("S", "")  # BUY = short liquidated, SELL = long liquidated
+            qty = float(data.get("q", 0))
+            price = float(data.get("p", 0))
+            usd_value = qty * price
+
+            now = datetime.now(timezone.utc).isoformat()
+            with binance_lock:
+                liq_w.writerow([now, symbol, side, f"{qty:.4f}", f"{price:.2f}", f"{usd_value:.2f}"])
+                if usd_value > 50000:
+                    log.info(f"LIQUIDATION {symbol} {side} ${usd_value:.0f}")
+        except Exception as e:
+            log.debug(f"Liquidation WS parse error: {e}")
+
+    def on_error(ws, error):
+        log.warning(f"Liquidation WS error: {error}")
+
+    def on_close(ws, close_status, close_msg):
+        log.warning(f"Liquidation WS closed")
+        time.sleep(3)
+        start_binance_liquidation_ws()
+
+    def on_open(ws):
+        log.info("Binance liquidation WebSocket connected")
+
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error,
+                                 on_close=on_close, on_open=on_open)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+
+
+# Track previous OI for change calculation
+prev_oi: dict = {}  # symbol -> last_oi
+
+def poll_open_interest():
+    """Poll Binance futures open interest every 30s (REST API)."""
+    futures_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+    while True:
+        for sym in futures_symbols:
+            try:
+                r = requests.get(
+                    "https://fapi.binance.com/fapi/v1/openInterest",
+                    params={"symbol": sym},
+                    timeout=5,
+                )
+                r.raise_for_status()
+                data = r.json()
+                oi = float(data.get("openInterest", 0))
+
+                # Get mark price for USD conversion
+                symbol = BINANCE_SYMBOL_MAP.get(sym, sym)
+                mark = latest_binance.get(symbol, {}).get("price", 0)
+                oi_usd = oi * mark if mark else 0
+
+                # Change %
+                last = prev_oi.get(symbol, oi)
+                change_pct = ((oi - last) / last * 100) if last > 0 else 0
+                prev_oi[symbol] = oi
+
+                now = datetime.now(timezone.utc).isoformat()
+                with binance_lock:
+                    oi_w.writerow([now, symbol, f"{oi:.2f}", f"{oi_usd:.0f}", f"{change_pct:.3f}"])
+            except Exception as e:
+                log.debug(f"OI fetch failed for {sym}: {e}")
+        time.sleep(30)
+
+
+def record_imbalance(m: dict, yes_book: dict | None, no_book: dict | None):
+    """Record bid-ask imbalance ratio from L2 book."""
+    now = datetime.now(timezone.utc).isoformat()
+    for book, side_name in [(yes_book, "YES"), (no_book, "NO")]:
+        if not book:
+            continue
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        bid_depth = sum(float(l.get("size", 0)) for l in bids)
+        ask_depth = sum(float(l.get("size", 0)) for l in asks)
+        total = bid_depth + ask_depth
+        imbalance = (bid_depth - ask_depth) / total if total > 0 else 0
+
+        # Weighted depth: size * (1 / distance from mid) — closer levels matter more
+        mid = 0.5
+        if bids and asks:
+            mid = (float(bids[0]["price"]) + float(asks[0]["price"])) / 2
+        w_bid = sum(float(l["size"]) / max(0.01, abs(float(l["price"]) - mid)) for l in bids[:10]) if bids else 0
+        w_ask = sum(float(l["size"]) / max(0.01, abs(float(l["price"]) - mid)) for l in asks[:10]) if asks else 0
+
+        imbalance_w.writerow([
+            now, m["condition_id"], m["symbol"], side_name,
+            f"{bid_depth:.2f}", f"{ask_depth:.2f}", f"{imbalance:.4f}",
+            f"{w_bid:.2f}", f"{w_ask:.2f}",
+        ])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -563,6 +724,10 @@ def main():
     start_binance_spot_ws()
     log.info("Starting Binance futures WS (funding rate + mark price)...")
     start_binance_futures_ws()
+    log.info("Starting Binance liquidation WS...")
+    start_binance_liquidation_ws()
+    log.info("Starting open interest poller (30s interval)...")
+    threading.Thread(target=poll_open_interest, daemon=True).start()
 
     last_discovery = 0
     last_status = 0
@@ -608,6 +773,7 @@ def main():
                 record_tick(m, yes_book, no_book)
                 record_l2_book(m, yes_book, "YES")
                 record_l2_book(m, no_book, "NO")
+                record_imbalance(m, yes_book, no_book)
                 stats["ticks"] += 1
 
             for cid in expired:
@@ -618,10 +784,13 @@ def main():
                 last_status = now
                 ticks_f.flush()
                 l2_f.flush()
+                imbalance_f.flush()
                 with binance_lock:
                     binance_f.flush()
                     flow_f.flush()
                     funding_f.flush()
+                    oi_f.flush()
+                    liq_f.flush()
                 prices = " | ".join(
                     f"{s}=${t['price']:.0f}" for s, t in latest_binance.items()
                 )
@@ -646,7 +815,7 @@ def main():
             binance_f.flush()
             flow_f.flush()
             funding_f.flush()
-        for f in [markets_f, ticks_f, l2_f, resolutions_f, binance_f, flow_f, funding_f]:
+        for f in [markets_f, ticks_f, l2_f, resolutions_f, binance_f, flow_f, funding_f, oi_f, liq_f, imbalance_f]:
             f.close()
         log.info(f"Final: {stats}")
 
