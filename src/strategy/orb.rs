@@ -28,8 +28,8 @@ const ATR_PERIOD: usize = 14;
 /// Minimum ATR multiple for a move to qualify. Below this, the move is noise.
 const MIN_ATR_MULTIPLE: f64 = 0.7;
 
-/// Maximum percentage of bankroll to risk per trade (3-5%).
-const MAX_RISK_PER_TRADE_PCT: f64 = 0.04; // 4% of bankroll per trade
+/// Maximum percentage of bankroll to risk per trade.
+const MAX_RISK_PER_TRADE_PCT: f64 = 0.09; // 9% of bankroll per trade (~$200 at $2200)
 
 /// Maximum percentage of bankroll in open positions at once.
 const MAX_TOTAL_EXPOSURE_PCT: f64 = 0.25; // 25% max deployed at once
@@ -199,6 +199,8 @@ pub struct OrbStrategy {
     updown_start_prices: HashMap<String, (f64, i64)>,
     /// Open positions by condition_id — used for one-entry-per-market and early exit.
     open_positions: HashMap<String, OrbPosition>,
+    /// All condition_ids we've ever signaled — prevents duplicate orders across ticks.
+    entered_markets: std::collections::HashSet<String>,
     fee_calculator: FeeCalculator,
     book_cache: Option<BookCache>,
     ws_book_max_stale_secs: u64,
@@ -237,6 +239,7 @@ impl OrbStrategy {
             latest_prices: HashMap::new(),
             updown_start_prices: HashMap::new(),
             open_positions: HashMap::new(),
+            entered_markets: std::collections::HashSet::new(),
             fee_calculator: FeeCalculator::new(config.fee_rate_bps),
             book_cache: None,
             ws_book_max_stale_secs: config.ws_book_max_stale_secs,
@@ -549,6 +552,9 @@ impl OrbStrategy {
 
         let size = base * fraction;
 
+        // Hard cap: never exceed $200 per trade regardless of bankroll
+        let size = size.min(200.0);
+
         // Cap total exposure: don't exceed 25% of bankroll across all open positions
         let current_exposure: f64 = self.open_positions.values()
             .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
@@ -621,8 +627,13 @@ impl OrbStrategy {
             return None;
         }
 
-        // One entry per market
+        // One entry per market — check both open positions and pending signals
         if self.open_positions.contains_key(&market.condition_id) {
+            return None;
+        }
+        // Also check entered_markets which persists across ticks (open_positions
+        // might not be set yet if two ticks fire before execution confirms)
+        if self.entered_markets.contains(&market.condition_id) {
             return None;
         }
 
@@ -1034,6 +1045,7 @@ impl OrbStrategy {
         OrbDataLogger::log_entry(&pos, &market.condition_id);
         // Web dashboard event pushed on OrderFilled, not here — only filled orders count
         self.open_positions.insert(market.condition_id.clone(), pos);
+        self.entered_markets.insert(market.condition_id.clone());
 
         Some(TradeSignal {
             target: TradeTarget::Polymarket(market.clone()),
@@ -1552,6 +1564,7 @@ mod tests {
             latest_prices: HashMap::new(),
             updown_start_prices: HashMap::new(),
             open_positions: HashMap::new(),
+            entered_markets: std::collections::HashSet::new(),
             fee_calculator: FeeCalculator::new(0),
             book_cache: None,
             ws_book_max_stale_secs: 30,
