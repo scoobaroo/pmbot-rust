@@ -581,6 +581,9 @@ impl OrbStrategy {
             Some(0.76)
         } else if move_pct >= 0.06 && elapsed_secs >= 50 {
             Some(0.74)
+        } else if move_pct >= 0.05 && elapsed_secs >= 60 {
+            // Viable again without +5¢ markup — cheaper entries restore the edge
+            Some(0.72)
         } else {
             None
         }
@@ -616,11 +619,11 @@ impl OrbStrategy {
         // Hard cap: never exceed $200 per trade regardless of bankroll
         let size = size.min(200.0);
 
-        // Cap total exposure: don't exceed 25% of bankroll across all open positions
+        // Cap total exposure at $200 across all open positions
         let current_exposure: f64 = self.open_positions.values()
             .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
             .sum();
-        let remaining = (self.bankroll * MAX_TOTAL_EXPOSURE_PCT) - current_exposure;
+        let remaining = 200.0 - current_exposure;
         let size = size.min(remaining.max(0.0));
 
         // Minimum viable order size ($5)
@@ -728,7 +731,9 @@ impl OrbStrategy {
         let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
 
         // ETH/SOL/XRP are noisier — require 0.15%+ minimum vs BTC's 0.05%
-        if (is_eth || is_alt) && move_pct < 0.15 {
+        // Tiered minimum by noise level: BTC 0.05%, ETH 0.08%, SOL/XRP 0.10%
+        let min_move = if is_alt { 0.10 } else if is_eth { 0.08 } else { 0.0 }; // BTC uses accuracy tiers
+        if min_move > 0.0 && move_pct < min_move {
             return None;
         }
 
@@ -808,7 +813,7 @@ impl OrbStrategy {
         // Weak flow = noise/chop. Require both correct direction AND magnitude ≥0.3.
         let flow = price.trade_flow_imbalance;
         let flow_confirms = (price_move > 0.0 && flow > 0.0) || (price_move < 0.0 && flow < 0.0);
-        let flow_strong = flow.abs() >= 0.25;
+        let flow_strong = flow.abs() >= 0.20;
 
         if !flow_confirms || !flow_strong {
             debug!(
@@ -876,7 +881,7 @@ impl OrbStrategy {
         let entry_price = implied_price.min(Decimal::new(95, 2));
 
         // Max entry price cap — don't buy above 50¢.
-        if entry_price > Decimal::new(50, 2) {
+        if entry_price > Decimal::new(56, 2) {
             debug!(
                 question = %market.question,
                 price = format!("{:.2}", entry_price),

@@ -37,8 +37,7 @@ pub struct Cli {
     pub maker_mode: bool,
 
     /// Maximum position size in USD for live mode (safety cap).
-    /// Defaults to $50 to prevent large losses during initial live testing.
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "200")]
     pub live_max_position_usd: u64,
 }
 
