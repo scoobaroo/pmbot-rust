@@ -859,59 +859,11 @@ impl OrbStrategy {
             return None;
         }
 
-        // --- RSI filter: don't buy overbought, don't sell oversold ---
-        // RSI > 70 = overbought → skip UP bets (likely to reverse down)
-        // RSI < 30 = oversold → skip DOWN bets (likely to bounce)
+        // RSI and MACD are computed and logged for RL training data
+        // but not used as hard filters — they're designed for longer
+        // timeframes and block too many valid 5-minute entries.
         let rsi_val = self.rsi(&market.underlying_symbol);
-        if let Some(rsi) = rsi_val {
-            if side == Side::Buy && rsi > 70.0 {
-                debug!(
-                    question = %market.question,
-                    rsi = format!("{:.1}", rsi),
-                    "ORB: RSI overbought (>70) — skipping UP bet"
-                );
-                return None;
-            }
-            if side == Side::Sell && rsi < 30.0 {
-                debug!(
-                    question = %market.question,
-                    rsi = format!("{:.1}", rsi),
-                    "ORB: RSI oversold (<30) — skipping DOWN bet"
-                );
-                return None;
-            }
-            // RSI confirms trend — slight accuracy boost
-            let rsi_confirms = (side == Side::Sell && rsi > 55.0)
-                || (side == Side::Buy && rsi < 45.0);
-            if rsi_confirms {
-                accuracy = (accuracy + 0.02).min(0.98);
-            }
-        }
-
-        // --- MACD filter: require histogram alignment with trade direction ---
-        // Positive histogram = bullish momentum → confirms UP bets
-        // Negative histogram = bearish momentum → confirms DOWN bets
         let macd_val = self.macd(&market.underlying_symbol);
-        if let Some((macd_line, _signal, histogram)) = macd_val {
-            let macd_confirms = (side == Side::Buy && histogram > 0.0)
-                || (side == Side::Sell && histogram < 0.0);
-            let macd_strong = histogram.abs() > 5.0; // significant momentum
-
-            if !macd_confirms && macd_strong {
-                // Strong MACD against our direction — skip
-                debug!(
-                    question = %market.question,
-                    macd_line = format!("{:.1}", macd_line),
-                    histogram = format!("{:.1}", histogram),
-                    side = %side,
-                    "ORB: MACD histogram strongly against direction — skipping"
-                );
-                return None;
-            }
-            if macd_confirms && macd_strong {
-                accuracy = (accuracy + 0.02).min(0.98);
-            }
-        }
 
         // Don't place opposing orders — if we already have a position on this
         // market's underlying in the opposite direction, skip
