@@ -677,14 +677,10 @@ impl OrbStrategy {
             _ => return None,
         };
 
-        // Trade 5-minute windows only — entering both 5m and 15m on the same
-        // move doubles exposure on the same thesis. 5m = faster resolution, more cycles.
-        if window_secs != 300 {
+        if window_secs != 300 && window_secs != 900 {
             return None;
         }
 
-        // Supported symbols — validated by live trading data:
-        // BTC: 72% win, +$2007 | ETH: 74% win | SOL: 89% win | XRP: 90% win
         let is_eth = market.underlying_symbol == "ETH-USD";
         let is_alt = market.underlying_symbol == "SOL-USD"
             || market.underlying_symbol == "XRP-USD";
@@ -704,9 +700,10 @@ impl OrbStrategy {
 
         let price = self.latest_prices.get(&market.underlying_symbol)?;
         // Use Binance spot price directly — fastest feed, no oracle lag
-        let spot = price.binance_mid
-            .map(|m| m.to_f64().unwrap_or(0.0))
-            .unwrap_or_else(|| price.vwap.to_f64().unwrap_or(0.0));
+        let spot = match price.binance_mid {
+            Some(mid) => mid.to_f64().unwrap_or(0.0),
+            None => price.vwap.to_f64().unwrap_or(0.0),
+        };
 
         if spot <= 0.0 {
             return None;
@@ -732,7 +729,7 @@ impl OrbStrategy {
 
         // ETH/SOL/XRP are noisier — require 0.15%+ minimum vs BTC's 0.05%
         // Tiered minimum by noise level: BTC 0.05%, ETH 0.08%, SOL/XRP 0.10%
-        let min_move = if is_alt { 0.10 } else if is_eth { 0.08 } else { 0.0 }; // BTC uses accuracy tiers
+        let min_move = if is_alt { 0.10 } else if is_eth { 0.08 } else { 0.0 };
         if min_move > 0.0 && move_pct < min_move {
             return None;
         }
@@ -876,12 +873,12 @@ impl OrbStrategy {
 
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Use implied price directly — no +5¢ markup. Saves 5¢ per trade (~10-15% more profit).
-        // If the order doesn't fill at this price, it gets auto-cancelled after 30s.
-        let entry_price = implied_price.min(Decimal::new(95, 2));
+        // Add 2¢ above implied to sweep the ask for instant taker fill.
+        // 5¢ was too much, 0¢ sits on the book unfilled. 2¢ is the sweet spot.
+        let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
 
         // Max entry price cap — don't buy above 50¢.
-        if entry_price > Decimal::new(56, 2) {
+        if entry_price > Decimal::new(60, 2) {
             debug!(
                 question = %market.question,
                 price = format!("{:.2}", entry_price),
