@@ -566,9 +566,15 @@ impl OrbStrategy {
 
     fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
         let mut signals = Vec::new();
+        let mut signaled_cids = std::collections::HashSet::new();
         let market_list: Vec<PolymarketMarket> = self.markets.values().cloned().collect();
         for market in &market_list {
+            // Skip if we already generated a signal for this condition_id in this batch
+            if signaled_cids.contains(&market.condition_id) {
+                continue;
+            }
             if let Some(s) = self.evaluate_updown_market(market) {
+                signaled_cids.insert(market.condition_id.clone());
                 signals.push(s);
             }
         }
