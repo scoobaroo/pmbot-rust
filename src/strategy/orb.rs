@@ -216,8 +216,9 @@ pub struct OrbStrategy {
     /// Maps order_id → condition_id so we can link OrderFilled back to position.
     pending_orders: HashMap<String, String>,
     /// Estimated bankroll for dynamic position sizing.
-    /// Starts from config max_position_usd * 10, adjusts with wins/losses.
     bankroll: f64,
+    /// DOWN_ONLY mode: skip all UP bets. For bearish markets.
+    down_only: bool,
     /// Consecutive loss counter — pauses trading after MAX_CONSECUTIVE_LOSSES.
     consecutive_losses: u32,
     /// Timestamp when cooldown expires (resume trading after this time).
@@ -242,6 +243,7 @@ impl OrbStrategy {
             web_state: None,
             pending_orders: HashMap::new(),
             bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
+            down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
             consecutive_losses: 0,
             cooldown_until: None,
         }
@@ -767,6 +769,15 @@ impl OrbStrategy {
         } else {
             (Side::Sell, &market.token_id_no, market.implied_prob_no)
         };
+
+        // DOWN_ONLY mode: skip all UP bets in bearish markets
+        if self.down_only && side == Side::Buy {
+            debug!(
+                question = %market.question,
+                "ORB: DOWN_ONLY mode — skipping UP bet"
+            );
+            return None;
+        }
 
         // Don't place opposing orders — if we already have a position on this
         // market's underlying in the opposite direction, skip
@@ -1409,6 +1420,7 @@ mod tests {
             web_state: None,
             pending_orders: HashMap::new(),
             bankroll: 1000.0,
+            down_only: false,
             consecutive_losses: 0,
             cooldown_until: None,
         }

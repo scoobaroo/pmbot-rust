@@ -73,6 +73,17 @@ TICKS_HEADER = [
     "yes_bid_depth", "yes_ask_depth", "no_bid_depth", "no_ask_depth",
     "elapsed_secs", "time_remaining_secs",
 ]
+L2_BOOK_HEADER = [
+    "timestamp", "condition_id", "symbol", "side", "window_secs",
+    "elapsed_secs", "time_remaining_secs",
+    # Top 10 levels: price and size at each level
+    "l1_price", "l1_size", "l2_price", "l2_size",
+    "l3_price", "l3_size", "l4_price", "l4_size",
+    "l5_price", "l5_size", "l6_price", "l6_size",
+    "l7_price", "l7_size", "l8_price", "l8_size",
+    "l9_price", "l9_size", "l10_price", "l10_size",
+    "total_depth", "num_levels",
+]
 RESOLUTIONS_HEADER = [
     "timestamp", "condition_id", "question", "symbol", "window_secs",
     "window_start_ts", "outcome", "final_yes_mid", "final_no_mid",
@@ -106,6 +117,7 @@ FUNDING_HEADER = [
 
 markets_f, markets_w = open_csv("markets.csv", MARKETS_HEADER)
 ticks_f, ticks_w = open_csv("ticks.csv", TICKS_HEADER)
+l2_f, l2_w = open_csv("l2_book.csv", L2_BOOK_HEADER)
 resolutions_f, resolutions_w = open_csv("resolutions.csv", RESOLUTIONS_HEADER)
 binance_f, binance_w = open_csv("binance.csv", BINANCE_HEADER)
 flow_f, flow_w = open_csv("flow.csv", FLOW_HEADER)
@@ -429,6 +441,38 @@ def record_market(m: dict):
     markets_f.flush()
 
 
+def record_l2_book(m: dict, book: dict | None, side: str):
+    """Record full L2 orderbook depth (top 10 bid and ask levels)."""
+    if not book:
+        return
+    now = datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    elapsed = now_ts - m["window_start_ts"]
+    remaining = m["window_secs"] - elapsed
+
+    for book_side, levels_key in [("BID", "bids"), ("ASK", "asks")]:
+        levels = book.get(levels_key, [])
+        total_depth = sum(float(l.get("size", 0)) for l in levels)
+        num_levels = len(levels)
+
+        # Pad to 10 levels
+        row = [
+            now.isoformat(), m["condition_id"], m["symbol"],
+            f"{side}_{book_side}", m["window_secs"],
+            elapsed, max(0, remaining),
+        ]
+        for i in range(10):
+            if i < len(levels):
+                row.append(f"{float(levels[i].get('price', 0)):.4f}")
+                row.append(f"{float(levels[i].get('size', 0)):.2f}")
+            else:
+                row.append("")
+                row.append("")
+        row.append(f"{total_depth:.2f}")
+        row.append(num_levels)
+        l2_w.writerow(row)
+
+
 def record_tick(m: dict, yes_book: dict | None, no_book: dict | None):
     now = datetime.now(timezone.utc)
     now_ts = int(now.timestamp())
@@ -523,6 +567,8 @@ def main():
                 yes_book = fetch_book(m["token_id_yes"])
                 no_book = fetch_book(m["token_id_no"])
                 record_tick(m, yes_book, no_book)
+                record_l2_book(m, yes_book, "YES")
+                record_l2_book(m, no_book, "NO")
                 stats["ticks"] += 1
 
             for cid in expired:
@@ -532,6 +578,7 @@ def main():
             if now - last_status >= 60:
                 last_status = now
                 ticks_f.flush()
+                l2_f.flush()
                 with binance_lock:
                     binance_f.flush()
                     flow_f.flush()
@@ -560,7 +607,7 @@ def main():
             binance_f.flush()
             flow_f.flush()
             funding_f.flush()
-        for f in [markets_f, ticks_f, resolutions_f, binance_f, flow_f, funding_f]:
+        for f in [markets_f, ticks_f, l2_f, resolutions_f, binance_f, flow_f, funding_f]:
             f.close()
         log.info(f"Final: {stats}")
 
