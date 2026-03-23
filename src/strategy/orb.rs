@@ -207,8 +207,13 @@ pub struct OrbStrategy {
     true_ranges: HashMap<String, VecDeque<f64>>,
     /// Previous candle close per symbol (needed for true range calculation).
     prev_close: HashMap<String, f64>,
-    /// Rolling 1m closes for regime detection (last 30 candles = 30 min trend).
+    /// Rolling 1m closes for regime detection, RSI, MACD (last 30 candles).
     recent_closes: HashMap<String, VecDeque<f64>>,
+    /// Rolling gains/losses for RSI computation (14-period).
+    rsi_gains: HashMap<String, VecDeque<f64>>,
+    rsi_losses: HashMap<String, VecDeque<f64>>,
+    /// MACD state: (ema12, ema26, signal_ema9) per symbol.
+    macd_state: HashMap<String, (f64, f64, f64)>,
     /// Previous VWAP per symbol — used to confirm momentum is sustained at entry.
     prev_vwap: HashMap<String, f64>,
     /// Optional web state for pushing live trade events to the dashboard.
@@ -239,6 +244,9 @@ impl OrbStrategy {
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
             recent_closes: HashMap::new(),
+            rsi_gains: HashMap::new(),
+            rsi_losses: HashMap::new(),
+            macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),
@@ -333,6 +341,70 @@ impl OrbStrategy {
         }
         let sum: f64 = trs.iter().rev().take(ATR_PERIOD).sum();
         Some(sum / ATR_PERIOD as f64)
+    }
+
+    /// RSI (14-period) for a symbol. Returns 0-100, or None if not enough data.
+    fn rsi(&self, symbol: &str) -> Option<f64> {
+        let gains = self.rsi_gains.get(symbol)?;
+        let losses = self.rsi_losses.get(symbol)?;
+        if gains.len() < ATR_PERIOD {
+            return None;
+        }
+        let avg_gain: f64 = gains.iter().sum::<f64>() / ATR_PERIOD as f64;
+        let avg_loss: f64 = losses.iter().sum::<f64>() / ATR_PERIOD as f64;
+        if avg_loss == 0.0 {
+            return Some(100.0);
+        }
+        let rs = avg_gain / avg_loss;
+        Some(100.0 - (100.0 / (1.0 + rs)))
+    }
+
+    /// MACD for a symbol. Returns (macd_line, signal_line, histogram), or None.
+    fn macd(&self, symbol: &str) -> Option<(f64, f64, f64)> {
+        let (ema12, ema26, signal) = self.macd_state.get(symbol)?;
+        let macd_line = ema12 - ema26;
+        let histogram = macd_line - signal;
+        Some((macd_line, *signal, histogram))
+    }
+
+    /// Update RSI state from a completed 1m candle.
+    fn update_rsi(&mut self, symbol: &str, close: f64) {
+        if let Some(&prev) = self.prev_close.get(symbol) {
+            let change = close - prev;
+            let gain = if change > 0.0 { change } else { 0.0 };
+            let loss = if change < 0.0 { change.abs() } else { 0.0 };
+
+            let gains = self.rsi_gains.entry(symbol.to_string())
+                .or_insert_with(|| VecDeque::with_capacity(ATR_PERIOD + 1));
+            gains.push_back(gain);
+            if gains.len() > ATR_PERIOD {
+                gains.pop_front();
+            }
+
+            let losses = self.rsi_losses.entry(symbol.to_string())
+                .or_insert_with(|| VecDeque::with_capacity(ATR_PERIOD + 1));
+            losses.push_back(loss);
+            if losses.len() > ATR_PERIOD {
+                losses.pop_front();
+            }
+        }
+    }
+
+    /// Update MACD state from a completed 1m candle.
+    fn update_macd(&mut self, symbol: &str, close: f64) {
+        let (ema12, ema26, signal) = self.macd_state
+            .entry(symbol.to_string())
+            .or_insert((close, close, 0.0));
+
+        // EMA multipliers
+        let k12 = 2.0 / 13.0; // 12-period
+        let k26 = 2.0 / 27.0; // 26-period
+        let k9 = 2.0 / 10.0;  // 9-period signal
+
+        *ema12 = close * k12 + *ema12 * (1.0 - k12);
+        *ema26 = close * k26 + *ema26 * (1.0 - k26);
+        let macd_line = *ema12 - *ema26;
+        *signal = macd_line * k9 + *signal * (1.0 - k9);
     }
 
     /// Detect market regime: returns a value from -1.0 (strong bearish) to +1.0 (strong bullish).
@@ -739,7 +811,7 @@ impl OrbStrategy {
         let is_counter_trend = (price_move > 0.0 && regime < -0.2)
             || (price_move < 0.0 && regime > 0.2);
 
-        let accuracy = if is_counter_trend {
+        let mut accuracy = if is_counter_trend {
             // Trading against the trend — reduce accuracy, higher bar to enter
             let reduced = accuracy - 0.05;
             debug!(
@@ -777,6 +849,60 @@ impl OrbStrategy {
                 "ORB: DOWN_ONLY mode — skipping UP bet"
             );
             return None;
+        }
+
+        // --- RSI filter: don't buy overbought, don't sell oversold ---
+        // RSI > 70 = overbought → skip UP bets (likely to reverse down)
+        // RSI < 30 = oversold → skip DOWN bets (likely to bounce)
+        let rsi_val = self.rsi(&market.underlying_symbol);
+        if let Some(rsi) = rsi_val {
+            if side == Side::Buy && rsi > 70.0 {
+                debug!(
+                    question = %market.question,
+                    rsi = format!("{:.1}", rsi),
+                    "ORB: RSI overbought (>70) — skipping UP bet"
+                );
+                return None;
+            }
+            if side == Side::Sell && rsi < 30.0 {
+                debug!(
+                    question = %market.question,
+                    rsi = format!("{:.1}", rsi),
+                    "ORB: RSI oversold (<30) — skipping DOWN bet"
+                );
+                return None;
+            }
+            // RSI confirms trend — slight accuracy boost
+            let rsi_confirms = (side == Side::Sell && rsi > 55.0)
+                || (side == Side::Buy && rsi < 45.0);
+            if rsi_confirms {
+                accuracy = (accuracy + 0.02).min(0.98);
+            }
+        }
+
+        // --- MACD filter: require histogram alignment with trade direction ---
+        // Positive histogram = bullish momentum → confirms UP bets
+        // Negative histogram = bearish momentum → confirms DOWN bets
+        let macd_val = self.macd(&market.underlying_symbol);
+        if let Some((macd_line, _signal, histogram)) = macd_val {
+            let macd_confirms = (side == Side::Buy && histogram > 0.0)
+                || (side == Side::Sell && histogram < 0.0);
+            let macd_strong = histogram.abs() > 5.0; // significant momentum
+
+            if !macd_confirms && macd_strong {
+                // Strong MACD against our direction — skip
+                debug!(
+                    question = %market.question,
+                    macd_line = format!("{:.1}", macd_line),
+                    histogram = format!("{:.1}", histogram),
+                    side = %side,
+                    "ORB: MACD histogram strongly against direction — skipping"
+                );
+                return None;
+            }
+            if macd_confirms && macd_strong {
+                accuracy = (accuracy + 0.02).min(0.98);
+            }
         }
 
         // Don't place opposing orders — if we already have a position on this
@@ -868,6 +994,8 @@ impl OrbStrategy {
             flow = format!("{:.2}", flow),
             funding = format!("{:.6}", funding),
             funding_confirms,
+            rsi = format!("{:.1}", rsi_val.unwrap_or(0.0)),
+            macd_hist = format!("{:.1}", macd_val.map(|m| m.2).unwrap_or(0.0)),
             elapsed_secs = elapsed,
             "ORB: breakout signal"
         );
@@ -1201,13 +1329,19 @@ impl Strategy for OrbStrategy {
                     let high = candle.high.to_f64().unwrap_or(0.0);
                     let low = candle.low.to_f64().unwrap_or(0.0);
                     let close = candle.close.to_f64().unwrap_or(0.0);
+                    self.update_rsi(&candle.symbol, close);
+                    self.update_macd(&candle.symbol, close);
                     self.update_atr(&candle.symbol, high, low, close);
 
                     if let Some(atr) = self.atr(&candle.symbol) {
+                        let rsi_val = self.rsi(&candle.symbol);
+                        let macd_val = self.macd(&candle.symbol);
                         debug!(
                             symbol = %candle.symbol,
                             atr = format!("{:.1}", atr),
-                            "ORB: ATR updated"
+                            rsi = format!("{:.1}", rsi_val.unwrap_or(0.0)),
+                            macd_hist = format!("{:.2}", macd_val.map(|m| m.2).unwrap_or(0.0)),
+                            "ORB: indicators updated"
                         );
                     }
                 }
@@ -1416,6 +1550,9 @@ mod tests {
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
             recent_closes: HashMap::new(),
+            rsi_gains: HashMap::new(),
+            rsi_losses: HashMap::new(),
+            macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             pending_orders: HashMap::new(),

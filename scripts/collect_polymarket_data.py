@@ -105,6 +105,7 @@ def open_csv(filename: str, header: list[str]):
 BINANCE_HEADER = [
     "timestamp", "symbol", "price", "bid", "ask", "volume_24h",
     "quote_volume_24h", "trades_24h", "price_change_pct",
+    "rsi_14", "macd_line", "macd_signal", "macd_hist",
 ]
 FLOW_HEADER = [
     "timestamp", "symbol", "buy_volume", "sell_volume", "net_flow",
@@ -132,6 +133,41 @@ seen_condition_ids: set = set()  # all condition_ids we've ever seen
 stats = {"markets": 0, "ticks": 0, "resolutions": 0, "binance_ticks": 0, "flow_ticks": 0, "funding_ticks": 0}
 latest_binance: dict = {}  # symbol -> {price, bid, ask, ...}
 latest_funding: dict = {}  # symbol -> {rate, mark, index}
+
+# Technical indicators state per symbol
+indicators: dict = {}  # symbol -> {closes: [], ema12, ema26, signal9}
+
+def compute_rsi(closes: list, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(-period, 0):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(0, change))
+        losses.append(max(0, -change))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def update_indicators(symbol: str, price: float) -> dict:
+    if symbol not in indicators:
+        indicators[symbol] = {"closes": [], "ema12": price, "ema26": price, "signal9": 0.0}
+    ind = indicators[symbol]
+    ind["closes"].append(price)
+    if len(ind["closes"]) > 100:
+        ind["closes"] = ind["closes"][-100:]
+    # EMA updates
+    k12, k26, k9 = 2/13, 2/27, 2/10
+    ind["ema12"] = price * k12 + ind["ema12"] * (1 - k12)
+    ind["ema26"] = price * k26 + ind["ema26"] * (1 - k26)
+    macd_line = ind["ema12"] - ind["ema26"]
+    ind["signal9"] = macd_line * k9 + ind["signal9"] * (1 - k9)
+    histogram = macd_line - ind["signal9"]
+    rsi = compute_rsi(ind["closes"])
+    return {"rsi": rsi, "macd_line": macd_line, "macd_signal": ind["signal9"], "macd_hist": histogram}
 
 # Rolling 1-second flow buckets for aggTrade aggregation
 flow_buckets: dict = {}  # symbol -> {buy_vol, sell_vol, buy_cost, sell_cost, buy_n, sell_n, last_flush}
@@ -206,6 +242,7 @@ def start_binance_spot_ws():
                     "price_change_pct": float(data.get("P", 0)),
                 }
                 latest_binance[symbol] = tick
+                ind = update_indicators(symbol, tick["price"])
 
                 now = datetime.now(timezone.utc).isoformat()
                 with binance_lock:
@@ -214,6 +251,8 @@ def start_binance_spot_ws():
                         f"{tick['price']:.2f}", f"{tick['bid']:.2f}", f"{tick['ask']:.2f}",
                         f"{tick['volume_24h']:.2f}", f"{tick['quote_volume_24h']:.0f}",
                         tick["trades_24h"], f"{tick['price_change_pct']:.2f}",
+                        f"{ind['rsi']:.1f}", f"{ind['macd_line']:.2f}",
+                        f"{ind['macd_signal']:.2f}", f"{ind['macd_hist']:.2f}",
                     ])
                     stats["binance_ticks"] += 1
                     if stats["binance_ticks"] % 100 == 0:
