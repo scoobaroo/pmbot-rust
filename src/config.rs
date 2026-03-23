@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(long, default_value = "data/backtest.csv")]
     pub backtest_file: String,
 
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "false")]
     pub maker_mode: bool,
 
     /// Maximum position size in USD for live mode (safety cap).
