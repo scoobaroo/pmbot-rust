@@ -810,7 +810,7 @@ impl OrbStrategy {
         // Weak flow = noise/chop. Require both correct direction AND magnitude ≥0.3.
         let flow = price.trade_flow_imbalance;
         let flow_confirms = (price_move > 0.0 && flow > 0.0) || (price_move < 0.0 && flow < 0.0);
-        let flow_strong = flow.abs() >= 0.20;
+        let flow_strong = flow.abs() >= 0.10;
 
         if !flow_confirms || !flow_strong {
             debug!(
