@@ -618,8 +618,9 @@ impl OrbStrategy {
             _ => return None,
         };
 
-        // Trade 5-minute and 15-minute windows
-        if window_secs != 300 && window_secs != 900 {
+        // Trade 5-minute windows only — entering both 5m and 15m on the same
+        // move doubles exposure on the same thesis. 5m = faster resolution, more cycles.
+        if window_secs != 300 {
             return None;
         }
 
@@ -770,78 +771,11 @@ impl OrbStrategy {
             return None;
         }
 
-        // --- Funding rate signal: confirms or warns against direction ---
-        // Negative funding = shorts paying longs = bearish positioning
-        // Positive funding = longs paying shorts = bullish positioning
+        // Funding, regime, RSI, MACD — logged for RL training but not used as filters.
+        // The $400→$2200 run used simpler logic. Let the RL model learn these.
         let funding = price.funding_rate.unwrap_or(0.0);
-        let funding_confirms = (price_move > 0.0 && funding > 0.0)
-            || (price_move < 0.0 && funding < 0.0);
-        let funding_extreme = funding.abs() > 0.0001; // > 0.01% = crowded
-
-        // Adjust accuracy based on funding alignment
-        let accuracy = if funding_extreme && !funding_confirms {
-            // Extreme funding against our direction = crowded counter-trade
-            // Potential squeeze — boost accuracy (we're trading the squeeze)
-            let boosted = (accuracy + 0.03).min(0.98);
-            debug!(
-                question = %market.question,
-                funding = format!("{:.6}", funding),
-                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
-                accuracy_boost = format!("{:.0}% -> {:.0}%", accuracy * 100.0, boosted * 100.0),
-                "ORB: extreme counter-funding — squeeze potential, boosting accuracy"
-            );
-            boosted
-        } else if funding_extreme && funding_confirms {
-            // Extreme funding in our direction = crowded trade, reversal risk
-            // Reduce accuracy to be more cautious
-            let reduced = accuracy - 0.03;
-            debug!(
-                question = %market.question,
-                funding = format!("{:.6}", funding),
-                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
-                accuracy_reduction = format!("{:.0}% -> {:.0}%", accuracy * 100.0, reduced * 100.0),
-                "ORB: extreme aligned funding — crowded, reducing accuracy"
-            );
-            reduced
-        } else if funding_confirms {
-            // Mild funding confirms our direction — slight boost
-            accuracy + 0.01
-        } else {
-            accuracy
-        };
-
-        // --- Regime bias: trend-following adjustments ---
-        // regime() returns -1.0 (bearish) to +1.0 (bullish) based on last 30 candles.
-        // Trade with the trend = boost accuracy. Trade against = penalize.
         let regime = self.regime(&market.underlying_symbol);
-        let is_trend_aligned = (price_move > 0.0 && regime > 0.1)
-            || (price_move < 0.0 && regime < -0.1);
-        let is_counter_trend = (price_move > 0.0 && regime < -0.2)
-            || (price_move < 0.0 && regime > 0.2);
-
-        let mut accuracy = if is_counter_trend {
-            // Trading against the trend — reduce accuracy, higher bar to enter
-            let reduced = accuracy - 0.05;
-            debug!(
-                question = %market.question,
-                regime = format!("{:.2}", regime),
-                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
-                "ORB: counter-trend entry — reducing accuracy by 5%"
-            );
-            reduced
-        } else if is_trend_aligned {
-            // Trading with the trend — boost accuracy
-            let boosted = (accuracy + 0.03).min(0.98);
-            debug!(
-                question = %market.question,
-                regime = format!("{:.2}", regime),
-                direction = if price_move > 0.0 { "UP" } else { "DOWN" },
-                "ORB: trend-aligned entry — boosting accuracy by 3%"
-            );
-            boosted
-        } else {
-            accuracy
-        };
+        let mut accuracy = accuracy;
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
         let (side, token_id, implied_price) = if price_move > 0.0 {
@@ -881,18 +815,17 @@ impl OrbStrategy {
 
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Aggressive pricing: bid above implied to sweep the book immediately.
-        // Add 5c to implied price (e.g., 0.55 → 0.60) to ensure instant fill.
-        let aggressive_price = (implied_price + Decimal::new(5, 2)).min(Decimal::new(95, 2));
+        // Use implied price directly — no +5¢ markup. Saves 5¢ per trade (~10-15% more profit).
+        // If the order doesn't fill at this price, it gets auto-cancelled after 30s.
+        let entry_price = implied_price.min(Decimal::new(95, 2));
 
-        // Max entry price cap — don't buy above 50¢. Data shows 89% win rate below
-        // 50¢ but only 69% above. Everything above 50¢ is net negative P&L.
-        if aggressive_price > Decimal::new(50, 2) {
+        // Max entry price cap — don't buy above 50¢.
+        if entry_price > Decimal::new(50, 2) {
             debug!(
                 question = %market.question,
-                price = format!("{:.2}", aggressive_price),
+                price = format!("{:.2}", entry_price),
                 implied = format!("{:.2}", implied_prob),
-                "ORB: entry price too high (>70¢) — return not worth risk"
+                "ORB: entry price too high (>50¢) — return not worth risk"
             );
             OrbDataLogger::log_rejection(
                 &market.condition_id, &market.underlying_symbol,
@@ -904,11 +837,11 @@ impl OrbStrategy {
 
         // Deduct trading costs using aggressive price
         let half_spread = self.get_half_spread(token_id);
-        let total_cost = self.fee_calculator.total_cost(aggressive_price, half_spread);
+        let total_cost = self.fee_calculator.total_cost(entry_price, half_spread);
         let total_cost_f64 = total_cost.to_f64().unwrap_or(0.0);
-        let aggressive_f64 = aggressive_price.to_f64().unwrap_or(0.5);
+        let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
 
-        let edge = accuracy - aggressive_f64 - total_cost_f64;
+        let edge = accuracy - entry_f64 - total_cost_f64;
 
         if edge <= 0.0 {
             debug!(
@@ -954,7 +887,8 @@ impl OrbStrategy {
             atr_mult = format!("{:.1}x", atr_multiple.unwrap_or(0.0)),
             flow = format!("{:.2}", flow),
             funding = format!("{:.6}", funding),
-            funding_confirms,
+            funding = format!("{:.6}", funding),
+            regime = format!("{:.2}", regime),
             rsi = format!("{:.1}", rsi_val.unwrap_or(0.0)),
             macd_hist = format!("{:.1}", macd_val.map(|m| m.2).unwrap_or(0.0)),
             elapsed_secs = elapsed,
@@ -969,7 +903,7 @@ impl OrbStrategy {
         // Track position for one-entry-per-market and early exit
         let pos = OrbPosition {
             side,
-            entry_price: aggressive_price,
+            entry_price: entry_price,
             size_usd,
             entry_time: self.current_time(),
             symbol: market.underlying_symbol.clone(),
@@ -993,7 +927,7 @@ impl OrbStrategy {
             side,
             size_usd,
             confidence: edge,
-            price: aggressive_price,
+            price: entry_price,
             metadata: SignalMetadata::Orb {
                 btc_move: price_move,
                 accuracy_tier: accuracy,
@@ -2008,8 +1942,8 @@ mod tests {
         strategy
             .updown_start_prices
             .insert("m1".to_string(), (80000.0, window_start));
-        // Previous VWAP was further from start than current → move is reversing
-        strategy.prev_vwap.insert("BTC-USD".to_string(), 80070.0);
+        // Previous VWAP was much further from start → move has reversed >20%
+        strategy.prev_vwap.insert("BTC-USD".to_string(), 80100.0);
         strategy.latest_prices.insert(
             "BTC-USD".to_string(),
             make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
