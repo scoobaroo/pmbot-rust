@@ -16,6 +16,52 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use tracing::{debug, info, warn};
 
+/// Sends trade alerts to a Telegram chat via the Bot API.
+/// Non-blocking: all HTTP calls are fire-and-forget via tokio::spawn.
+#[derive(Debug, Clone)]
+pub struct TelegramNotifier {
+    bot_token: String,
+    chat_id: String,
+    client: reqwest::Client,
+}
+
+impl TelegramNotifier {
+    /// Create from environment variables. Returns None if not configured.
+    pub fn from_env() -> Option<Self> {
+        let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok()?;
+        let chat_id = std::env::var("TELEGRAM_CHAT_ID").ok()?;
+        if bot_token.is_empty() || chat_id.is_empty() {
+            return None;
+        }
+        info!("Telegram notifier enabled");
+        Some(Self {
+            bot_token,
+            chat_id,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    /// Fire-and-forget: spawn an async task to send the message.
+    pub fn send(&self, message: &str) {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            self.bot_token
+        );
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.post(&url).json(&body).send().await {
+                warn!(error = %e, "Telegram send failed");
+            }
+        });
+    }
+}
+
 /// Default half-spread when no live book data is available.
 const DEFAULT_HALF_SPREAD: Decimal = dec!(0.01);
 
@@ -225,6 +271,8 @@ pub struct OrbStrategy {
     prev_vwap: HashMap<String, f64>,
     /// Optional web state for pushing live trade events to the dashboard.
     web_state: Option<SharedWebState>,
+    /// Optional Telegram notifier for trade alerts.
+    telegram: Option<TelegramNotifier>,
     /// Maps order_id → condition_id so we can link OrderFilled back to position.
     pending_orders: HashMap<String, String>,
     /// Estimated bankroll for dynamic position sizing.
@@ -257,6 +305,7 @@ impl OrbStrategy {
             macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
+            telegram: TelegramNotifier::from_env(),
             pending_orders: HashMap::new(),
             bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
             down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
@@ -289,6 +338,13 @@ impl OrbStrategy {
             tokio::spawn(async move {
                 state.push_orb_event(event).await;
             });
+        }
+    }
+
+    /// Send a Telegram notification (non-blocking, no-op if not configured).
+    fn notify_telegram(&self, message: &str) {
+        if let Some(ref tg) = self.telegram {
+            tg.send(message);
         }
     }
 
@@ -1148,6 +1204,10 @@ impl OrbStrategy {
                                     "ORB: {} losses — pausing 30min",
                                     self.consecutive_losses
                                 );
+                                self.notify_telegram(&format!(
+                                    "<b>CIRCUIT BREAKER</b>\n{} consecutive losses\nPausing for {}min\nBankroll: ${:.0}",
+                                    self.consecutive_losses, COOLDOWN_SECS / 60, self.bankroll,
+                                ));
                             }
                         }
 
@@ -1175,6 +1235,14 @@ impl OrbStrategy {
                             window_secs: pos.window_secs,
                             reason: format!("P&L: ${:+.2} | start:{:.0} end:{:.0}", pnl, start, current),
                         });
+                        self.notify_telegram(&format!(
+                            "<b>{} {}</b>\n{} {} @ {:.0}c\nP&L: <b>${}{:.2}</b>\nBankroll: ${:.0}",
+                            result, if won { "+" } else { "-" },
+                            pos.symbol, pos.side,
+                            entry_f64 * 100.0,
+                            if pnl >= 0.0 { "+" } else { "" }, pnl,
+                            self.bankroll,
+                        ));
                     }
                     self.open_positions.remove(cid);
                 }
@@ -1298,6 +1366,7 @@ impl Strategy for OrbStrategy {
                         // Push FILLED event to dashboard immediately on order placement
                         // (OrderFilled events don't reliably fire from CLOB)
                         if let Some(pos) = self.open_positions.get(&order.condition_id) {
+                            let size_usd = (order.price * order.size).to_f64().unwrap_or(0.0);
                             info!(
                                 condition_id = %order.condition_id,
                                 side = %order.side,
@@ -1311,7 +1380,7 @@ impl Strategy for OrbStrategy {
                                 side: format!("{}", order.side),
                                 action: "FILLED".to_string(),
                                 price: order.price.to_f64().unwrap_or(0.0),
-                                size_usd: (order.price * order.size).to_f64().unwrap_or(0.0),
+                                size_usd,
                                 move_pct: pos.move_pct,
                                 accuracy: pos.accuracy,
                                 edge: pos.edge,
@@ -1319,6 +1388,13 @@ impl Strategy for OrbStrategy {
                                 window_secs: pos.window_secs,
                                 reason: String::new(),
                             });
+                            self.notify_telegram(&format!(
+                                "<b>ORDER PLACED</b>\n{} {} @ {:.0}c\nSize: ${:.2} | Edge: {:.1}%\nMove: {:.2}% | Acc: {:.0}%",
+                                pos.symbol, order.side,
+                                order.price.to_f64().unwrap_or(0.0) * 100.0,
+                                size_usd, pos.edge * 100.0,
+                                pos.move_pct * 100.0, pos.accuracy * 100.0,
+                            ));
                         }
                     }
                     crate::types::events::ExecutionEvent::OrderFilled(fill) => {
@@ -1334,6 +1410,7 @@ impl Strategy for OrbStrategy {
                     }
                     crate::types::events::ExecutionEvent::MarketResolved { condition_id, pnl, won } => {
                         let result = if *won { "WON" } else { "LOST" };
+                        let emoji = if *won { "+" } else { "-" };
 
                         // Look up position data before removing
                         if let Some(pos) = self.open_positions.get(condition_id) {
@@ -1369,6 +1446,14 @@ impl Strategy for OrbStrategy {
                                 window_secs: pos.window_secs,
                                 reason: format!("P&L: ${:+.2} | entry: {:.0}c", pnl, pos.entry_price.to_f64().unwrap_or(0.0) * 100.0),
                             });
+                            self.notify_telegram(&format!(
+                                "<b>{} {}</b>\n{} {} @ {:.0}c\nP&L: <b>${}{:.2}</b>\nBankroll: ${:.0}",
+                                result, emoji,
+                                pos.symbol, pos.side,
+                                pos.entry_price.to_f64().unwrap_or(0.0) * 100.0,
+                                if *pnl >= 0.0 { "+" } else { "" }, pnl,
+                                self.bankroll + pnl,
+                            ));
                         } else {
                             info!(
                                 condition_id = %condition_id,
@@ -1405,6 +1490,10 @@ impl Strategy for OrbStrategy {
                                     "ORB: {} losses — pausing for {}min",
                                     self.consecutive_losses, COOLDOWN_SECS / 60
                                 );
+                                self.notify_telegram(&format!(
+                                    "<b>CIRCUIT BREAKER</b>\n{} consecutive losses\nPausing for {}min\nBankroll: ${:.0}",
+                                    self.consecutive_losses, COOLDOWN_SECS / 60, self.bankroll,
+                                ));
                             }
                         }
 
@@ -1452,6 +1541,7 @@ mod tests {
             macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
+            telegram: None,
             pending_orders: HashMap::new(),
             bankroll: 1000.0,
             down_only: false,
