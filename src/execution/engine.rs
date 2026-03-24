@@ -429,10 +429,12 @@ impl ExecutionEngine {
             }
         };
 
-        let post_only = self.maker_mode;
         let fee_rate_bps = Some(self.config.fee_rate_bps);
-        // FOK = Fill Or Kill — instant fill or cancel, no stale limit orders
-        let order_type = "FOK";
+        // Sniper 99¢ scalps use GTD limit orders for maker pricing (edge is only 1%).
+        // Everything else uses FOK for instant fills (edge is 15%+, speed > fees).
+        let is_sniper = order.price >= Decimal::new(99, 2);
+        let order_type = if is_sniper { "GTD" } else { "FOK" };
+        let post_only = is_sniper || self.maker_mode;
 
         let params = OrderParams {
             token_id: &order.token_id,
