@@ -89,6 +89,18 @@ const PAUSE_AFTER_LOSSES: u32 = 4;
 /// How long to pause after hitting the loss streak (in seconds).
 const COOLDOWN_SECS: i64 = 1800; // 30 minutes
 
+/// Sniper mode: enter in the last N seconds when outcome is near-certain.
+const SNIPER_WINDOW_SECS: i64 = 30;
+
+/// Minimum price gap (%) for sniper entries — 2x typical 30s volatility per coin.
+/// BTC: 0.030% ($21), ETH: 0.040% ($0.82), SOL: 0.060%, XRP: 0.050%
+const SNIPER_GAP_BTC: f64 = 0.030;
+const SNIPER_GAP_ETH: f64 = 0.040;
+const SNIPER_GAP_ALT: f64 = 0.060; // SOL/XRP — noisier
+
+/// Max entry price for sniper — can go higher than ORB since accuracy is 95%+.
+const SNIPER_MAX_PRICE: f64 = 0.90;
+
 /// Take profit floor: exit when book bid reaches this level.
 const TAKE_PROFIT_MIN: f64 = 0.75;
 
@@ -717,15 +729,99 @@ impl OrbStrategy {
         let window_end = window_start_ts + window_secs as i64;
         let time_remaining_secs = (window_end - now).max(0) as f64;
 
-        // Too close to expiry
-        if time_remaining_secs < MIN_TIME_REMAINING_SECS as f64 {
-            return None;
-        }
-
-        // Measure the breakout magnitude (percentage-based for cross-coin support)
+        // Measure the breakout magnitude
         let price_move = spot - start_price;
         let move_abs = price_move.abs();
         let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
+
+        // === SNIPER MODE: last 30 seconds, near-certain outcome ===
+        if time_remaining_secs <= SNIPER_WINDOW_SECS as f64 && time_remaining_secs > 5.0 {
+            let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC }
+                else if is_eth { SNIPER_GAP_ETH }
+                else { SNIPER_GAP_ALT };
+
+            if move_pct >= min_gap {
+                // Direction
+                let (side, _token_id, implied_price) = if price_move > 0.0 {
+                    (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
+                } else {
+                    (Side::Sell, &market.token_id_no, market.implied_prob_no)
+                };
+
+                let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
+                let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
+
+                // Only snipe if token is under 90¢ (10%+ return)
+                if entry_f64 <= SNIPER_MAX_PRICE {
+                    let size_usd = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(200.0);
+                    if size_usd < 5.0 { return None; }
+
+                    let window_secs_u32 = window_secs as u32;
+                    let pos = OrbPosition {
+                        side,
+                        entry_price,
+                        size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
+                        entry_time: self.current_time(),
+                        symbol: market.underlying_symbol.clone(),
+                        accuracy: 0.95,
+                        edge: 1.0 - entry_f64,
+                        flow: price.trade_flow_imbalance,
+                        move_pct,
+                        atr_multiple: 0.0,
+                        window_secs: window_secs_u32,
+                        window_end_ts: window_start_ts + window_secs as i64,
+                        max_bid_seen: 0.0,
+                        max_implied_seen: 0.0,
+                    };
+
+                    info!(
+                        question = %market.question,
+                        price_move = format!("{:+.1}", price_move),
+                        move_pct = format!("{:.3}%", move_pct),
+                        side = %side,
+                        entry_price = %entry_price,
+                        size_usd = format!("{:.0}", size_usd),
+                        time_remaining = format!("{:.0}s", time_remaining_secs),
+                        "ORB SNIPER: near-certain resolution"
+                    );
+
+                    self.notify_telegram(&format!(
+                        "🎯 <b>SNIPER</b> {} {} @{}¢ ${:.0} | gap:{:.3}% | {:.0}s left",
+                        market.underlying_symbol, side, entry_f64 * 100.0, size_usd, move_pct, time_remaining_secs
+                    ));
+
+                    OrbDataLogger::log_entry(&pos, &market.condition_id);
+                    self.open_positions.insert(market.condition_id.clone(), pos);
+                    self.entered_markets.insert(market.condition_id.clone());
+
+                    return Some(TradeSignal {
+                        target: TradeTarget::Polymarket(market.clone()),
+                        side,
+                        size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
+                        confidence: 0.95,
+                        price: entry_price,
+                        metadata: SignalMetadata::Orb {
+                            btc_move: price_move,
+                            accuracy_tier: 0.95,
+                            implied_prob: entry_f64,
+                            edge: 1.0 - entry_f64,
+                            start_price,
+                            spot,
+                            elapsed_secs: elapsed as f64,
+                            time_remaining_secs,
+                        },
+                        timestamp: self.current_time(),
+                        is_exit: false,
+                    });
+                }
+            }
+            return None; // In sniper window but gap too small — don't enter
+        }
+
+        // Too close to expiry for normal ORB
+        if time_remaining_secs < MIN_TIME_REMAINING_SECS as f64 {
+            return None;
+        }
 
         // ETH/SOL/XRP are noisier — require 0.15%+ minimum vs BTC's 0.05%
         // Tiered minimum by noise level: BTC 0.05%, ETH 0.08%, SOL/XRP 0.10%
@@ -1675,7 +1771,7 @@ mod tests {
         // === Confirmed tiers (30s+) — work in both modes ===
         assert_eq!(OrbStrategy::empirical_accuracy(0.03, 120, true), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.04, 90, true), None);
-        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60, true), None);
+        assert_eq!(OrbStrategy::empirical_accuracy(0.05, 60, true), Some(0.72));
         assert_eq!(OrbStrategy::empirical_accuracy(0.06, 49, true), None);
         assert_eq!(OrbStrategy::empirical_accuracy(0.06, 50, true), Some(0.74));
         assert_eq!(OrbStrategy::empirical_accuracy(0.07, 44, true), None);
