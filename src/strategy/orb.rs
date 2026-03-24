@@ -698,10 +698,16 @@ impl OrbStrategy {
             return all_signals;
         }
 
-        // Spread $200 max across all qualifying signals evenly.
-        // More diversification = lower variance.
-        let max_total = 200.0_f64;
-        let per_trade = (max_total / all_signals.len() as f64).min(200.0).max(5.0);
+        // Spread bankroll-based max across all qualifying signals evenly.
+        // Total exposure = 9% of bankroll, capped at $200.
+        let max_total = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(200.0);
+        // Apply loss streak halving to total
+        let max_total = if self.consecutive_losses > 0 {
+            max_total / (2.0_f64.powi(self.consecutive_losses as i32))
+        } else {
+            max_total
+        };
+        let per_trade = (max_total / all_signals.len() as f64).max(3.0);
 
         for signal in &mut all_signals {
             signal.size_usd = Decimal::from_f64_retain(per_trade).unwrap_or(Decimal::ZERO);
