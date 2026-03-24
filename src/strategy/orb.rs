@@ -288,8 +288,6 @@ pub struct OrbStrategy {
     consecutive_losses: u32,
     /// Consecutive win counter — reduces size after hot streak.
     consecutive_wins: u32,
-    /// Counter-trade mode: flip ORB direction after 2 consecutive losses.
-    counter_mode: bool,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
 }
@@ -315,7 +313,6 @@ impl OrbStrategy {
             down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
             consecutive_losses: 0,
             consecutive_wins: 0,
-            counter_mode: false,
             cooldown_until: None,
         }
     }
@@ -568,17 +565,6 @@ impl OrbStrategy {
             size /= 2.0_f64.powi(self.consecutive_losses as i32);
         }
 
-        // Counter mode: start small and scale up with wins
-        if self.counter_mode {
-            let scale = match self.consecutive_wins {
-                0 => 0.25,
-                1 => 0.50,
-                2 => 0.75,
-                _ => 1.0,
-            };
-            size *= scale;
-        }
-
         // After 5+ consecutive wins, reduce 50% — edge may be decaying
         if self.consecutive_wins >= 5 {
             size *= 0.5;
@@ -618,13 +604,12 @@ impl OrbStrategy {
         // Telegram alert
         if let TradeTarget::Polymarket(ref m) = best.target {
             self.notify_telegram(&format!(
-                "📊 <b>TRADE</b> {} {} @{:.0}¢ ${:.0}\nEdge: {:.1}% | Bankroll: ${:.0}{}",
+                "📊 <b>TRADE</b> {} {} @{:.0}¢ ${:.0}\nEdge: {:.1}% | Bankroll: ${:.0}",
                 best.side, m.underlying_symbol,
                 best.price.to_f64().unwrap_or(0.0) * 100.0,
                 size,
                 best.confidence * 100.0,
                 self.bankroll,
-                if self.counter_mode { " [COUNTER]" } else { "" }
             ));
         }
 
@@ -989,8 +974,7 @@ impl OrbStrategy {
         let accuracy = accuracy;
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
-        // In counter_mode, flip the direction — bet against the ORB signal
-        let going_up = if self.counter_mode { price_move <= 0.0 } else { price_move > 0.0 };
+        let going_up = price_move > 0.0;
         let (side, token_id, implied_price) = if going_up {
             (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
         } else {
@@ -1326,23 +1310,6 @@ impl OrbStrategy {
                 self.consecutive_wins = 0;
                 self.consecutive_losses += 1;
 
-                // Counter mode toggle
-                if self.counter_mode {
-                    self.counter_mode = false;
-                    self.consecutive_losses = 0;
-                    info!("ORB: counter-trade lost — back to normal ORB");
-                    self.notify_telegram(&format!(
-                        "🔄 <b>Back to ORB</b>\nBankroll: ${:.0}", self.bankroll
-                    ));
-                } else if self.consecutive_losses >= 2 {
-                    self.counter_mode = true;
-                    info!("ORB: 2 losses — switching to counter-trade mode");
-                    self.notify_telegram(&format!(
-                        "🔄 <b>COUNTER MODE</b>\n2 losses, flipping signals\nBankroll: ${:.0}",
-                        self.bankroll
-                    ));
-                }
-
                 if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
                     let cooldown_end = Utc::now() + chrono::Duration::seconds(COOLDOWN_SECS);
                     self.cooldown_until = Some(cooldown_end);
@@ -1356,12 +1323,11 @@ impl OrbStrategy {
             self.open_positions.remove(&cid);
 
             self.notify_telegram(&format!(
-                "{} <b>{}</b> ${:.2}\n{}W/{}L | Bankroll: ${:.0}{}",
+                "{} <b>{}</b> ${:.2}\n{}W/{}L | Bankroll: ${:.0}",
                 if won { "✅" } else { "❌" },
                 result, usdc,
                 self.consecutive_wins, self.consecutive_losses,
                 self.bankroll,
-                if self.counter_mode { " [COUNTER]" } else { "" }
             ));
         }
     }
@@ -1426,15 +1392,6 @@ impl OrbStrategy {
                             self.consecutive_losses = 0;
                         } else {
                             self.consecutive_losses += 1;
-                            // Counter mode toggle
-                            if self.counter_mode {
-                                self.counter_mode = false;
-                                self.consecutive_losses = 0;
-                                info!("ORB: counter-trade lost — back to normal ORB");
-                            } else if self.consecutive_losses >= 2 {
-                                self.counter_mode = true;
-                                info!("ORB: 2 losses — switching to counter-trade mode");
-                            }
                             if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
                                 let cooldown_end = now + chrono::Duration::seconds(COOLDOWN_SECS);
                                 self.cooldown_until = Some(cooldown_end);
@@ -1705,24 +1662,6 @@ impl Strategy for OrbStrategy {
                             self.consecutive_wins = 0;
                             self.consecutive_losses += 1;
 
-                            // After 2 consecutive losses in normal mode → flip to counter
-                            // After 1 loss in counter mode → flip back to normal
-                            if self.counter_mode {
-                                self.counter_mode = false;
-                                info!("ORB: counter-trade lost — back to normal ORB");
-                                self.notify_telegram(&format!(
-                                    "🔄 <b>Back to ORB</b> — counter-trade failed\nBankroll: ${:.0}",
-                                    self.bankroll
-                                ));
-                                self.consecutive_losses = 0; // reset for fresh start
-                            } else if self.consecutive_losses >= 2 {
-                                self.counter_mode = true;
-                                info!("ORB: 2 losses — switching to counter-trade mode");
-                                self.notify_telegram(&format!(
-                                    "🔄 <b>COUNTER MODE</b> — flipping ORB signals\n2 losses in a row, betting opposite\nBankroll: ${:.0}",
-                                    self.bankroll
-                                ));
-                            }
                             if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
                                 warn!(
                                     consecutive_losses = self.consecutive_losses,
@@ -1791,7 +1730,6 @@ mod tests {
             down_only: false,
             consecutive_losses: 0,
             consecutive_wins: 0,
-            counter_mode: false,
             cooldown_until: None,
         }
     }
