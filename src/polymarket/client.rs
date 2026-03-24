@@ -150,9 +150,12 @@ impl PolymarketClient {
         //   BUY: maker (USDC, 2 dec) = floor(size × price), taker (tokens, 4 dec) = size
         //   SELL: maker (tokens, 4 dec) = size, taker (USDC, 2 dec) = floor(size × price)
         // Round size to 4 decimals first, then derive maker from rounded values.
-        let size_rounded = params.size.round_dp(4);
-        let price_rounded = params.price.round_dp(4);
-        let usdc_amount = (size_rounded * price_rounded).round_dp(2);
+        use rust_decimal::RoundingStrategy;
+        // Truncate (floor) to avoid rounding up past what CLOB expects
+        let size_rounded = params.size.round_dp_with_strategy(4, RoundingStrategy::ToZero);
+        let price_rounded = params.price.round_dp_with_strategy(4, RoundingStrategy::ToZero);
+        // Don't round USDC — CLOB computes exact price×size and validates it
+        let usdc_amount = size_rounded * price_rounded;
 
         let (maker_amount, taker_amount) = match params.side {
             Side::Buy => {
