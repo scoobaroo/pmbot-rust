@@ -431,9 +431,9 @@ impl ExecutionEngine {
 
         let fee_rate_bps = Some(self.config.fee_rate_bps);
         // Sniper 99¢ scalps use GTD limit orders for maker pricing (edge is only 1%).
-        // Everything else uses FOK for instant fills (edge is 15%+, speed > fees).
+        // Everything else uses FAK — fill what's available, cancel the rest. No 60s timeouts.
         let is_sniper = order.price >= Decimal::new(99, 2);
-        let order_type = if is_sniper { "GTD" } else { "FOK" };
+        let order_type = if is_sniper { "GTD" } else { "FAK" };
         let post_only = is_sniper || self.maker_mode;
 
         // FOK orders must have expiration=None (API rejects non-zero)
