@@ -101,6 +101,11 @@ const SNIPER_GAP_ALT: f64 = 0.060; // SOL/XRP — noisier
 /// Max entry price for sniper — can go higher than ORB since accuracy is 95%+.
 const SNIPER_MAX_PRICE: f64 = 0.90;
 
+/// Lottery mode: buy very cheap tokens (<5¢) for massive payoff on reversal.
+/// Small fixed bet size — most will lose but one win covers many losses.
+const LOTTERY_MAX_PRICE: f64 = 0.05;
+const LOTTERY_BET_USD: f64 = 3.0;
+
 /// Take profit floor: exit when book bid reaches this level.
 const TAKE_PROFIT_MIN: f64 = 0.75;
 
@@ -733,6 +738,87 @@ impl OrbStrategy {
         let price_move = spot - start_price;
         let move_abs = price_move.abs();
         let move_pct = if start_price > 0.0 { move_abs / start_price * 100.0 } else { 0.0 };
+
+        // === LOTTERY MODE: buy ultra-cheap tokens for massive reversal payoff ===
+        // If either YES or NO token is under 5¢, buy it for $3. One win = $60+ profit.
+        // Only on BTC (most liquid, most likely to have sharp reversals).
+        // Skip if < 60s remaining (too close, price is set) or < 30s elapsed (too early, price noisy).
+        if market.underlying_symbol == "BTC-USD"
+            && time_remaining_secs > 60.0
+            && elapsed > 30
+        {
+            // Check which side is cheap
+            let yes_price = market.implied_prob_yes.to_f64().unwrap_or(0.5);
+            let no_price = market.implied_prob_no.to_f64().unwrap_or(0.5);
+
+            let (cheap_side, cheap_price, cheap_token) = if yes_price <= LOTTERY_MAX_PRICE && yes_price > 0.0 {
+                (Side::Buy, market.implied_prob_yes, &market.token_id_yes)
+            } else if no_price <= LOTTERY_MAX_PRICE && no_price > 0.0 {
+                (Side::Sell, market.implied_prob_no, &market.token_id_no)
+            } else {
+                (Side::Buy, Decimal::ONE, &market.token_id_yes) // dummy, won't pass check
+            };
+
+            let cheap_f64 = cheap_price.to_f64().unwrap_or(1.0);
+            if cheap_f64 <= LOTTERY_MAX_PRICE && cheap_f64 > 0.0 {
+                let entry = (cheap_price + Decimal::new(1, 2)).min(Decimal::new(5, 2)); // +1¢ to fill
+
+                let window_secs_u32 = window_secs as u32;
+                let pos = OrbPosition {
+                    side: cheap_side,
+                    entry_price: entry,
+                    size_usd: Decimal::from_f64_retain(LOTTERY_BET_USD).unwrap_or(Decimal::ZERO),
+                    entry_time: self.current_time(),
+                    symbol: market.underlying_symbol.clone(),
+                    accuracy: cheap_f64, // low probability
+                    edge: 1.0 - cheap_f64,
+                    flow: price.trade_flow_imbalance,
+                    move_pct,
+                    atr_multiple: 0.0,
+                    window_secs: window_secs_u32,
+                    window_end_ts: window_start_ts + window_secs as i64,
+                    max_bid_seen: 0.0,
+                    max_implied_seen: 0.0,
+                };
+
+                info!(
+                    question = %market.question,
+                    side = %cheap_side,
+                    price = format!("{:.0}¢", cheap_f64 * 100.0),
+                    potential_return = format!("{}x", (1.0 / cheap_f64) as u32),
+                    "ORB LOTTERY: buying cheap token"
+                );
+
+                self.notify_telegram(&format!(
+                    "🎰 <b>LOTTERY</b> {} {} @{}¢ ${:.0} | potential {}x",
+                    market.underlying_symbol, cheap_side, cheap_f64 * 100.0, LOTTERY_BET_USD, (1.0 / cheap_f64) as u32
+                ));
+
+                OrbDataLogger::log_entry(&pos, &market.condition_id);
+                self.open_positions.insert(market.condition_id.clone(), pos);
+                self.entered_markets.insert(market.condition_id.clone());
+
+                return Some(TradeSignal {
+                    target: TradeTarget::Polymarket(market.clone()),
+                    side: cheap_side,
+                    size_usd: Decimal::from_f64_retain(LOTTERY_BET_USD).unwrap_or(Decimal::ZERO),
+                    confidence: cheap_f64,
+                    price: entry,
+                    metadata: SignalMetadata::Orb {
+                        btc_move: price_move,
+                        accuracy_tier: cheap_f64,
+                        implied_prob: cheap_f64,
+                        edge: 1.0 - cheap_f64,
+                        start_price,
+                        spot,
+                        elapsed_secs: elapsed as f64,
+                        time_remaining_secs,
+                    },
+                    timestamp: self.current_time(),
+                    is_exit: false,
+                });
+            }
+        }
 
         // === SNIPER MODE: last 30 seconds, near-certain outcome ===
         if time_remaining_secs <= SNIPER_WINDOW_SECS as f64 && time_remaining_secs > 5.0 {
