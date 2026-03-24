@@ -3,6 +3,7 @@ use crate::execution::paper_tracker::PaperTracker;
 use crate::execution::risk::RiskManager;
 use crate::polymarket::client::{OrderParams, PolymarketClient};
 use crate::polymarket::market_scanner::check_resolutions;
+use crate::polymarket::redeemer::Redeemer;
 use crate::types::events::{ExecutionEvent, SignalMetadata, TradeSignal, TradeTarget};
 use crate::types::market::{MarketDirection, MarketType};
 use crate::types::order::{Fill, Order, OrderStatus, OrderType, Side};
@@ -37,6 +38,8 @@ pub struct ExecutionEngine {
     backtest_market_meta: HashMap<String, BacktestMarketMeta>,
     /// In backtest mode, tracks the latest signal timestamp for time-aware resolution.
     backtest_time: Option<DateTime<Utc>>,
+    /// On-chain redeemer for claiming winning positions.
+    redeemer: Option<Redeemer>,
 }
 
 impl ExecutionEngine {
@@ -53,6 +56,7 @@ impl ExecutionEngine {
             last_underlying_prices: HashMap::new(),
             backtest_market_meta: HashMap::new(),
             backtest_time: None,
+            redeemer: Redeemer::from_env(),
             config,
         }
     }
@@ -684,6 +688,12 @@ impl ExecutionEngine {
         let resolved = check_resolutions(&self.http, &expired_ids).await;
         for (condition_id, up_won) in resolved {
             if let Some((pnl, won)) = self.paper_tracker.resolve_by_outcome(&condition_id, up_won) {
+                // Auto-redeem winning tokens on-chain
+                if won {
+                    if let Some(ref mut redeemer) = self.redeemer {
+                        redeemer.redeem(&condition_id).await;
+                    }
+                }
                 let _ = exec_tx
                     .send(ExecutionEvent::MarketResolved {
                         condition_id,
