@@ -73,6 +73,7 @@ pub fn create_strategy(
                     config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0
                 });
             s = s.with_bankroll(bankroll);
+            s.sync_from_activity();
             Box::new(s)
         }
         StrategyName::Sniper => {

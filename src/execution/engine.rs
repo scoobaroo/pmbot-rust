@@ -56,7 +56,7 @@ impl ExecutionEngine {
             last_underlying_prices: HashMap::new(),
             backtest_market_meta: HashMap::new(),
             backtest_time: None,
-            redeemer: Redeemer::from_env(),
+            redeemer: None, // Enable with Redeemer::from_env() when MATIC is funded
             config,
         }
     }

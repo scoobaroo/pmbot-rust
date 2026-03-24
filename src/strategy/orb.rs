@@ -324,6 +324,81 @@ impl OrbStrategy {
         self
     }
 
+    /// Sync win/loss streak from Polymarket activity API on startup.
+    /// Reads recent REDEEMs to set consecutive_wins/losses accurately.
+    pub fn sync_from_activity(&mut self) {
+        let wallet = std::env::var("COPYTRADE_FUNDER_ADDRESS").unwrap_or_default();
+        if wallet.is_empty() {
+            return;
+        }
+
+        let url = format!(
+            "https://data-api.polymarket.com/activity?user={}&limit=50&sortDirection=DESC",
+            wallet
+        );
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let resp = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "failed to sync activity from Polymarket");
+                return;
+            }
+        };
+
+        let data: Vec<serde_json::Value> = match resp.json() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // Walk redeems from most recent to find current streak
+        let mut wins = 0u32;
+        let mut losses = 0u32;
+        let mut streak_type: Option<bool> = None; // true=win, false=loss
+
+        for item in &data {
+            let ttype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ttype != "REDEEM" {
+                continue;
+            }
+
+            let usdc = item.get("usdcSize").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let won = usdc > 0.0;
+
+            match streak_type {
+                None => {
+                    streak_type = Some(won);
+                    if won { wins = 1; } else { losses = 1; }
+                }
+                Some(prev_won) if prev_won == won => {
+                    if won { wins += 1; } else { losses += 1; }
+                }
+                _ => break, // streak broken
+            }
+        }
+
+        self.consecutive_wins = wins;
+        self.consecutive_losses = losses;
+
+        info!(
+            consecutive_wins = wins,
+            consecutive_losses = losses,
+            bankroll = format!("${:.0}", self.bankroll),
+            "ORB: synced streak from Polymarket activity"
+        );
+
+        // Notify state on Telegram
+        if wins > 0 || losses > 0 {
+            self.notify_telegram(&format!(
+                "🔄 <b>Bot restarted</b>\n{}W/{}L streak | Bankroll: ${:.0}",
+                wins, losses, self.bankroll,
+            ));
+        }
+    }
+
     pub fn with_book_cache(mut self, cache: BookCache) -> Self {
         self.book_cache = Some(cache);
         self
