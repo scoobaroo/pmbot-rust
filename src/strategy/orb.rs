@@ -1094,10 +1094,11 @@ impl OrbStrategy {
 
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Use book best ask for instant fill — this is what someone is actually selling at.
-        // Fallback to implied + 3¢ if no book data.
+        // Use book best ask + 2¢ buffer for reliable FAK fills.
+        // Fallback to implied + 5¢ if no book data.
         let entry_price = self.get_book_ask(token_id)
-            .unwrap_or_else(|| implied_price + Decimal::new(3, 2))
+            .map(|ask| ask + Decimal::new(2, 2))
+            .unwrap_or_else(|| implied_price + Decimal::new(5, 2))
             .min(Decimal::new(95, 2));
 
         // Max entry price cap — don't buy above 50¢.
