@@ -675,9 +675,9 @@ impl OrbStrategy {
         // Unified position sizing — all caps applied here
         let mut size = self.bankroll * MAX_RISK_PER_TRADE_PCT; // 9% of bankroll
 
-        // Loss halving: 0 losses = full, 1 = 50%, 2 = 25%, etc.
+        // Loss reduction: halve size after any losses (flat 50%, not exponential)
         if self.consecutive_losses > 0 {
-            size /= 2.0_f64.powi(self.consecutive_losses as i32);
+            size *= 0.5;
         }
 
         // After 5+ consecutive wins, reduce 50% — edge may be decaying
@@ -685,8 +685,12 @@ impl OrbStrategy {
             size *= 0.5;
         }
 
-        // Hard cap: never exceed $200 per trade
-        size = size.min(200.0);
+        // Hard cap per trade
+        let max_bet: f64 = std::env::var("MAX_BET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200.0);
+        size = size.min(max_bet);
 
         // Cap total exposure at bankroll * 25% across all open positions
         let current_exposure: f64 = self.open_positions.values()
@@ -2561,8 +2565,8 @@ mod tests {
     #[test]
     fn test_loss_halving_reduces_size() {
         let mut strategy = make_test_strategy();
-        strategy.bankroll = 200.0;
-        strategy.consecutive_losses = 2; // should halve twice: 9% * 200 / 4 = $4.5 → too small
+        strategy.bankroll = 50.0;
+        strategy.consecutive_losses = 2; // flat 50% reduction: 9% * 50 * 0.5 = $2.25 → too small
         let now = Utc::now();
         let window_start = now.timestamp() - 120;
 
@@ -2576,7 +2580,7 @@ mod tests {
         seed_atr(&mut strategy, "BTC-USD", 20.0);
 
         let signals = strategy.evaluate_all_markets();
-        // $200 * 9% / 4 = $4.50 — below $5 minimum
+        // $50 * 9% * 0.5 = $2.25 — below $5 minimum
         assert!(signals.is_empty(), "should skip when loss-halved size < $5");
     }
 }
