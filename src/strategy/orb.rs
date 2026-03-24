@@ -301,10 +301,17 @@ pub struct OrbStrategy {
     /// Consecutive win counter — reduces size after hot streak.
     consecutive_wins: u32,
     /// Counter-trade mode: flip ORB direction after 2 consecutive losses.
-    /// Stays flipped until it loses, then reverts to normal ORB.
     counter_mode: bool,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
+    /// Last time we polled Polymarket API for resolutions.
+    last_resolution_poll: i64,
+    /// Condition IDs we've already processed as resolved (prevent double-counting).
+    resolved_cids: std::collections::HashSet<String>,
+    /// HTTP client for polling Polymarket API.
+    http_client: reqwest::Client,
+    /// Wallet address for polling redeems.
+    wallet_address: String,
 }
 
 impl OrbStrategy {
@@ -335,6 +342,13 @@ impl OrbStrategy {
             consecutive_wins: 0,
             counter_mode: false,
             cooldown_until: None,
+            last_resolution_poll: 0,
+            resolved_cids: std::collections::HashSet::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("failed to build http client"),
+            wallet_address: std::env::var("COPYTRADE_FUNDER_ADDRESS").unwrap_or_default(),
         }
     }
 
@@ -1412,6 +1426,136 @@ impl OrbStrategy {
         signals
     }
 
+    /// Poll Polymarket API for recent REDEEMs to track wins/losses.
+    /// This is the ONLY reliable way to know trade outcomes.
+    fn poll_resolutions(&mut self) {
+        let now_ts = Utc::now().timestamp();
+        // Poll every 15 seconds
+        if now_ts - self.last_resolution_poll < 15 {
+            return;
+        }
+        self.last_resolution_poll = now_ts;
+
+        if self.wallet_address.is_empty() {
+            return;
+        }
+
+        let url = format!(
+            "https://data-api.polymarket.com/activity?user={}&limit=20&sortDirection=DESC",
+            self.wallet_address
+        );
+
+        // Use blocking call (strategy is sync)
+        let resp = match reqwest::blocking::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let data: Vec<serde_json::Value> = match resp.json() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        for item in &data {
+            let ttype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ttype != "REDEEM" {
+                continue;
+            }
+
+            let cid = item.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() || self.resolved_cids.contains(cid) {
+                continue;
+            }
+
+            // Only process if we had a position on this market
+            let had_position = self.open_positions.contains_key(cid)
+                || self.entered_markets.contains(cid);
+            if !had_position {
+                continue;
+            }
+
+            let size = item.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let usdc = item.get("usdcSize").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let won = size > 0.0 || usdc > 0.0;
+
+            self.resolved_cids.insert(cid.to_string());
+            self.open_positions.remove(cid);
+
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let result = if won { "WON" } else { "LOST" };
+
+            info!(
+                condition_id = %cid,
+                result,
+                usdc = format!("${:.2}", usdc),
+                "ORB: resolution from API poll"
+            );
+
+            // Update bankroll
+            if won {
+                self.bankroll += usdc;
+                if self.consecutive_losses >= SLOW_MODE_AFTER_LOSSES {
+                    info!("ORB: win after loss streak — back to full speed");
+                }
+                self.consecutive_losses = 0;
+                self.consecutive_wins += 1;
+
+                if self.consecutive_wins == 5 {
+                    self.notify_telegram(&format!(
+                        "🔥 <b>HOT STREAK</b> {} wins\nBankroll: ${:.0}",
+                        self.consecutive_wins, self.bankroll
+                    ));
+                }
+            } else {
+                // Estimate loss from entry price
+                if let Some(pos) = self.open_positions.get(cid) {
+                    self.bankroll -= pos.size_usd.to_f64().unwrap_or(0.0);
+                }
+                self.consecutive_wins = 0;
+                self.consecutive_losses += 1;
+
+                // Counter mode toggle
+                if self.counter_mode {
+                    self.counter_mode = false;
+                    self.consecutive_losses = 0;
+                    info!("ORB: counter-trade lost — back to normal ORB");
+                    self.notify_telegram(&format!(
+                        "🔄 <b>Back to ORB</b>\nBankroll: ${:.0}", self.bankroll
+                    ));
+                } else if self.consecutive_losses >= 2 {
+                    self.counter_mode = true;
+                    info!("ORB: 2 losses — switching to counter-trade mode");
+                    self.notify_telegram(&format!(
+                        "🔄 <b>COUNTER MODE</b>\n2 losses, flipping signals\nBankroll: ${:.0}",
+                        self.bankroll
+                    ));
+                }
+
+                if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
+                    let cooldown_end = Utc::now() + chrono::Duration::seconds(COOLDOWN_SECS);
+                    self.cooldown_until = Some(cooldown_end);
+                    self.notify_telegram(&format!(
+                        "⛔ <b>CIRCUIT BREAKER</b>\n{} losses — pausing 30min\nBankroll: ${:.0}",
+                        self.consecutive_losses, self.bankroll
+                    ));
+                }
+            }
+
+            self.notify_telegram(&format!(
+                "{} <b>{}</b> ${:.2}\n{}W/{}L | Bankroll: ${:.0}{}",
+                if won { "✅" } else { "❌" },
+                result, usdc,
+                self.consecutive_wins, self.consecutive_losses,
+                self.bankroll,
+                if self.counter_mode { " [COUNTER]" } else { "" }
+            ));
+        }
+    }
+
     /// Garbage-collect expired markets and self-resolve expired positions.
     /// Uses current BTC/ETH price vs start price to determine WIN/LOSS
     /// since the Gamma API resolution path is unreliable for UpDown markets.
@@ -1559,6 +1703,8 @@ impl Strategy for OrbStrategy {
                 }
                 self.latest_prices.insert(price.symbol.clone(), price);
                 self.gc_expired_markets();
+                // Poll Polymarket API for actual win/loss outcomes (every 15s)
+                self.poll_resolutions();
                 // Check take-profit exits first (every tick), then new entries
                 let mut signals = self.check_take_profits();
                 signals.extend(self.evaluate_all_markets());
@@ -1856,6 +2002,10 @@ mod tests {
             consecutive_wins: 0,
             counter_mode: false,
             cooldown_until: None,
+            last_resolution_poll: 0,
+            resolved_cids: std::collections::HashSet::new(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            wallet_address: String::new(),
         }
     }
 
