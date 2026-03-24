@@ -820,8 +820,10 @@ impl OrbStrategy {
             }
         }
 
-        // === SNIPER MODE: last 30 seconds, near-certain outcome ===
-        if time_remaining_secs <= SNIPER_WINDOW_SECS as f64 && time_remaining_secs > 5.0 {
+        // === SNIPER MODE: last 60 seconds, near-certain outcome ===
+        // With a big enough price gap, even 80-95¢ entries are safe.
+        // BTC $100+ gap with 60s left = virtually impossible to reverse.
+        if time_remaining_secs <= 60.0 && time_remaining_secs > 5.0 {
             let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC }
                 else if is_eth { SNIPER_GAP_ETH }
                 else { SNIPER_GAP_ALT };
@@ -837,12 +839,18 @@ impl OrbStrategy {
                 let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
                 let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
 
-                // For expensive entries (>80¢), require tight spread
-                let token_id = if price_move > 0.0 { &market.token_id_yes } else { &market.token_id_no };
-                let spread = self.get_book_spread(token_id).unwrap_or(1.0);
-                if entry_f64 > 0.80 && spread > 0.04 {
-                    // Wide spread at high price = bad fill, skip
-                    return None;
+                // For expensive entries (>80¢), require a larger price gap
+                // BTC needs $100+ gap to justify 80¢+ entry
+                let big_gap = if market.underlying_symbol == "BTC-USD" {
+                    move_abs >= 100.0
+                } else if is_eth {
+                    move_abs >= 3.0
+                } else {
+                    move_pct >= 0.15
+                };
+
+                if entry_f64 > 0.80 && !big_gap {
+                    return None; // gap too small for expensive entry
                 }
 
                 if entry_f64 <= SNIPER_MAX_PRICE {
