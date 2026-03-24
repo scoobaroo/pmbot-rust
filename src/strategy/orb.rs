@@ -890,10 +890,10 @@ impl OrbStrategy {
         // Only enter when outcome is essentially locked in. Fixed 99¢ limit order.
         // ~1% return per trade, but needs massive gap to ensure certainty.
         if time_remaining_secs <= 10.0 && time_remaining_secs > 2.0 {
-            // Require 2x the normal gap — outcome must be beyond doubt
-            let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC * 2.0 }
-                else if is_eth { SNIPER_GAP_ETH * 2.0 }
-                else { SNIPER_GAP_ALT * 2.0 };
+            // Require 4x the normal gap — outcome must be beyond doubt
+            let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC * 4.0 }
+                else if is_eth { SNIPER_GAP_ETH * 4.0 }
+                else { SNIPER_GAP_ALT * 4.0 };
 
             if move_pct >= min_gap {
                 // Direction: price went up → buy YES, price went down → buy NO
