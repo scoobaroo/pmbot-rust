@@ -709,17 +709,7 @@ impl OrbStrategy {
             return vec![];
         }
 
-        // Telegram alert
-        if let TradeTarget::Polymarket(ref m) = best.target {
-            self.notify_telegram(&format!(
-                "📊 <b>TRADE</b> {} {} @{:.0}¢ ${:.0}\nEdge: {:.1}% | Bankroll: ${:.0}",
-                best.side, m.underlying_symbol,
-                best.price.to_f64().unwrap_or(0.0) * 100.0,
-                size,
-                best.confidence * 100.0,
-                self.bankroll,
-            ));
-        }
+        // Telegram alert sent from OrderPlaced handler — only after confirmed fill
 
         vec![best]
     }
