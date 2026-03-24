@@ -98,8 +98,8 @@ const SNIPER_GAP_BTC: f64 = 0.030;
 const SNIPER_GAP_ETH: f64 = 0.040;
 const SNIPER_GAP_ALT: f64 = 0.060; // SOL/XRP — noisier
 
-/// Max entry price for sniper — can go higher than ORB since accuracy is 95%+.
-const SNIPER_MAX_PRICE: f64 = 0.90;
+/// Max entry price for sniper — high accuracy justifies paying up to 95¢.
+const SNIPER_MAX_PRICE: f64 = 0.95;
 
 /// Lottery mode: buy very cheap tokens (<5¢) for massive payoff on reversal.
 /// Small fixed bet size — most will lose but one win covers many losses.
@@ -837,7 +837,14 @@ impl OrbStrategy {
                 let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
                 let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
 
-                // Only snipe if token is under 90¢ (10%+ return)
+                // For expensive entries (>80¢), require tight spread
+                let token_id = if price_move > 0.0 { &market.token_id_yes } else { &market.token_id_no };
+                let spread = self.get_book_spread(token_id).unwrap_or(1.0);
+                if entry_f64 > 0.80 && spread > 0.04 {
+                    // Wide spread at high price = bad fill, skip
+                    return None;
+                }
+
                 if entry_f64 <= SNIPER_MAX_PRICE {
                     let size_usd = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(200.0);
                     if size_usd < 5.0 { return None; }
