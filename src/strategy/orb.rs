@@ -652,20 +652,37 @@ impl OrbStrategy {
     }
 
     fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
-        let mut signals = Vec::new();
+        let mut all_signals = Vec::new();
         let mut signaled_cids = std::collections::HashSet::new();
         let market_list: Vec<PolymarketMarket> = self.markets.values().cloned().collect();
         for market in &market_list {
-            // Skip if we already generated a signal for this condition_id in this batch
             if signaled_cids.contains(&market.condition_id) {
                 continue;
             }
             if let Some(s) = self.evaluate_updown_market(market) {
                 signaled_cids.insert(market.condition_id.clone());
-                signals.push(s);
+                all_signals.push(s);
             }
         }
-        signals
+
+        if all_signals.is_empty() {
+            return all_signals;
+        }
+
+        // Pick the best signal by edge (confidence) — only trade one per tick.
+        // Multiple signals = same underlying move, don't stack exposure.
+        all_signals.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        let best = all_signals.remove(0);
+
+        // Remove open_positions for the signals we're NOT taking
+        for rejected in &all_signals {
+            if let TradeTarget::Polymarket(ref m) = rejected.target {
+                self.open_positions.remove(&m.condition_id);
+                // Keep entered_markets so we don't re-enter on next tick
+            }
+        }
+
+        vec![best]
     }
 
     fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
