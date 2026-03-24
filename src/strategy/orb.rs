@@ -816,7 +816,11 @@ impl OrbStrategy {
             };
 
             let cheap_f64 = cheap_price.to_f64().unwrap_or(1.0);
-            if cheap_f64 <= LOTTERY_MAX_PRICE && cheap_f64 > 0.0 {
+            // Skip lottery if gap is too wide — reversal unlikely
+            // Only take lottery when move is small (<0.05% ≈ $35 BTC) — market still undecided
+            if move_pct >= 0.05 {
+                // Token is cheap because the move is massive, not because of opportunity
+            } else if cheap_f64 <= LOTTERY_MAX_PRICE && cheap_f64 > 0.0 {
                 let entry = (cheap_price + Decimal::new(1, 2)).min(Decimal::new(5, 2)); // +1¢ to fill
 
                 let window_secs_u32 = window_secs as u32;
