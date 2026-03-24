@@ -388,6 +388,21 @@ impl OrbStrategy {
         Some(snap.spread.to_f64().unwrap_or(1.0))
     }
 
+    /// Look up best ask from orderbook — this is the price to buy at for instant fill.
+    fn get_book_ask(&self, token_id: &str) -> Option<Decimal> {
+        let cache = self.book_cache.as_ref()?;
+        let books = cache.try_read().ok()?;
+        let snap = books.get(token_id)?;
+        if !snap.is_fresh(self.ws_book_max_stale_secs) {
+            return None;
+        }
+        if snap.best_ask > Decimal::ZERO && snap.best_ask < Decimal::ONE {
+            Some(snap.best_ask)
+        } else {
+            None
+        }
+    }
+
     /// Look up best bid from orderbook for exit pricing.
     fn get_book_bid(&self, token_id: &str) -> Option<Decimal> {
         let cache = self.book_cache.as_ref()?;
@@ -863,13 +878,16 @@ impl OrbStrategy {
 
             if move_pct >= min_gap {
                 // Direction
-                let (side, _token_id, implied_price) = if price_move > 0.0 {
+                let (side, token_id_sniper, implied_price) = if price_move > 0.0 {
                     (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
                 } else {
                     (Side::Sell, &market.token_id_no, market.implied_prob_no)
                 };
 
-                let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
+                // Use book best ask for instant fill, fallback to implied + 3¢
+                let entry_price = self.get_book_ask(token_id_sniper)
+                    .unwrap_or_else(|| (implied_price + Decimal::new(3, 2)))
+                    .min(Decimal::new(95, 2));
                 let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
 
                 // For expensive entries (>80¢), require a larger price gap
@@ -1100,9 +1118,11 @@ impl OrbStrategy {
 
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Add 2¢ above implied to sweep the ask for instant taker fill.
-        // 5¢ was too much, 0¢ sits on the book unfilled. 2¢ is the sweet spot.
-        let entry_price = (implied_price + Decimal::new(2, 2)).min(Decimal::new(95, 2));
+        // Use book best ask for instant fill — this is what someone is actually selling at.
+        // Fallback to implied + 3¢ if no book data.
+        let entry_price = self.get_book_ask(token_id)
+            .unwrap_or_else(|| (implied_price + Decimal::new(3, 2)))
+            .min(Decimal::new(95, 2));
 
         // Max entry price cap — don't buy above 50¢.
         if entry_price > Decimal::new(60, 2) {
