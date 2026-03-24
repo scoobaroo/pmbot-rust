@@ -95,8 +95,8 @@ const SNIPER_GAP_BTC: f64 = 0.030;
 const SNIPER_GAP_ETH: f64 = 0.040;
 const SNIPER_GAP_ALT: f64 = 0.060; // SOL/XRP — noisier
 
-/// Max entry price for sniper — high accuracy justifies paying up to 95¢.
-const SNIPER_MAX_PRICE: f64 = 0.95;
+/// Sniper entry price — only buy at 99¢ for near-guaranteed resolution scalps.
+const SNIPER_ENTRY_PRICE: f64 = 0.99;
 
 /// Lottery mode: buy very cheap tokens (<5¢) for massive payoff on reversal.
 /// Small fixed bet size — most will lose but one win covers many losses.
@@ -886,103 +886,79 @@ impl OrbStrategy {
             }
         }
 
-        // === SNIPER MODE: last 60 seconds, near-certain outcome ===
-        // With a big enough price gap, even 80-95¢ entries are safe.
-        // BTC $100+ gap with 60s left = virtually impossible to reverse.
-        if time_remaining_secs <= 60.0 && time_remaining_secs > 5.0 {
-            let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC }
-                else if is_eth { SNIPER_GAP_ETH }
-                else { SNIPER_GAP_ALT };
+        // === SNIPER MODE: last 10 seconds, buy at 99¢ for resolution scalp ===
+        // Only enter when outcome is essentially locked in. Fixed 99¢ limit order.
+        // ~1% return per trade, but needs massive gap to ensure certainty.
+        if time_remaining_secs <= 10.0 && time_remaining_secs > 2.0 {
+            // Require 2x the normal gap — outcome must be beyond doubt
+            let min_gap = if market.underlying_symbol == "BTC-USD" { SNIPER_GAP_BTC * 2.0 }
+                else if is_eth { SNIPER_GAP_ETH * 2.0 }
+                else { SNIPER_GAP_ALT * 2.0 };
 
             if move_pct >= min_gap {
-                // Direction
-                let (side, token_id_sniper, implied_price) = if price_move > 0.0 {
-                    (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
-                } else {
-                    (Side::Sell, &market.token_id_no, market.implied_prob_no)
+                // Direction: price went up → buy YES, price went down → buy NO
+                let side = if price_move > 0.0 { Side::Buy } else { Side::Sell };
+
+                // Fixed 99¢ limit order
+                let entry_price = Decimal::new(99, 2);
+                let size_usd = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(
+                    std::env::var("MAX_BET").ok().and_then(|v| v.parse().ok()).unwrap_or(200.0)
+                );
+                if size_usd < 5.0 { return None; }
+
+                let window_secs_u32 = window_secs as u32;
+                let pos = OrbPosition {
+                    side,
+                    entry_price,
+                    size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
+                    entry_time: self.current_time(),
+                    symbol: market.underlying_symbol.clone(),
+                    accuracy: 0.99,
+                    edge: 0.01,
+                    flow: price.trade_flow_imbalance,
+                    move_pct,
+                    atr_multiple: 0.0,
+                    window_secs: window_secs_u32,
+                    window_end_ts: window_start_ts + window_secs as i64,
+                    max_bid_seen: 0.0,
+                    max_implied_seen: 0.0,
                 };
 
-                // Use book best ask for instant fill, fallback to implied + 3¢
-                let entry_price = self.get_book_ask(token_id_sniper)
-                    .unwrap_or_else(|| implied_price + Decimal::new(3, 2))
-                    .min(Decimal::new(95, 2));
-                let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
+                info!(
+                    question = %market.question,
+                    price_move = format!("{:+.1}", price_move),
+                    move_pct = format!("{:.3}%", move_pct),
+                    side = %side,
+                    size_usd = format!("{:.0}", size_usd),
+                    time_remaining = format!("{:.0}s", time_remaining_secs),
+                    "ORB SNIPER: 99¢ resolution scalp"
+                );
 
-                // For expensive entries (>80¢), require a larger price gap
-                // BTC needs $100+ gap to justify 80¢+ entry
-                let big_gap = if market.underlying_symbol == "BTC-USD" {
-                    move_abs >= 100.0
-                } else if is_eth {
-                    move_abs >= 3.0
-                } else {
-                    move_pct >= 0.15
-                };
+                OrbDataLogger::log_entry(&pos, &market.condition_id);
+                self.open_positions.insert(market.condition_id.clone(), pos);
+                self.entered_markets.insert(market.condition_id.clone());
 
-                if entry_f64 > 0.80 && !big_gap {
-                    return None; // gap too small for expensive entry
-                }
-
-                if entry_f64 <= SNIPER_MAX_PRICE {
-                    let size_usd = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(200.0);
-                    if size_usd < 5.0 { return None; }
-
-                    let window_secs_u32 = window_secs as u32;
-                    let pos = OrbPosition {
-                        side,
-                        entry_price,
-                        size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
-                        entry_time: self.current_time(),
-                        symbol: market.underlying_symbol.clone(),
-                        accuracy: 0.95,
-                        edge: 1.0 - entry_f64,
-                        flow: price.trade_flow_imbalance,
-                        move_pct,
-                        atr_multiple: 0.0,
-                        window_secs: window_secs_u32,
-                        window_end_ts: window_start_ts + window_secs as i64,
-                        max_bid_seen: 0.0,
-                        max_implied_seen: 0.0,
-                    };
-
-                    info!(
-                        question = %market.question,
-                        price_move = format!("{:+.1}", price_move),
-                        move_pct = format!("{:.3}%", move_pct),
-                        side = %side,
-                        entry_price = %entry_price,
-                        size_usd = format!("{:.0}", size_usd),
-                        time_remaining = format!("{:.0}s", time_remaining_secs),
-                        "ORB SNIPER: near-certain resolution"
-                    );
-
-                    // Telegram notification sent after best-signal selection
-
-                    OrbDataLogger::log_entry(&pos, &market.condition_id);
-                    self.open_positions.insert(market.condition_id.clone(), pos);
-                    self.entered_markets.insert(market.condition_id.clone());
-
-                    return Some(TradeSignal {
-                        target: TradeTarget::Polymarket(market.clone()),
-                        side,
-                        size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
-                        confidence: 0.95,
-                        price: entry_price,
-                        metadata: SignalMetadata::Orb {
-                            btc_move: price_move,
-                            accuracy_tier: 0.95,
-                            implied_prob: entry_f64,
-                            edge: 1.0 - entry_f64,
-                            start_price,
-                            spot,
-                            elapsed_secs: elapsed as f64,
-                            time_remaining_secs,
-                        },
-                        timestamp: self.current_time(),
-                        is_exit: false,
-                    });
-                }
+                return Some(TradeSignal {
+                    target: TradeTarget::Polymarket(market.clone()),
+                    side,
+                    size_usd: Decimal::from_f64_retain(size_usd).unwrap_or(Decimal::ZERO),
+                    confidence: 0.99,
+                    price: entry_price,
+                    metadata: SignalMetadata::Orb {
+                        btc_move: price_move,
+                        accuracy_tier: 0.99,
+                        implied_prob: 0.99,
+                        edge: 0.01,
+                        start_price,
+                        spot,
+                        elapsed_secs: elapsed as f64,
+                        time_remaining_secs,
+                    },
+                    timestamp: self.current_time(),
+                    is_exit: false,
+                });
             }
-            return None; // In sniper window but gap too small — don't enter
+            return None; // In sniper window but gap too small
         }
 
         // Too close to expiry for normal ORB
