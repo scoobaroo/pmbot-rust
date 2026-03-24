@@ -290,6 +290,8 @@ pub struct OrbStrategy {
     consecutive_wins: u32,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
+    /// Last time we synced streak from Polymarket activity.
+    last_activity_sync: i64,
 }
 
 impl OrbStrategy {
@@ -314,6 +316,7 @@ impl OrbStrategy {
             consecutive_losses: 0,
             consecutive_wins: 0,
             cooldown_until: None,
+            last_activity_sync: 0,
         }
     }
 
@@ -1379,6 +1382,100 @@ impl OrbStrategy {
         signals
     }
 
+    /// Re-sync win/loss streak from Polymarket every 60 seconds.
+    /// This catches resolutions for trades placed before this bot instance started.
+    fn periodic_activity_sync(&mut self) {
+        let now_ts = Utc::now().timestamp();
+        if now_ts - self.last_activity_sync < 60 {
+            return;
+        }
+        self.last_activity_sync = now_ts;
+
+        // sync_from_activity uses reqwest::blocking which is fine at startup
+        // (before tokio runtime), but here we're inside the async runtime.
+        // Use spawn_blocking to avoid deadlock.
+        let wallet = std::env::var("COPYTRADE_FUNDER_ADDRESS").unwrap_or_default();
+        if wallet.is_empty() {
+            return;
+        }
+
+        let result = std::thread::spawn(move || {
+            let url = format!(
+                "https://data-api.polymarket.com/activity?user={}&limit=200&sortDirection=DESC",
+                wallet
+            );
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .ok()?;
+            let data: Vec<serde_json::Value> = client.get(&url).send().ok()?.json().ok()?;
+            Some(data)
+        }).join().ok().flatten();
+
+        let data = match result {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Same logic as sync_from_activity
+        let mut traded_cids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut redeemed_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for item in &data {
+            let ttype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let cid = item.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            if !title.contains("Up or Down") {
+                continue;
+            }
+
+            match ttype {
+                "TRADE" => {
+                    traded_cids.entry(cid.to_string())
+                        .and_modify(|old_ts| { if ts > *old_ts { *old_ts = ts; } })
+                        .or_insert(ts);
+                }
+                "REDEEM" => { redeemed_cids.insert(cid.to_string()); }
+                _ => {}
+            }
+        }
+
+        let mut results: Vec<(i64, bool)> = Vec::new();
+        for (cid, ts) in &traded_cids {
+            if now_ts - ts < 600 { continue; }
+            results.push((*ts, redeemed_cids.contains(cid)));
+        }
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut wins = 0u32;
+        let mut losses = 0u32;
+        let mut streak_type: Option<bool> = None;
+        for (_ts, won) in &results {
+            match streak_type {
+                None => {
+                    streak_type = Some(*won);
+                    if *won { wins = 1; } else { losses = 1; }
+                }
+                Some(prev) if prev == *won => {
+                    if *won { wins += 1; } else { losses += 1; }
+                }
+                _ => break,
+            }
+        }
+
+        if wins != self.consecutive_wins || losses != self.consecutive_losses {
+            self.consecutive_wins = wins;
+            self.consecutive_losses = losses;
+            info!(
+                consecutive_wins = wins,
+                consecutive_losses = losses,
+                "ORB: streak updated from activity sync"
+            );
+        }
+    }
+
     /// Read resolved trades from web server's poll_resolutions (non-blocking).
     /// The web server polls Polymarket API every 3s for REDEEMs and pushes them
     /// to SharedWebState. We drain them here on each price tick.
@@ -1590,6 +1687,8 @@ impl Strategy for OrbStrategy {
                 self.gc_expired_markets();
                 // Check resolutions from web server (non-blocking)
                 self.check_web_resolutions();
+                // Re-sync streak from Polymarket every 60s
+                self.periodic_activity_sync();
                 // Check take-profit exits first (every tick), then new entries
                 let mut signals = self.check_take_profits();
                 signals.extend(self.evaluate_all_markets());
@@ -1849,6 +1948,7 @@ mod tests {
             consecutive_losses: 0,
             consecutive_wins: 0,
             cooldown_until: None,
+            last_activity_sync: 0,
         }
     }
 
