@@ -669,33 +669,33 @@ impl OrbStrategy {
             return all_signals;
         }
 
-        // Pick the best signal by edge (confidence) — only trade one per tick.
-        // Multiple signals = same underlying move, don't stack exposure.
-        all_signals.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-        let best = all_signals.remove(0);
+        // Spread $200 max across all qualifying signals evenly.
+        // More diversification = lower variance.
+        let max_total = 200.0_f64;
+        let per_trade = (max_total / all_signals.len() as f64).min(200.0).max(5.0);
 
-        // Remove open_positions for the signals we're NOT taking
-        for rejected in &all_signals {
-            if let TradeTarget::Polymarket(ref m) = rejected.target {
-                self.open_positions.remove(&m.condition_id);
+        for signal in &mut all_signals {
+            signal.size_usd = Decimal::from_f64_retain(per_trade).unwrap_or(Decimal::ZERO);
+            // Update the open_position size too
+            if let TradeTarget::Polymarket(ref m) = signal.target {
+                if let Some(pos) = self.open_positions.get_mut(&m.condition_id) {
+                    pos.size_usd = signal.size_usd;
+                }
             }
         }
 
-        // Notify Telegram only for the winning signal
-        if let TradeTarget::Polymarket(ref m) = best.target {
-            let side = &best.side;
-            let price = best.price.to_f64().unwrap_or(0.0);
-            let size = best.size_usd.to_f64().unwrap_or(0.0);
-            let edge = best.confidence;
-            let q = &m.question;
-            self.notify_telegram(&format!(
-                "📊 <b>{}</b> {} @{:.0}¢ ${:.0} | edge:{:.0}% | {}",
-                side, m.underlying_symbol, price * 100.0, size, edge * 100.0,
-                &q[..q.len().min(40)]
-            ));
-        }
+        // One Telegram alert summarizing all trades
+        let symbols: Vec<String> = all_signals.iter().map(|s| {
+            if let TradeTarget::Polymarket(ref m) = s.target {
+                format!("{} {} @{:.0}¢", s.side, m.underlying_symbol, s.price.to_f64().unwrap_or(0.0) * 100.0)
+            } else { String::new() }
+        }).collect();
+        self.notify_telegram(&format!(
+            "📊 <b>{} trades</b> ${:.0} each\n{}",
+            all_signals.len(), per_trade, symbols.join("\n")
+        ));
 
-        vec![best]
+        all_signals
     }
 
     fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
