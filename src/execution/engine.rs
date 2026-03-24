@@ -431,7 +431,8 @@ impl ExecutionEngine {
 
         let post_only = self.maker_mode;
         let fee_rate_bps = Some(self.config.fee_rate_bps);
-        let order_type = if expiration.is_some() { "GTD" } else { "GTC" };
+        // FOK = Fill Or Kill — instant fill or cancel, no stale limit orders
+        let order_type = "FOK";
 
         let params = OrderParams {
             token_id: &order.token_id,
