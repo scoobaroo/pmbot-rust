@@ -146,25 +146,23 @@ impl PolymarketClient {
         };
 
         // Calculate maker/taker amounts (6 decimal places)
-        // CLOB requires: maker (USDC) max 2 decimal accuracy, taker (tokens) max 4.
-        // In 6-decimal units: maker must be multiple of 10000, taker multiple of 100.
+        // CLOB requires exact price×size relationship:
+        //   BUY: maker (USDC, 2 dec) = floor(size × price), taker (tokens, 4 dec) = size
+        //   SELL: maker (tokens, 4 dec) = size, taker (USDC, 2 dec) = floor(size × price)
+        // Round size to 4 decimals first, then derive maker from rounded values.
+        let size_rounded = params.size.round_dp(4);
+        let price_rounded = params.price.round_dp(4);
+        let usdc_amount = (size_rounded * price_rounded).round_dp(2);
+
         let (maker_amount, taker_amount) = match params.side {
             Side::Buy => {
-                // BUY: pay USDC (size * price), receive tokens (size)
-                let maker_raw = auth::to_token_decimals(params.size * params.price);
-                let taker_raw = auth::to_token_decimals(params.size);
-                // Round maker down to 2 decimal USDC (multiple of 10000)
-                let maker = (maker_raw / U256::from(10000)) * U256::from(10000);
-                // Round taker down to 4 decimal tokens (multiple of 100)
-                let taker = (taker_raw / U256::from(100)) * U256::from(100);
+                let maker = auth::to_token_decimals(usdc_amount);
+                let taker = auth::to_token_decimals(size_rounded);
                 (maker, taker)
             }
             Side::Sell => {
-                // SELL: pay tokens (size), receive USDC (size * price)
-                let maker_raw = auth::to_token_decimals(params.size);
-                let taker_raw = auth::to_token_decimals(params.size * params.price);
-                let maker = (maker_raw / U256::from(100)) * U256::from(100);
-                let taker = (taker_raw / U256::from(10000)) * U256::from(10000);
+                let maker = auth::to_token_decimals(size_rounded);
+                let taker = auth::to_token_decimals(usdc_amount);
                 (maker, taker)
             }
         };
