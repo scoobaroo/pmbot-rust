@@ -325,7 +325,8 @@ impl OrbStrategy {
     }
 
     /// Sync win/loss streak from Polymarket activity API on startup.
-    /// Reads recent REDEEMs to set consecutive_wins/losses accurately.
+    /// Matches TRADEs against REDEEMs: trade with no redeem = loss.
+    /// Only considers UpDown markets (5m/15m windows) to avoid noise.
     pub fn sync_from_activity(&mut self) {
         let wallet = std::env::var("COPYTRADE_FUNDER_ADDRESS").unwrap_or_default();
         if wallet.is_empty() {
@@ -333,7 +334,7 @@ impl OrbStrategy {
         }
 
         let url = format!(
-            "https://data-api.polymarket.com/activity?user={}&limit=50&sortDirection=DESC",
+            "https://data-api.polymarket.com/activity?user={}&limit=200&sortDirection=DESC",
             wallet
         );
 
@@ -354,31 +355,71 @@ impl OrbStrategy {
             Err(_) => return,
         };
 
-        // Walk redeems from most recent to find current streak
-        let mut wins = 0u32;
-        let mut losses = 0u32;
-        let mut streak_type: Option<bool> = None; // true=win, false=loss
+        // Collect all condition_ids that have TRADEs and REDEEMs
+        let mut traded_cids: std::collections::HashMap<String, (i64, String)> = std::collections::HashMap::new(); // cid -> (latest_ts, title)
+        let mut redeemed_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for item in &data {
             let ttype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if ttype != "REDEEM" {
+            let cid = item.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            // Only UpDown markets
+            if !title.contains("Up or Down") {
                 continue;
             }
 
-            let usdc = item.get("usdcSize").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let won = usdc > 0.0;
-
-            match streak_type {
-                None => {
-                    streak_type = Some(won);
-                    if won { wins = 1; } else { losses = 1; }
+            match ttype {
+                "TRADE" => {
+                    traded_cids.entry(cid.to_string())
+                        .and_modify(|(old_ts, _)| { if ts > *old_ts { *old_ts = ts; } })
+                        .or_insert((ts, title.to_string()));
                 }
-                Some(prev_won) if prev_won == won => {
-                    if won { wins += 1; } else { losses += 1; }
+                "REDEEM" => {
+                    redeemed_cids.insert(cid.to_string());
                 }
-                _ => break, // streak broken
+                _ => {}
             }
         }
+
+        // Build timeline: each traded market is a win (has redeem) or loss (no redeem)
+        // Only include markets old enough to have resolved (>10 min)
+        let now_ts = Utc::now().timestamp();
+        let mut results: Vec<(i64, bool)> = Vec::new(); // (timestamp, won)
+
+        for (cid, (ts, _title)) in &traded_cids {
+            let age_secs = now_ts - ts;
+            if age_secs < 600 {
+                continue; // too recent, may not have resolved yet
+            }
+            let won = redeemed_cids.contains(cid);
+            results.push((*ts, won));
+        }
+
+        // Sort by time descending (most recent first)
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Walk from most recent to find current streak
+        let mut wins = 0u32;
+        let mut losses = 0u32;
+        let mut streak_type: Option<bool> = None;
+
+        for (_ts, won) in &results {
+            match streak_type {
+                None => {
+                    streak_type = Some(*won);
+                    if *won { wins = 1; } else { losses = 1; }
+                }
+                Some(prev) if prev == *won => {
+                    if *won { wins += 1; } else { losses += 1; }
+                }
+                _ => break,
+            }
+        }
+
+        let total_wins = results.iter().filter(|(_, w)| *w).count();
+        let total_losses = results.iter().filter(|(_, w)| !*w).count();
 
         self.consecutive_wins = wins;
         self.consecutive_losses = losses;
@@ -386,17 +427,16 @@ impl OrbStrategy {
         info!(
             consecutive_wins = wins,
             consecutive_losses = losses,
+            total_wins,
+            total_losses,
             bankroll = format!("${:.0}", self.bankroll),
-            "ORB: synced streak from Polymarket activity"
+            "ORB: synced from Polymarket activity"
         );
 
-        // Notify state on Telegram
-        if wins > 0 || losses > 0 {
-            self.notify_telegram(&format!(
-                "🔄 <b>Bot restarted</b>\n{}W/{}L streak | Bankroll: ${:.0}",
-                wins, losses, self.bankroll,
-            ));
-        }
+        self.notify_telegram(&format!(
+            "🔄 <b>Bot restarted</b>\nStreak: {}W/{}L | Total: {}/{} | Bankroll: ${:.0}",
+            wins, losses, total_wins, total_losses, self.bankroll,
+        ));
     }
 
     pub fn with_book_cache(mut self, cache: BookCache) -> Self {
