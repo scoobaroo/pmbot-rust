@@ -628,10 +628,9 @@ impl OrbStrategy {
         }
     }
 
-    /// Quick check: is there room for another trade?
-    /// Actual sizing happens in evaluate_all_markets.
-    /// Returns a placeholder size or ZERO if exposure is maxed out.
-    fn can_take_trade(&self) -> Decimal {
+    /// Compute actual trade size with all caps applied.
+    /// Same logic as evaluate_all_markets sizing — single source of truth.
+    fn compute_trade_size(&self) -> Decimal {
         let current_exposure: f64 = self.open_positions.values()
             .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
             .sum();
@@ -639,9 +638,35 @@ impl OrbStrategy {
         if current_exposure >= max_exposure || self.bankroll < 10.0 {
             return Decimal::ZERO;
         }
-        // Placeholder — real size set in evaluate_all_markets
-        Decimal::from_f64_retain(self.bankroll * MAX_RISK_PER_TRADE_PCT)
-            .unwrap_or(Decimal::ZERO)
+
+        let mut size = self.bankroll * MAX_RISK_PER_TRADE_PCT;
+
+        // Loss reduction: flat 50%
+        if self.consecutive_losses > 0 {
+            size *= 0.5;
+        }
+
+        // Win streak reduction
+        if self.consecutive_wins >= 5 {
+            size *= 0.5;
+        }
+
+        // Hard cap
+        let max_bet: f64 = std::env::var("MAX_BET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200.0);
+        size = size.min(max_bet);
+
+        // Exposure cap
+        let remaining = (max_exposure - current_exposure).max(0.0);
+        size = size.min(remaining);
+
+        if size < 5.0 {
+            return Decimal::ZERO;
+        }
+
+        Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO)
     }
 
     fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
@@ -675,51 +700,13 @@ impl OrbStrategy {
             }
         }
 
-        // Unified position sizing — all caps applied here
-        let mut size = self.bankroll * MAX_RISK_PER_TRADE_PCT; // 9% of bankroll
-
-        // Loss reduction: halve size after any losses (flat 50%, not exponential)
-        if self.consecutive_losses > 0 {
-            size *= 0.5;
-        }
-
-        // After 5+ consecutive wins, reduce 50% — edge may be decaying
-        if self.consecutive_wins >= 5 {
-            size *= 0.5;
-        }
-
-        // Hard cap per trade
-        let max_bet: f64 = std::env::var("MAX_BET")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200.0);
-        size = size.min(max_bet);
-
-        // Cap total exposure at bankroll * 25% across all open positions
-        let current_exposure: f64 = self.open_positions.values()
-            .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
-            .sum();
-        let max_exposure = self.bankroll * MAX_TOTAL_EXPOSURE_PCT;
-        let remaining = (max_exposure - current_exposure).max(0.0);
-        size = size.min(remaining);
-
-        // Minimum viable order ($5)
+        // Size already computed correctly in compute_trade_size() — use it directly
+        let size = best.size_usd.to_f64().unwrap_or(0.0);
         if size < 5.0 {
-            // Clean up the position but keep in entered_markets to prevent re-signaling
             if let TradeTarget::Polymarket(ref m) = best.target {
                 self.open_positions.remove(&m.condition_id);
             }
             return vec![];
-        }
-
-        let size_dec = Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO);
-        best.size_usd = size_dec;
-
-        // Update the open_position size too
-        if let TradeTarget::Polymarket(ref m) = best.target {
-            if let Some(pos) = self.open_positions.get_mut(&m.condition_id) {
-                pos.size_usd = size_dec;
-            }
         }
 
         // Telegram alert
@@ -1152,7 +1139,7 @@ impl OrbStrategy {
             return None;
         }
 
-        let size_usd = self.can_take_trade();
+        let size_usd = self.compute_trade_size();
         if size_usd == Decimal::ZERO {
             debug!(
                 question = %market.question,
