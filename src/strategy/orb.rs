@@ -654,6 +654,14 @@ impl OrbStrategy {
         // After 5+ consecutive wins, reduce size 50% — edge may be decaying
         let size = if self.consecutive_wins >= 5 { size * 0.5 } else { size };
 
+        // After each consecutive loss, halve the bet size
+        // 0 losses = full, 1 = 50%, 2 = 25%, 3 = 12.5%, etc.
+        let size = if self.consecutive_losses > 0 {
+            size / (2.0_f64.powi(self.consecutive_losses as i32))
+        } else {
+            size
+        };
+
         // Hard cap: never exceed $200 per trade regardless of bankroll
         let size = size.min(200.0);
 
