@@ -658,6 +658,20 @@ impl OrbStrategy {
         // After 5+ consecutive wins, reduce size 50% — edge may be decaying
         let size = if self.consecutive_wins >= 5 { size * 0.5 } else { size };
 
+        // Counter mode: start small (25%) and scale up with consecutive wins
+        // 0 wins = 25%, 1 = 50%, 2 = 75%, 3+ = 100%
+        let size = if self.counter_mode {
+            let scale = match self.consecutive_wins {
+                0 => 0.25,
+                1 => 0.50,
+                2 => 0.75,
+                _ => 1.0,
+            };
+            size * scale
+        } else {
+            size
+        };
+
         // After each consecutive loss, halve the bet size
         // 0 losses = full, 1 = 50%, 2 = 25%, 3 = 12.5%, etc.
         let size = if self.consecutive_losses > 0 {
