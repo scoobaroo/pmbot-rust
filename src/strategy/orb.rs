@@ -300,6 +300,9 @@ pub struct OrbStrategy {
     consecutive_losses: u32,
     /// Consecutive win counter — reduces size after hot streak.
     consecutive_wins: u32,
+    /// Counter-trade mode: flip ORB direction after 2 consecutive losses.
+    /// Stays flipped until it loses, then reverts to normal ORB.
+    counter_mode: bool,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
 }
@@ -330,6 +333,7 @@ impl OrbStrategy {
             down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
             consecutive_losses: 0,
             consecutive_wins: 0,
+            counter_mode: false,
             cooldown_until: None,
         }
     }
@@ -1095,7 +1099,9 @@ impl OrbStrategy {
         let mut accuracy = accuracy;
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
-        let (side, token_id, implied_price) = if price_move > 0.0 {
+        // In counter_mode, flip the direction — bet against the ORB signal
+        let going_up = if self.counter_mode { price_move <= 0.0 } else { price_move > 0.0 };
+        let (side, token_id, implied_price) = if going_up {
             (Side::Buy, &market.token_id_yes, market.implied_prob_yes)
         } else {
             (Side::Sell, &market.token_id_no, market.implied_prob_no)
@@ -1452,25 +1458,18 @@ impl OrbStrategy {
                             self.consecutive_losses = 0;
                         } else {
                             self.consecutive_losses += 1;
-                            if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
-                                warn!(
-                                    consecutive_losses = self.consecutive_losses,
-                                    "ORB: {} losses — switching to slow mode",
-                                    self.consecutive_losses
-                                );
+                            // Counter mode toggle
+                            if self.counter_mode {
+                                self.counter_mode = false;
+                                self.consecutive_losses = 0;
+                                info!("ORB: counter-trade lost — back to normal ORB");
+                            } else if self.consecutive_losses >= 2 {
+                                self.counter_mode = true;
+                                info!("ORB: 2 losses — switching to counter-trade mode");
                             }
                             if self.consecutive_losses >= PAUSE_AFTER_LOSSES {
                                 let cooldown_end = now + chrono::Duration::seconds(COOLDOWN_SECS);
                                 self.cooldown_until = Some(cooldown_end);
-                                warn!(
-                                    consecutive_losses = self.consecutive_losses,
-                                    "ORB: {} losses — pausing 30min",
-                                    self.consecutive_losses
-                                );
-                                self.notify_telegram(&format!(
-                                    "<b>CIRCUIT BREAKER</b>\n{} consecutive losses\nPausing for {}min\nBankroll: ${:.0}",
-                                    self.consecutive_losses, COOLDOWN_SECS / 60, self.bankroll,
-                                ));
                             }
                         }
 
@@ -1729,7 +1728,7 @@ impl Strategy for OrbStrategy {
                         // Adjust bankroll based on outcome
                         self.bankroll += pnl;
 
-                        // Track consecutive losses for circuit breaker
+                        // Track streaks and toggle counter_mode
                         if *won {
                             if self.consecutive_losses >= SLOW_MODE_AFTER_LOSSES {
                                 info!("ORB: win after loss streak — back to full speed");
@@ -1739,16 +1738,35 @@ impl Strategy for OrbStrategy {
                             if self.consecutive_wins == 5 {
                                 warn!(
                                     consecutive_wins = self.consecutive_wins,
-                                    "ORB: 5 wins in a row — reducing size 50% for 30min (edge may be decaying)"
+                                    "ORB: 5 wins in a row — reducing size 50% (edge may be decaying)"
                                 );
                                 self.notify_telegram(&format!(
-                                    "🔥 <b>HOT STREAK</b> {} wins in a row\nReducing size 50% for 30min\nBankroll: ${:.0}",
+                                    "🔥 <b>HOT STREAK</b> {} wins\nReducing size 50%\nBankroll: ${:.0}",
                                     self.consecutive_wins, self.bankroll
                                 ));
                             }
                         } else {
                             self.consecutive_wins = 0;
                             self.consecutive_losses += 1;
+
+                            // After 2 consecutive losses in normal mode → flip to counter
+                            // After 1 loss in counter mode → flip back to normal
+                            if self.counter_mode {
+                                self.counter_mode = false;
+                                info!("ORB: counter-trade lost — back to normal ORB");
+                                self.notify_telegram(&format!(
+                                    "🔄 <b>Back to ORB</b> — counter-trade failed\nBankroll: ${:.0}",
+                                    self.bankroll
+                                ));
+                                self.consecutive_losses = 0; // reset for fresh start
+                            } else if self.consecutive_losses >= 2 {
+                                self.counter_mode = true;
+                                info!("ORB: 2 losses — switching to counter-trade mode");
+                                self.notify_telegram(&format!(
+                                    "🔄 <b>COUNTER MODE</b> — flipping ORB signals\n2 losses in a row, betting opposite\nBankroll: ${:.0}",
+                                    self.bankroll
+                                ));
+                            }
                             if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
                                 warn!(
                                     consecutive_losses = self.consecutive_losses,
@@ -1822,6 +1840,7 @@ mod tests {
             down_only: false,
             consecutive_losses: 0,
             consecutive_wins: 0,
+            counter_mode: false,
             cooldown_until: None,
         }
     }
