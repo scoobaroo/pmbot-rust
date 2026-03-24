@@ -1094,15 +1094,12 @@ impl OrbStrategy {
 
         let implied_prob = implied_price.to_f64().unwrap_or(0.5);
 
-        // Use book best ask + 2¢ buffer for reliable FAK fills.
-        // Fallback to implied + 5¢ if no book data.
-        let entry_price = self.get_book_ask(token_id)
-            .map(|ask| ask + Decimal::new(2, 2))
-            .unwrap_or_else(|| implied_price + Decimal::new(5, 2))
-            .min(Decimal::new(95, 2));
+        // FAK at 60¢ — CLOB fills at best available price, not our limit.
+        // This is just the max we're willing to pay. Simplifies everything.
+        let entry_price = Decimal::new(60, 2);
 
-        // Max entry price cap — don't buy above 50¢.
-        if entry_price > Decimal::new(60, 2) {
+        // Check implied prob — if market already prices it above 60¢, no edge
+        if implied_prob > 0.60 {
             debug!(
                 question = %market.question,
                 price = format!("{:.2}", entry_price),
