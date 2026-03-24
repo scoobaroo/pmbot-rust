@@ -146,17 +146,25 @@ impl PolymarketClient {
         };
 
         // Calculate maker/taker amounts (6 decimal places)
+        // CLOB requires: maker (USDC) max 2 decimal accuracy, taker (tokens) max 4.
+        // In 6-decimal units: maker must be multiple of 10000, taker multiple of 100.
         let (maker_amount, taker_amount) = match params.side {
             Side::Buy => {
                 // BUY: pay USDC (size * price), receive tokens (size)
-                let maker = auth::to_token_decimals(params.size * params.price);
-                let taker = auth::to_token_decimals(params.size);
+                let maker_raw = auth::to_token_decimals(params.size * params.price);
+                let taker_raw = auth::to_token_decimals(params.size);
+                // Round maker down to 2 decimal USDC (multiple of 10000)
+                let maker = (maker_raw / U256::from(10000)) * U256::from(10000);
+                // Round taker down to 4 decimal tokens (multiple of 100)
+                let taker = (taker_raw / U256::from(100)) * U256::from(100);
                 (maker, taker)
             }
             Side::Sell => {
                 // SELL: pay tokens (size), receive USDC (size * price)
-                let maker = auth::to_token_decimals(params.size);
-                let taker = auth::to_token_decimals(params.size * params.price);
+                let maker_raw = auth::to_token_decimals(params.size);
+                let taker_raw = auth::to_token_decimals(params.size * params.price);
+                let maker = (maker_raw / U256::from(100)) * U256::from(100);
+                let taker = (taker_raw / U256::from(10000)) * U256::from(10000);
                 (maker, taker)
             }
         };

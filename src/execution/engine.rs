@@ -436,6 +436,9 @@ impl ExecutionEngine {
         let order_type = if is_sniper { "GTD" } else { "FOK" };
         let post_only = is_sniper || self.maker_mode;
 
+        // FOK orders must have expiration=None (API rejects non-zero)
+        let order_expiration = if is_sniper { expiration } else { None };
+
         let params = OrderParams {
             token_id: &order.token_id,
             side: order.side,
@@ -445,7 +448,7 @@ impl ExecutionEngine {
             post_only,
             fee_rate_bps,
             neg_risk: None,
-            expiration,
+            expiration: order_expiration,
         };
 
         match client.place_order(&params).await {
