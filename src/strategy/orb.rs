@@ -550,10 +550,10 @@ impl OrbStrategy {
         let mut best = all_signals.swap_remove(0);
 
         // Remove open positions for signals we're NOT taking
+        // Keep them in entered_markets to prevent re-signaling on next tick
         for rejected in &all_signals {
             if let TradeTarget::Polymarket(ref m) = rejected.target {
                 self.open_positions.remove(&m.condition_id);
-                self.entered_markets.remove(&m.condition_id);
             }
         }
 
@@ -583,10 +583,9 @@ impl OrbStrategy {
 
         // Minimum viable order ($5)
         if size < 5.0 {
-            // Clean up the position we pre-inserted
+            // Clean up the position but keep in entered_markets to prevent re-signaling
             if let TradeTarget::Polymarket(ref m) = best.target {
                 self.open_positions.remove(&m.condition_id);
-                self.entered_markets.remove(&m.condition_id);
             }
             return vec![];
         }
