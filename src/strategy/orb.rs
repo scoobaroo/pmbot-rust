@@ -298,6 +298,8 @@ pub struct OrbStrategy {
     down_only: bool,
     /// Consecutive loss counter — pauses trading after MAX_CONSECUTIVE_LOSSES.
     consecutive_losses: u32,
+    /// Consecutive win counter — reduces size after hot streak.
+    consecutive_wins: u32,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
 }
@@ -327,6 +329,7 @@ impl OrbStrategy {
             bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
             down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
             consecutive_losses: 0,
+            consecutive_wins: 0,
             cooldown_until: None,
         }
     }
@@ -632,6 +635,9 @@ impl OrbStrategy {
         };
 
         let size = base * fraction;
+
+        // After 5+ consecutive wins, reduce size 50% — edge may be decaying
+        let size = if self.consecutive_wins >= 5 { size * 0.5 } else { size };
 
         // Hard cap: never exceed $200 per trade regardless of bankroll
         let size = size.min(200.0);
@@ -1695,7 +1701,19 @@ impl Strategy for OrbStrategy {
                                 info!("ORB: win after loss streak — back to full speed");
                             }
                             self.consecutive_losses = 0;
+                            self.consecutive_wins += 1;
+                            if self.consecutive_wins == 5 {
+                                warn!(
+                                    consecutive_wins = self.consecutive_wins,
+                                    "ORB: 5 wins in a row — reducing size 50% for 30min (edge may be decaying)"
+                                );
+                                self.notify_telegram(&format!(
+                                    "🔥 <b>HOT STREAK</b> {} wins in a row\nReducing size 50% for 30min\nBankroll: ${:.0}",
+                                    self.consecutive_wins, self.bankroll
+                                ));
+                            }
                         } else {
+                            self.consecutive_wins = 0;
                             self.consecutive_losses += 1;
                             if self.consecutive_losses == SLOW_MODE_AFTER_LOSSES {
                                 warn!(
@@ -1769,6 +1787,7 @@ mod tests {
             bankroll: 1000.0,
             down_only: false,
             consecutive_losses: 0,
+            consecutive_wins: 0,
             cooldown_until: None,
         }
     }
