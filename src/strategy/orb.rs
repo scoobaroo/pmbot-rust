@@ -678,8 +678,21 @@ impl OrbStrategy {
         for rejected in &all_signals {
             if let TradeTarget::Polymarket(ref m) = rejected.target {
                 self.open_positions.remove(&m.condition_id);
-                // Keep entered_markets so we don't re-enter on next tick
             }
+        }
+
+        // Notify Telegram only for the winning signal
+        if let TradeTarget::Polymarket(ref m) = best.target {
+            let side = &best.side;
+            let price = best.price.to_f64().unwrap_or(0.0);
+            let size = best.size_usd.to_f64().unwrap_or(0.0);
+            let edge = best.confidence;
+            let q = &m.question;
+            self.notify_telegram(&format!(
+                "📊 <b>{}</b> {} @{:.0}¢ ${:.0} | edge:{:.0}% | {}",
+                side, m.underlying_symbol, price * 100.0, size, edge * 100.0,
+                &q[..q.len().min(40)]
+            ));
         }
 
         vec![best]
@@ -806,10 +819,7 @@ impl OrbStrategy {
                     "ORB LOTTERY: buying cheap token"
                 );
 
-                self.notify_telegram(&format!(
-                    "🎰 <b>LOTTERY</b> {} {} @{}¢ ${:.0} | potential {}x",
-                    market.underlying_symbol, cheap_side, cheap_f64 * 100.0, LOTTERY_BET_USD, (1.0 / cheap_f64) as u32
-                ));
+                // Telegram notification sent after best-signal selection
 
                 OrbDataLogger::log_entry(&pos, &market.condition_id);
                 self.open_positions.insert(market.condition_id.clone(), pos);
@@ -903,10 +913,7 @@ impl OrbStrategy {
                         "ORB SNIPER: near-certain resolution"
                     );
 
-                    self.notify_telegram(&format!(
-                        "🎯 <b>SNIPER</b> {} {} @{}¢ ${:.0} | gap:{:.3}% | {:.0}s left",
-                        market.underlying_symbol, side, entry_f64 * 100.0, size_usd, move_pct, time_remaining_secs
-                    ));
+                    // Telegram notification sent after best-signal selection
 
                     OrbDataLogger::log_entry(&pos, &market.condition_id);
                     self.open_positions.insert(market.condition_id.clone(), pos);
