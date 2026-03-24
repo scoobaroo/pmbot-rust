@@ -103,12 +103,17 @@ pub async fn poll_resolutions(
                         else if title.contains("Ethereum") { "ETH-USD" }
                         else { "UNKNOWN" };
 
+                    let won = action == "WON";
+
                     info!(
                         action,
                         title = &title[..title.len().min(45)],
                         usdc = format!("${:.2}", usdc),
                         "ORB resolution from Polymarket API"
                     );
+
+                    // Push to strategy for win/loss tracking
+                    state.push_resolved_trade(cid.to_string(), won, usdc).await;
 
                     state.push_orb_event(OrbTradeEvent {
                         timestamp,

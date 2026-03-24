@@ -89,9 +89,6 @@ const PAUSE_AFTER_LOSSES: u32 = 4;
 /// How long to pause after hitting the loss streak (in seconds).
 const COOLDOWN_SECS: i64 = 1800; // 30 minutes
 
-/// Sniper mode: enter in the last N seconds when outcome is near-certain.
-const SNIPER_WINDOW_SECS: i64 = 30;
-
 /// Minimum price gap (%) for sniper entries — 2x typical 30s volatility per coin.
 /// BTC: 0.030% ($21), ETH: 0.040% ($0.82), SOL: 0.060%, XRP: 0.050%
 const SNIPER_GAP_BTC: f64 = 0.030;
@@ -277,21 +274,12 @@ pub struct OrbStrategy {
     true_ranges: HashMap<String, VecDeque<f64>>,
     /// Previous candle close per symbol (needed for true range calculation).
     prev_close: HashMap<String, f64>,
-    /// Rolling 1m closes for regime detection, RSI, MACD (last 30 candles).
-    recent_closes: HashMap<String, VecDeque<f64>>,
-    /// Rolling gains/losses for RSI computation (14-period).
-    rsi_gains: HashMap<String, VecDeque<f64>>,
-    rsi_losses: HashMap<String, VecDeque<f64>>,
-    /// MACD state: (ema12, ema26, signal_ema9) per symbol.
-    macd_state: HashMap<String, (f64, f64, f64)>,
     /// Previous VWAP per symbol — used to confirm momentum is sustained at entry.
     prev_vwap: HashMap<String, f64>,
     /// Optional web state for pushing live trade events to the dashboard.
     web_state: Option<SharedWebState>,
     /// Optional Telegram notifier for trade alerts.
     telegram: Option<TelegramNotifier>,
-    /// Maps order_id → condition_id so we can link OrderFilled back to position.
-    pending_orders: HashMap<String, String>,
     /// Estimated bankroll for dynamic position sizing.
     bankroll: f64,
     /// DOWN_ONLY mode: skip all UP bets. For bearish markets.
@@ -304,14 +292,6 @@ pub struct OrbStrategy {
     counter_mode: bool,
     /// Timestamp when cooldown expires (resume trading after this time).
     cooldown_until: Option<DateTime<Utc>>,
-    /// Last time we polled Polymarket API for resolutions.
-    last_resolution_poll: i64,
-    /// Condition IDs we've already processed as resolved (prevent double-counting).
-    resolved_cids: std::collections::HashSet<String>,
-    /// HTTP client for polling Polymarket API.
-    http_client: reqwest::Client,
-    /// Wallet address for polling redeems.
-    wallet_address: String,
 }
 
 impl OrbStrategy {
@@ -328,27 +308,15 @@ impl OrbStrategy {
             max_position_usd: config.max_position_usd,
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
-            recent_closes: HashMap::new(),
-            rsi_gains: HashMap::new(),
-            rsi_losses: HashMap::new(),
-            macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             telegram: TelegramNotifier::from_env(),
-            pending_orders: HashMap::new(),
             bankroll: config.max_position_usd.to_f64().unwrap_or(100.0) * 10.0,
             down_only: std::env::var("DOWN_ONLY").map(|v| v == "true" || v == "1").unwrap_or(false),
             consecutive_losses: 0,
             consecutive_wins: 0,
             counter_mode: false,
             cooldown_until: None,
-            last_resolution_poll: 0,
-            resolved_cids: std::collections::HashSet::new(),
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("failed to build http client"),
-            wallet_address: std::env::var("COPYTRADE_FUNDER_ADDRESS").unwrap_or_default(),
         }
     }
 
@@ -460,93 +428,6 @@ impl OrbStrategy {
         Some(sum / ATR_PERIOD as f64)
     }
 
-    /// RSI (14-period) for a symbol. Returns 0-100, or None if not enough data.
-    fn rsi(&self, symbol: &str) -> Option<f64> {
-        let gains = self.rsi_gains.get(symbol)?;
-        let losses = self.rsi_losses.get(symbol)?;
-        if gains.len() < ATR_PERIOD {
-            return None;
-        }
-        let avg_gain: f64 = gains.iter().sum::<f64>() / ATR_PERIOD as f64;
-        let avg_loss: f64 = losses.iter().sum::<f64>() / ATR_PERIOD as f64;
-        if avg_loss == 0.0 {
-            return Some(100.0);
-        }
-        let rs = avg_gain / avg_loss;
-        Some(100.0 - (100.0 / (1.0 + rs)))
-    }
-
-    /// MACD for a symbol. Returns (macd_line, signal_line, histogram), or None.
-    fn macd(&self, symbol: &str) -> Option<(f64, f64, f64)> {
-        let (ema12, ema26, signal) = self.macd_state.get(symbol)?;
-        let macd_line = ema12 - ema26;
-        let histogram = macd_line - signal;
-        Some((macd_line, *signal, histogram))
-    }
-
-    /// Update RSI state from a completed 1m candle.
-    fn update_rsi(&mut self, symbol: &str, close: f64) {
-        if let Some(&prev) = self.prev_close.get(symbol) {
-            let change = close - prev;
-            let gain = if change > 0.0 { change } else { 0.0 };
-            let loss = if change < 0.0 { change.abs() } else { 0.0 };
-
-            let gains = self.rsi_gains.entry(symbol.to_string())
-                .or_insert_with(|| VecDeque::with_capacity(ATR_PERIOD + 1));
-            gains.push_back(gain);
-            if gains.len() > ATR_PERIOD {
-                gains.pop_front();
-            }
-
-            let losses = self.rsi_losses.entry(symbol.to_string())
-                .or_insert_with(|| VecDeque::with_capacity(ATR_PERIOD + 1));
-            losses.push_back(loss);
-            if losses.len() > ATR_PERIOD {
-                losses.pop_front();
-            }
-        }
-    }
-
-    /// Update MACD state from a completed 1m candle.
-    fn update_macd(&mut self, symbol: &str, close: f64) {
-        let (ema12, ema26, signal) = self.macd_state
-            .entry(symbol.to_string())
-            .or_insert((close, close, 0.0));
-
-        // EMA multipliers
-        let k12 = 2.0 / 13.0; // 12-period
-        let k26 = 2.0 / 27.0; // 26-period
-        let k9 = 2.0 / 10.0;  // 9-period signal
-
-        *ema12 = close * k12 + *ema12 * (1.0 - k12);
-        *ema26 = close * k26 + *ema26 * (1.0 - k26);
-        let macd_line = *ema12 - *ema26;
-        *signal = macd_line * k9 + *signal * (1.0 - k9);
-    }
-
-    /// Detect market regime: returns a value from -1.0 (strong bearish) to +1.0 (strong bullish).
-    /// Uses the slope of recent 1m closes over the last 30 minutes.
-    fn regime(&self, symbol: &str) -> f64 {
-        let closes = match self.recent_closes.get(symbol) {
-            Some(c) if c.len() >= 5 => c,
-            _ => return 0.0, // not enough data
-        };
-
-        let n = closes.len() as f64;
-        let first = closes.front().copied().unwrap_or(0.0);
-        let last = closes.back().copied().unwrap_or(0.0);
-
-        if first <= 0.0 {
-            return 0.0;
-        }
-
-        // Percentage change over the lookback window
-        let pct_change = (last - first) / first;
-
-        // Clamp to [-1, 1] — ±0.5% over 30 min is strongly directional
-        (pct_change * 200.0).clamp(-1.0, 1.0)
-    }
-
     /// Update ATR state from a completed 1m candle.
     fn update_atr(&mut self, symbol: &str, high: f64, low: f64, close: f64) {
         let tr = if let Some(&prev_c) = self.prev_close.get(symbol) {
@@ -566,16 +447,6 @@ impl OrbStrategy {
         trs.push_back(tr);
         if trs.len() > ATR_PERIOD * 2 {
             trs.pop_front();
-        }
-
-        // Track recent closes for regime detection (30 candle lookback)
-        let closes = self
-            .recent_closes
-            .entry(symbol.to_string())
-            .or_insert_with(|| VecDeque::with_capacity(31));
-        closes.push_back(close);
-        if closes.len() > 30 {
-            closes.pop_front();
         }
     }
 
@@ -642,74 +513,20 @@ impl OrbStrategy {
         }
     }
 
-    /// Dynamic position sizing: 3-5% of bankroll, scaled by signal strength.
-    ///
-    /// Base size = 4% of bankroll. Tiered by signal quality:
-    ///   Velocity (≤20s): 50-100% of base (smaller but better price)
-    ///   Confirmed large (0.15%+): 100% of base
-    ///   Confirmed medium (0.07%+): 75% of base
-    ///   Confirmed small (0.06%+): 50% of base
-    ///   Mid-window (150s+): 100% of base (highest accuracy)
-    ///
-    /// Also checks total exposure — won't exceed 25% of bankroll in open positions.
-    fn tiered_size(&self, move_pct: f64, elapsed_secs: i64) -> Decimal {
-        let base = self.bankroll * MAX_RISK_PER_TRADE_PCT;
-
-        let fraction = if elapsed_secs <= 20 {
-            if move_pct >= 0.15 { 1.0 }
-            else if move_pct >= 0.10 { 0.75 }
-            else { 0.50 }
-        } else if elapsed_secs >= 150 {
-            1.0
-        } else {
-            if move_pct >= 0.15 { 1.0 }
-            else if move_pct >= 0.07 { 0.75 }
-            else { 0.50 }
-        };
-
-        let size = base * fraction;
-
-        // After 5+ consecutive wins, reduce size 50% — edge may be decaying
-        let size = if self.consecutive_wins >= 5 { size * 0.5 } else { size };
-
-        // Counter mode: start small (25%) and scale up with consecutive wins
-        // 0 wins = 25%, 1 = 50%, 2 = 75%, 3+ = 100%
-        let size = if self.counter_mode {
-            let scale = match self.consecutive_wins {
-                0 => 0.25,
-                1 => 0.50,
-                2 => 0.75,
-                _ => 1.0,
-            };
-            size * scale
-        } else {
-            size
-        };
-
-        // After each consecutive loss, halve the bet size
-        // 0 losses = full, 1 = 50%, 2 = 25%, 3 = 12.5%, etc.
-        let size = if self.consecutive_losses > 0 {
-            size / (2.0_f64.powi(self.consecutive_losses as i32))
-        } else {
-            size
-        };
-
-        // Hard cap: never exceed $200 per trade regardless of bankroll
-        let size = size.min(200.0);
-
-        // Cap total exposure at $200 across all open positions
+    /// Quick check: is there room for another trade?
+    /// Actual sizing happens in evaluate_all_markets.
+    /// Returns a placeholder size or ZERO if exposure is maxed out.
+    fn can_take_trade(&self) -> Decimal {
         let current_exposure: f64 = self.open_positions.values()
             .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
             .sum();
-        let remaining = 200.0 - current_exposure;
-        let size = size.min(remaining.max(0.0));
-
-        // Minimum viable order size ($5)
-        if size < 5.0 {
+        let max_exposure = self.bankroll * MAX_TOTAL_EXPOSURE_PCT;
+        if current_exposure >= max_exposure || self.bankroll < 10.0 {
             return Decimal::ZERO;
         }
-
-        Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO)
+        // Placeholder — real size set in evaluate_all_markets
+        Decimal::from_f64_retain(self.bankroll * MAX_RISK_PER_TRADE_PCT)
+            .unwrap_or(Decimal::ZERO)
     }
 
     fn evaluate_all_markets(&mut self) -> Vec<TradeSignal> {
@@ -730,39 +547,88 @@ impl OrbStrategy {
             return all_signals;
         }
 
-        // Spread bankroll-based max across all qualifying signals evenly.
-        // Total exposure = 9% of bankroll, capped at $200.
-        let max_total = (self.bankroll * MAX_RISK_PER_TRADE_PCT).min(200.0);
-        // Apply loss streak halving to total
-        let max_total = if self.consecutive_losses > 0 {
-            max_total / (2.0_f64.powi(self.consecutive_losses as i32))
-        } else {
-            max_total
-        };
-        let per_trade = (max_total / all_signals.len() as f64).max(3.0);
+        // Pick ONLY the best signal (highest edge) — don't spread across multiple.
+        // This was the approach during the $200→$3,300 run.
+        all_signals.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best = all_signals.swap_remove(0);
 
-        for signal in &mut all_signals {
-            signal.size_usd = Decimal::from_f64_retain(per_trade).unwrap_or(Decimal::ZERO);
-            // Update the open_position size too
-            if let TradeTarget::Polymarket(ref m) = signal.target {
-                if let Some(pos) = self.open_positions.get_mut(&m.condition_id) {
-                    pos.size_usd = signal.size_usd;
-                }
+        // Remove open positions for signals we're NOT taking
+        for rejected in &all_signals {
+            if let TradeTarget::Polymarket(ref m) = rejected.target {
+                self.open_positions.remove(&m.condition_id);
+                self.entered_markets.remove(&m.condition_id);
             }
         }
 
-        // One Telegram alert summarizing all trades
-        let symbols: Vec<String> = all_signals.iter().map(|s| {
-            if let TradeTarget::Polymarket(ref m) = s.target {
-                format!("{} {} @{:.0}¢", s.side, m.underlying_symbol, s.price.to_f64().unwrap_or(0.0) * 100.0)
-            } else { String::new() }
-        }).collect();
-        self.notify_telegram(&format!(
-            "📊 <b>{} trades</b> ${:.0} each\n{}",
-            all_signals.len(), per_trade, symbols.join("\n")
-        ));
+        // Unified position sizing — all caps applied here
+        let mut size = self.bankroll * MAX_RISK_PER_TRADE_PCT; // 9% of bankroll
 
-        all_signals
+        // Loss halving: 0 losses = full, 1 = 50%, 2 = 25%, etc.
+        if self.consecutive_losses > 0 {
+            size /= 2.0_f64.powi(self.consecutive_losses as i32);
+        }
+
+        // Counter mode: start small and scale up with wins
+        if self.counter_mode {
+            let scale = match self.consecutive_wins {
+                0 => 0.25,
+                1 => 0.50,
+                2 => 0.75,
+                _ => 1.0,
+            };
+            size *= scale;
+        }
+
+        // After 5+ consecutive wins, reduce 50% — edge may be decaying
+        if self.consecutive_wins >= 5 {
+            size *= 0.5;
+        }
+
+        // Hard cap: never exceed $200 per trade
+        size = size.min(200.0);
+
+        // Cap total exposure at bankroll * 25% across all open positions
+        let current_exposure: f64 = self.open_positions.values()
+            .map(|p| p.size_usd.to_f64().unwrap_or(0.0))
+            .sum();
+        let max_exposure = self.bankroll * MAX_TOTAL_EXPOSURE_PCT;
+        let remaining = (max_exposure - current_exposure).max(0.0);
+        size = size.min(remaining);
+
+        // Minimum viable order ($5)
+        if size < 5.0 {
+            // Clean up the position we pre-inserted
+            if let TradeTarget::Polymarket(ref m) = best.target {
+                self.open_positions.remove(&m.condition_id);
+                self.entered_markets.remove(&m.condition_id);
+            }
+            return vec![];
+        }
+
+        let size_dec = Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO);
+        best.size_usd = size_dec;
+
+        // Update the open_position size too
+        if let TradeTarget::Polymarket(ref m) = best.target {
+            if let Some(pos) = self.open_positions.get_mut(&m.condition_id) {
+                pos.size_usd = size_dec;
+            }
+        }
+
+        // Telegram alert
+        if let TradeTarget::Polymarket(ref m) = best.target {
+            self.notify_telegram(&format!(
+                "📊 <b>TRADE</b> {} {} @{:.0}¢ ${:.0}\nEdge: {:.1}% | Bankroll: ${:.0}{}",
+                best.side, m.underlying_symbol,
+                best.price.to_f64().unwrap_or(0.0) * 100.0,
+                size,
+                best.confidence * 100.0,
+                self.bankroll,
+                if self.counter_mode { " [COUNTER]" } else { "" }
+            ));
+        }
+
+        vec![best]
     }
 
     fn evaluate_updown_market(&mut self, market: &PolymarketMarket) -> Option<TradeSignal> {
@@ -932,7 +798,7 @@ impl OrbStrategy {
 
                 // Use book best ask for instant fill, fallback to implied + 3¢
                 let entry_price = self.get_book_ask(token_id_sniper)
-                    .unwrap_or_else(|| (implied_price + Decimal::new(3, 2)))
+                    .unwrap_or_else(|| implied_price + Decimal::new(3, 2))
                     .min(Decimal::new(95, 2));
                 let entry_f64 = entry_price.to_f64().unwrap_or(0.5);
 
@@ -1120,11 +986,7 @@ impl OrbStrategy {
             return None;
         }
 
-        // Funding, regime, RSI, MACD — logged for RL training but not used as filters.
-        // The $400→$2200 run used simpler logic. Let the RL model learn these.
-        let funding = price.funding_rate.unwrap_or(0.0);
-        let regime = self.regime(&market.underlying_symbol);
-        let mut accuracy = accuracy;
+        let accuracy = accuracy;
 
         // Direction: if BTC moved up → buy Up token, if down → buy Down token
         // In counter_mode, flip the direction — bet against the ORB signal
@@ -1143,12 +1005,6 @@ impl OrbStrategy {
             );
             return None;
         }
-
-        // RSI and MACD are computed and logged for RL training data
-        // but not used as hard filters — they're designed for longer
-        // timeframes and block too many valid 5-minute entries.
-        let rsi_val = self.rsi(&market.underlying_symbol);
-        let macd_val = self.macd(&market.underlying_symbol);
 
         // Don't place opposing orders — if we already have a position on this
         // market's underlying in the opposite direction, skip
@@ -1169,7 +1025,7 @@ impl OrbStrategy {
         // Use book best ask for instant fill — this is what someone is actually selling at.
         // Fallback to implied + 3¢ if no book data.
         let entry_price = self.get_book_ask(token_id)
-            .unwrap_or_else(|| (implied_price + Decimal::new(3, 2)))
+            .unwrap_or_else(|| implied_price + Decimal::new(3, 2))
             .min(Decimal::new(95, 2));
 
         // Max entry price cap — don't buy above 50¢.
@@ -1215,7 +1071,7 @@ impl OrbStrategy {
             return None;
         }
 
-        let size_usd = self.tiered_size(move_pct, elapsed);
+        let size_usd = self.can_take_trade();
         if size_usd == Decimal::ZERO {
             debug!(
                 question = %market.question,
@@ -1239,11 +1095,6 @@ impl OrbStrategy {
             atr = format!("{:.1}", atr_val.unwrap_or(0.0)),
             atr_mult = format!("{:.1}x", atr_multiple.unwrap_or(0.0)),
             flow = format!("{:.2}", flow),
-            funding = format!("{:.6}", funding),
-            funding = format!("{:.6}", funding),
-            regime = format!("{:.2}", regime),
-            rsi = format!("{:.1}", rsi_val.unwrap_or(0.0)),
-            macd_hist = format!("{:.1}", macd_val.map(|m| m.2).unwrap_or(0.0)),
             elapsed_secs = elapsed,
             "ORB: breakout signal"
         );
@@ -1426,73 +1277,30 @@ impl OrbStrategy {
         signals
     }
 
-    /// Poll Polymarket API for recent REDEEMs to track wins/losses.
-    /// This is the ONLY reliable way to know trade outcomes.
-    fn poll_resolutions(&mut self) {
-        let now_ts = Utc::now().timestamp();
-        // Poll every 15 seconds
-        if now_ts - self.last_resolution_poll < 15 {
-            return;
-        }
-        self.last_resolution_poll = now_ts;
-
-        if self.wallet_address.is_empty() {
-            return;
-        }
-
-        let url = format!(
-            "https://data-api.polymarket.com/activity?user={}&limit=20&sortDirection=DESC",
-            self.wallet_address
-        );
-
-        // Use blocking call (strategy is sync)
-        let resp = match reqwest::blocking::Client::new()
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => return,
+    /// Read resolved trades from web server's poll_resolutions (non-blocking).
+    /// The web server polls Polymarket API every 3s for REDEEMs and pushes them
+    /// to SharedWebState. We drain them here on each price tick.
+    fn check_web_resolutions(&mut self) {
+        let state = match &self.web_state {
+            Some(s) => s.clone(),
+            None => return,
         };
 
-        let data: Vec<serde_json::Value> = match resp.json() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        for item in &data {
-            let ttype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if ttype != "REDEEM" {
-                continue;
-            }
-
-            let cid = item.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
-            if cid.is_empty() || self.resolved_cids.contains(cid) {
-                continue;
-            }
-
+        let resolved = state.drain_resolved_trades();
+        for (cid, won, usdc) in resolved {
             // Only process if we had a position on this market
-            let had_position = self.open_positions.contains_key(cid)
-                || self.entered_markets.contains(cid);
+            let had_position = self.open_positions.contains_key(&cid)
+                || self.entered_markets.contains(&cid);
             if !had_position {
                 continue;
             }
 
-            let size = item.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let usdc = item.get("usdcSize").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let won = size > 0.0 || usdc > 0.0;
-
-            self.resolved_cids.insert(cid.to_string());
-            self.open_positions.remove(cid);
-
-            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let result = if won { "WON" } else { "LOST" };
-
             info!(
                 condition_id = %cid,
                 result,
                 usdc = format!("${:.2}", usdc),
-                "ORB: resolution from API poll"
+                "ORB: resolution from web server"
             );
 
             // Update bankroll
@@ -1512,7 +1320,7 @@ impl OrbStrategy {
                 }
             } else {
                 // Estimate loss from entry price
-                if let Some(pos) = self.open_positions.get(cid) {
+                if let Some(pos) = self.open_positions.get(&cid) {
                     self.bankroll -= pos.size_usd.to_f64().unwrap_or(0.0);
                 }
                 self.consecutive_wins = 0;
@@ -1544,6 +1352,8 @@ impl OrbStrategy {
                     ));
                 }
             }
+
+            self.open_positions.remove(&cid);
 
             self.notify_telegram(&format!(
                 "{} <b>{}</b> ${:.2}\n{}W/{}L | Bankroll: ${:.0}{}",
@@ -1703,8 +1513,8 @@ impl Strategy for OrbStrategy {
                 }
                 self.latest_prices.insert(price.symbol.clone(), price);
                 self.gc_expired_markets();
-                // Poll Polymarket API for actual win/loss outcomes (every 15s)
-                self.poll_resolutions();
+                // Check resolutions from web server (non-blocking)
+                self.check_web_resolutions();
                 // Check take-profit exits first (every tick), then new entries
                 let mut signals = self.check_take_profits();
                 signals.extend(self.evaluate_all_markets());
@@ -1715,21 +1525,7 @@ impl Strategy for OrbStrategy {
                     let high = candle.high.to_f64().unwrap_or(0.0);
                     let low = candle.low.to_f64().unwrap_or(0.0);
                     let close = candle.close.to_f64().unwrap_or(0.0);
-                    self.update_rsi(&candle.symbol, close);
-                    self.update_macd(&candle.symbol, close);
                     self.update_atr(&candle.symbol, high, low, close);
-
-                    if let Some(atr) = self.atr(&candle.symbol) {
-                        let rsi_val = self.rsi(&candle.symbol);
-                        let macd_val = self.macd(&candle.symbol);
-                        debug!(
-                            symbol = %candle.symbol,
-                            atr = format!("{:.1}", atr),
-                            rsi = format!("{:.1}", rsi_val.unwrap_or(0.0)),
-                            macd_hist = format!("{:.2}", macd_val.map(|m| m.2).unwrap_or(0.0)),
-                            "ORB: indicators updated"
-                        );
-                    }
                 }
                 Vec::new()
             }
@@ -1988,24 +1784,15 @@ mod tests {
             max_position_usd: dec!(100),
             true_ranges: HashMap::new(),
             prev_close: HashMap::new(),
-            recent_closes: HashMap::new(),
-            rsi_gains: HashMap::new(),
-            rsi_losses: HashMap::new(),
-            macd_state: HashMap::new(),
             prev_vwap: HashMap::new(),
             web_state: None,
             telegram: None,
-            pending_orders: HashMap::new(),
             bankroll: 1000.0,
             down_only: false,
             consecutive_losses: 0,
             consecutive_wins: 0,
             counter_mode: false,
             cooldown_until: None,
-            last_resolution_poll: 0,
-            resolved_cids: std::collections::HashSet::new(),
-            http_client: reqwest::Client::builder().build().unwrap(),
-            wallet_address: String::new(),
         }
     }
 
@@ -2663,5 +2450,81 @@ mod tests {
         assert_eq!(exits.len(), 1, "should exit NO position at take-profit");
         assert_eq!(exits[0].side, Side::Sell, "exit keeps Sell side for NO token");
         assert!(exits[0].price > dec!(0.79) && exits[0].price < dec!(0.81), "exit at book bid ~0.80");
+    }
+
+    // ---- Exposure cap tests ----
+
+    #[test]
+    fn test_exposure_cap_enforced() {
+        let mut strategy = make_test_strategy();
+        strategy.bankroll = 100.0;
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        // 0.075% move up, market at 0.40 — should generate signal
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy.updown_start_prices.insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        assert_eq!(signals.len(), 1);
+        let size = signals[0].size_usd.to_f64().unwrap();
+        // 9% of $100 = $9, capped at $200 — should be $9
+        assert!(size <= 9.0, "per_trade should not exceed 9% of $100 bankroll, got {}", size);
+        assert!(size >= 5.0, "per_trade should be at least $5, got {}", size);
+    }
+
+    #[test]
+    fn test_picks_best_signal_only() {
+        let mut strategy = make_test_strategy();
+        strategy.bankroll = 500.0;
+        let now = Utc::now();
+
+        // Two markets, different edge levels
+        let ws1 = now.timestamp() - 120;
+        let ws2 = now.timestamp() - 120;
+
+        let m1 = make_updown_market("m1", 80000.0, ws1, 0.40);
+        let m2 = make_updown_market("m2", 80000.0, ws2, 0.35); // cheaper = more edge
+        strategy.markets.insert("m1".to_string(), m1);
+        strategy.markets.insert("m2".to_string(), m2);
+        strategy.updown_start_prices.insert("m1".to_string(), (80000.0, ws1));
+        strategy.updown_start_prices.insert("m2".to_string(), (80000.0, ws2));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        // Should pick only 1 — the best edge
+        assert_eq!(signals.len(), 1, "should pick only the best signal, not spread across multiple");
+    }
+
+    #[test]
+    fn test_loss_halving_reduces_size() {
+        let mut strategy = make_test_strategy();
+        strategy.bankroll = 200.0;
+        strategy.consecutive_losses = 2; // should halve twice: 9% * 200 / 4 = $4.5 → too small
+        let now = Utc::now();
+        let window_start = now.timestamp() - 120;
+
+        let market = make_updown_market("m1", 80000.0, window_start, 0.40);
+        strategy.markets.insert("m1".to_string(), market);
+        strategy.updown_start_prices.insert("m1".to_string(), (80000.0, window_start));
+        strategy.latest_prices.insert(
+            "BTC-USD".to_string(),
+            make_price_with_flow("BTC-USD", 80060.0, now, 0.5),
+        );
+        seed_atr(&mut strategy, "BTC-USD", 20.0);
+
+        let signals = strategy.evaluate_all_markets();
+        // $200 * 9% / 4 = $4.50 — below $5 minimum
+        assert!(signals.is_empty(), "should skip when loss-halved size < $5");
     }
 }

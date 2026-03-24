@@ -43,9 +43,14 @@ pub struct OrbTradeEvent {
 
 const MAX_ORB_EVENTS: usize = 100;
 
+/// A resolved trade: (condition_id, won, usdc_amount).
+pub type ResolvedTrade = (String, bool, f64);
+
 pub struct WebState {
     pub wallets: RwLock<HashMap<String, WalletData>>,
     pub orb_trades: RwLock<VecDeque<OrbTradeEvent>>,
+    /// Resolved trades from poll_resolutions — strategy reads these on each tick.
+    pub resolved_trades: RwLock<VecDeque<ResolvedTrade>>,
     pub client: reqwest::Client,
 }
 
@@ -55,6 +60,21 @@ impl WebState {
         trades.push_front(event);
         if trades.len() > MAX_ORB_EVENTS {
             trades.pop_back();
+        }
+    }
+
+    /// Push a resolved trade for the strategy to consume.
+    pub async fn push_resolved_trade(&self, condition_id: String, won: bool, usdc: f64) {
+        let mut resolved = self.resolved_trades.write().await;
+        resolved.push_back((condition_id, won, usdc));
+    }
+
+    /// Drain all pending resolved trades (called by strategy on each tick).
+    pub fn drain_resolved_trades(&self) -> Vec<ResolvedTrade> {
+        if let Ok(mut resolved) = self.resolved_trades.try_write() {
+            resolved.drain(..).collect()
+        } else {
+            Vec::new()
         }
     }
 }
@@ -77,6 +97,7 @@ pub fn new_web_state() -> SharedWebState {
     Arc::new(WebState {
         wallets: RwLock::new(HashMap::new()),
         orb_trades: RwLock::new(trades),
+        resolved_trades: RwLock::new(VecDeque::new()),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
